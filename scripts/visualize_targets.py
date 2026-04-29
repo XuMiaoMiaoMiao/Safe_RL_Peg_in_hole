@@ -17,9 +17,12 @@
     python scripts/visualize_targets.py
     python scripts/visualize_targets.py --preinsert_offset 0.08
     python scripts/visualize_targets.py --duration 30
+    # 同时 spawn 19 球 sphere proxy (左红 / 右蓝, opacity=0.3), 看 M2c 几何包络:
+    python scripts/visualize_targets.py --show_proxies --duration 30
 """
 
 import argparse
+import math
 import sys
 import time
 from pathlib import Path
@@ -54,6 +57,14 @@ def parse_args():
     p.add_argument("--n_resets", type=int, default=1,
                    help="进入主可视化循环前采样多少次 reset, 用来打印 preinsert "
                         "误差在 reset 分布下的统计. n_resets=1 = 单次 reset.")
+    p.add_argument("--show_proxies", action="store_true",
+                   help="spawn 19 球 sphere proxy marker (M2c clearance 用), 半透明, "
+                       "跟随 articulation. 帮你肉眼判断 arm/EE 半径是否合理. "
+                       "默认关闭.")
+    p.add_argument("--proxy_arm_radius", type=float, default=None,
+                   help="M2c sphere proxy 的 arm/link 半径 (m). 默认 0.06.")
+    p.add_argument("--proxy_ee_radius", type=float, default=None,
+                   help="M2c sphere proxy 的 EE/finger 半径 (m). 默认 0.03.")
     return p.parse_args()
 
 
@@ -126,6 +137,78 @@ def _spawn_preinsert_markers(axis_length=0.10, axis_radius=0.004, sphere_radius=
     return {"peg_t": peg_t, "peg_r": peg_r,
             "hole_t": hole_t, "hole_r": hole_r,
             "pre_t": pre_t}
+
+
+def _spawn_sphere_proxies(mdp):
+    """在 /World/viz/sphere_proxies/ 下 spawn 38 个半透明球 (左 19 + 右 19),
+    跟随 mdp 的 sphere proxy 几何. 颜色: 左红 / 右蓝, alpha=0.3.
+
+    球心走 world 坐标 (physics_view.get_link_transforms 已经是 world frame),
+    不加 env_offset — 与 preinsert markers (env-local + env_offset) 不同.
+
+    返回 list translate_op 用于每帧 update; mdp 未启用 _clearance_active 或
+    IsaacSim 不可用时返回 None.
+    """
+    if not mdp._clearance_active:
+        print("[VIS PROXIES] mdp._clearance_active=False (M2c 未启用且未设 log_clearance). "
+              "sphere proxy 在 _create_observation 不算, 无法可视化. "
+              "重跑加 --rew_clearance 0.5 --clearance_soft 0.0 之类启用 M2c, "
+              "或 env 端开 log_clearance=True (CLI 暂未透出).")
+        return None
+    try:
+        import omni.usd
+        from pxr import UsdGeom, Sdf, Gf, Vt
+    except ImportError:
+        return None
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        return None
+
+    n_per_side = mdp._n_proxies_per_side                 # 19
+    radii = mdp._proxy_radii_per_side.detach().cpu().numpy()  # [19], configured radii
+    handles = []
+
+    def _make_sphere(path, color, radius):
+        sphere = UsdGeom.Sphere.Define(stage, Sdf.Path(path))
+        sphere.GetRadiusAttr().Set(float(radius))
+        sphere.GetDisplayColorAttr().Set(Vt.Vec3fArray([Gf.Vec3f(*color)]))
+        sphere.GetDisplayOpacityAttr().Set(Vt.FloatArray([0.30]))
+        xf = UsdGeom.Xformable(sphere.GetPrim())
+        xf.ClearXformOpOrder()
+        t_op = xf.AddTranslateOp()
+        t_op.Set(Gf.Vec3d(0.0, 0.0, 100.0))   # 初始放远处, 第一帧 update 后到位
+        return t_op, sphere
+
+    UsdGeom.Xform.Define(stage, Sdf.Path("/World/viz/sphere_proxies"))
+    for side, color in [("left", (1.0, 0.4, 0.4)), ("right", (0.4, 0.4, 1.0))]:
+        for i in range(n_per_side):
+            path = f"/World/viz/sphere_proxies/{side}_{i:02d}"
+            t_op, _ = _make_sphere(path, color, float(radii[i]))
+            handles.append(t_op)
+
+    print(f"[VIS PROXIES] spawned {2 * n_per_side} sphere proxies "
+          f"(left=red / right=blue, opacity=0.3). 每侧 19 球: 8 关节 + 7 中点 + 4 EE.")
+    return handles
+
+
+def _update_sphere_proxies(mdp, viz_env_idx, proxy_handles):
+    """每帧从 mdp._compute_min_clearance() 拿到 left_proxies / right_proxies,
+    更新 marker 位置. 这两个张量已经是 world 坐标 (physics_view.get_link_transforms
+    返回 world frame), 直接写入 /World/viz 下不需要再加 env_offset.
+    """
+    if proxy_handles is None:
+        return
+    from pxr import Gf
+    _, info = mdp._compute_min_clearance()    # info["left_proxies"] [N_env, 19, 3] world coord
+    left = info["left_proxies"][viz_env_idx].detach().cpu().numpy()
+    right = info["right_proxies"][viz_env_idx].detach().cpu().numpy()
+    n_per = mdp._n_proxies_per_side
+    for i in range(n_per):
+        x, y, z = left[i]
+        proxy_handles[i].Set(Gf.Vec3d(float(x), float(y), float(z)))
+    for i in range(n_per):
+        x, y, z = right[i]
+        proxy_handles[n_per + i].Set(Gf.Vec3d(float(x), float(y), float(z)))
 
 
 def _update_preinsert_markers(frames, handles, env_idx, env_offset_world):
@@ -211,6 +294,14 @@ def main():
         env_kwargs["preinsert_offset"] = args.preinsert_offset
     if args.success_axis_threshold is not None:
         env_kwargs["success_axis_threshold"] = args.success_axis_threshold
+    if args.proxy_arm_radius is not None:
+        env_kwargs["proxy_arm_radius"] = args.proxy_arm_radius
+    if args.proxy_ee_radius is not None:
+        env_kwargs["proxy_ee_radius"] = args.proxy_ee_radius
+    if args.show_proxies:
+        # log_clearance 让 _create_observation 每步算 sphere proxy, 否则
+        # _compute_min_clearance 用的 cache 是 None.
+        env_kwargs["log_clearance"] = True
 
     from envs import DualArmPegHoleEnv
 
@@ -252,7 +343,7 @@ def main():
     n_total = pos.numel()
     # success_rate 名字 + 阈值显式标出: axis_th=inf 时是 pos-only success, 不是
     # M2 的 pos∧axis success — 不标清楚容易误读成 M2 的乐观估计.
-    is_pos_only = not (mdp._success_axis_threshold < float("inf"))
+    is_pos_only = math.isinf(mdp._success_axis_threshold)
     success_label = "pos_success_rate" if is_pos_only else "success_rate (pos∧axis)"
     print(
         f"[VIS PREINSERT STATS] aggregated over n_resets={args.n_resets} × "
@@ -281,6 +372,10 @@ def main():
     errors = mdp._compute_preinsert_errors(frames)
     _print_preinsert_frames(frames, errors, args.viz_env_idx)
     _update_preinsert_markers(frames, handles, args.viz_env_idx, env_offset_world)
+    proxy_handles = None
+    if args.show_proxies:
+        proxy_handles = _spawn_sphere_proxies(mdp)
+        _update_sphere_proxies(mdp, args.viz_env_idx, proxy_handles)
 
     if args.duration <= 0:
         print("[VIS] 窗口已打开. 观察完后按 Ctrl-C 退出.")
@@ -293,6 +388,7 @@ def main():
             mdp._world.step(render=True)
             frames = mdp.get_preinsert_frames()
             _update_preinsert_markers(frames, handles, args.viz_env_idx, env_offset_world)
+            _update_sphere_proxies(mdp, args.viz_env_idx, proxy_handles)
             if args.duration > 0 and time.monotonic() - start_t >= args.duration:
                 break
             time.sleep(args.idle_dt)
