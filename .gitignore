@@ -40,3 +40,8 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+.codex/
+hydra_output/
+conf/
+scripts/train_hydra.py
