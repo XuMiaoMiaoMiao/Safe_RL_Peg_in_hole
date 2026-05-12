@@ -1,23 +1,24 @@
 train_script: scripts/train_sac.py
 
 # Stage 2: position + axis alignment.
-# Warm-start from Stage 1 (34-dim, use_axis_resid_obs=True) actor-only.
+# Current SAC recipe: warm-start from Stage 1 (34-dim, use_axis_resid_obs=True)
+# actor-only, rebuild critic/replay under the Stage 2 reward.
 # obs_dim must stay 34 to match the Stage 1 checkpoint.
 
 num_envs: 16
 render: false
 seed: 42
 use_axis_resid_obs: true
-n_epochs: 200
+n_epochs: 100
 n_steps_per_epoch: 1024
-n_steps_per_fit: null
+n_steps_per_fit: 16
 utd: null
 
-lr_actor: 1e-4
+lr_actor: 5e-5
 lr_critic: 3e-4
 lr_alpha: 3e-4
-alpha_max: 0.1
-target_entropy: -7
+alpha_max: 0.05
+target_entropy: -10
 n_eval_episodes: 16
 critic_warmup_transitions: 50000
 
@@ -25,11 +26,13 @@ initial_joint_noise: null
 preinsert_success_pos_threshold: 0.10
 preinsert_offset: null
 rew_action: null
-rew_success: 2.0
+rew_success: 4.0
 rew_home: 0.0005
 home_weights: "1,1,1,1,0.75,0.5,0.5"
-rew_axis: 0.5
-success_axis_threshold: 0.50
+rew_axis: 1.0
+# Training threshold is intentionally loose enough for dense cliff hits.
+# For strict reporting, override this at eval time with 0.30 or 0.20.
+success_axis_threshold: 0.40
 rew_pos_success: 1.0
 axis_gate_radius: 0.40
 # hold-N absorbing 关闭 (terminal_hold_bonus=0 即关). episode 只走 horizon, 让
@@ -38,18 +41,23 @@ axis_gate_radius: 0.40
 terminal_hold_bonus: 0.0
 hold_success_steps: 10
 
-# Sphere-proxy 兜底: clearance_hard=0.0 = 球壳一接触即触发 hard absorbing.
-# 与 PhysX 力检测 OR, 补偿 PhysX 在 1-5cm 近距离的失明区.
+# Sphere-proxy 自碰撞兜底 (PhysX 1-5cm 失明区补丁, 全 stage 通用):
+#   clearance_hard=0.0 = 球壳一接触即触发 hard absorbing (与 PhysX 力检测 OR).
+#   proxy_arm_radius: iiwa link 段球半径 0.06m (link 直径 ~6-10cm, 带 margin).
+#   proxy_ee_radius:  coupler + hande_link 段球半径 0.04m (更紧凑但也更宽).
 # 关闭请设 clearance_hard: -.inf (注意负数会走 --clearance_hard=-.inf 形式).
 clearance_hard: 0.0
+proxy_arm_radius: 0.06
+proxy_ee_radius: 0.04
 
 # Warm-start controls.
-# 运行前确认此文件存在, 或传 --load_agent 覆盖:
-#   cp results/best_hold.msh results/S1_axisresid_home_uniform_repro_best_hold.msh
-load_agent: results/S1_axisresid_home_uniform_repro_best_hold.msh
+# 运行前确认 load_agent 是 Stage 1 / preinsert actor checkpoint; 若要换 seed 或
+# 复现实验, 通过 CLI/Hydra override 覆盖 train.load_agent 和 train.seed.
+load_agent: results/checkpoints/2026-05-10/10-06-17/best_agent.msh
 actor_only_warmstart: true
 keep_replay: false
 
 wandb_project: bimanual_peghole
-wandb_run_name: phase2_axis05_gate040_cwarm50k_actoronly_200epochs
+wandb_entity: safe_rl_2026_lund
+wandb_run_name: SAC_phase2_seed42_new
 no_wandb: false

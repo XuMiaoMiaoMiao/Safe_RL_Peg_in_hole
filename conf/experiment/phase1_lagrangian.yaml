@@ -7,7 +7,7 @@ train_script: scripts/train_sac_lagrangian.py
 
 num_envs: 16
 render: false
-seed: 4
+seed: 42
 use_axis_resid_obs: true
 n_epochs: 100
 n_steps_per_epoch: 1024
@@ -69,6 +69,7 @@ gamma_cost: null
 # --------------------------------------------------------------------------
 
 wandb_project: bimanual_peghole
-wandb_run_name: phase1_lag_seed4
-wandb_group: phase1_lag_seed_sweep
+wandb_entity: safe_rl_2026_lund
+wandb_run_name: lag_phase1_seed42
+wandb_group: phase1_lag
 no_wandb: false

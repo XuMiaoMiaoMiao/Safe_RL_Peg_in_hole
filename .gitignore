@@ -1,5 +1,7 @@
 # Training outputs
-results/
+results/**
+!results/video_local/
+!results/video_local/**
 logs/
 runs/
 wandb/
@@ -43,3 +45,4 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+results/*.msh

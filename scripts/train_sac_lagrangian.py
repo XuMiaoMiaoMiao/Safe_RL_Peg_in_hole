@@ -1,9 +1,9 @@
 """Lagrangian SAC 训练 — 双臂 peg-in-hole, mushroom-rl + VectorCore.
 
 跟 train_sac.py 的差异:
-- 算法换成 algo.lagrangian_sac.SACLagrangian (在 PROJECT_ROOT/algo/ 下).
+- 算法换成 algorithm.lagrangian_sac.SACLagrangian (在 PROJECT_ROOT/algorithm/ 下).
 - env._create_info_dictionary 必须返回 {"cost": tensor} (已在
-  envs/dual_arm_peg_hole_env.py 实现).
+  envs/dual_arm_peg_hole_cost_env.py 实现).
 - 多了 --cost_limit / --lr_lambda / --lambda_max / --init_log_lambda /
   --gamma_cost flags.
 - 每 epoch eval 多算 cost_rate, wandb 加 lambda / cost_q_mean.
@@ -19,6 +19,15 @@ Cost signal 调标:
 - 设 --cost_limit 之前先用 SAC baseline 跑一次 64-ep eval, 记录
   absorb_sphere_per_epoch / n_steps_per_epoch (per-step 触发率), 取其 0.5 倍
   做起步预算. 设 cost_limit=0 会让 λ 一上来就爆.
+
+整体架构：
+  envs/dual_arm_peg_hole_cost_env.py   ← cost 信号来源 (DualArmPegHoleCostEnv)
+           ↓  _create_info_dictionary() → {"cost": tensor}
+  algorithm/lagrangian_sac.py          ← ConstrainedReplayMemory + SACLagrangian
+           ↓  fit() 读 dataset.info.data["cost"]
+  scripts/train_sac_lagrangian.py      ← 训练入口，接所有 CLI 参数
+  scripts/_eval_utils.py               ← compute_cost_metrics() 评估 cost 指标
+
 """
 
 import argparse
@@ -55,16 +64,32 @@ def parse_args():
     p.add_argument("--render", action="store_true", help="打开 IsaacSim 窗口")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--n_epochs", type=int, default=400)
-    p.add_argument("--n_steps_per_epoch", type=int, default=1024)
-    p.add_argument("--n_steps_per_fit", type=int, default=None)
-    p.add_argument("--utd", type=int, default=None)
-    p.add_argument("--lr_actor", type=float, default=3e-4)
+    p.add_argument("--n_steps_per_epoch", type=int, default=1024,
+                   help="每个 epoch 收集的总 env-step 数 (不是 vector-step)")
+    p.add_argument("--n_steps_per_fit", type=int, default=None,
+                   help="两次 fit 之间收集的总 env-step 数 (默认 = num_envs, 即 1 个 vector-step)")
+    p.add_argument("--utd", type=int, default=None,
+                   help="每次 fit 块对应的总梯度步数. 默认自动取 n_steps_per_fit, 使 true UTD≈1")
+    p.add_argument("--lr_actor", type=float, default=3e-4,
+                   help="cold-start 联合任务推荐降到 1e-4 (避免 noisy critic 拉坏 actor), "
+                        "warm-start 用 default 即可.")
     p.add_argument("--lr_critic", type=float, default=3e-4)
     p.add_argument("--lr_alpha", type=float, default=3e-4)
-    p.add_argument("--alpha_max", type=float, default=0.1)
-    p.add_argument("--target_entropy", type=float, default=None)
-    p.add_argument("--critic_warmup_transitions", type=int, default=None)
-    p.add_argument("--n_eval_episodes", type=int, default=None)
+    p.add_argument("--alpha_max", type=float, default=0.1,
+                   help="alpha 上限. cold-start 联合任务推荐 0.2 (探索), warm-start 0.1 稳态. "
+                        "Lagrangian SAC 从已收敛 actor warmstart 时, Stage 2 经验建议保守用 0.05 "
+                        "(λ 额外给 actor 施压, alpha 过高易引发塌方).")
+    p.add_argument("--target_entropy", type=float, default=None,
+                   help="目标 entropy. 默认自动取 -act_dim (SAC 标准). "
+                        "14-DoF cold-start 联合任务可考虑 -7 (= -act_dim/2), "
+                        "让 SAC 倾向稍集中, alpha 不顶 cap.")
+    p.add_argument("--critic_warmup_transitions", type=int, default=None,
+                   help="actor / α / λ 开始更新前需要的 replay 容量 (env-steps). 默认 = "
+                        "INITIAL_REPLAY_SIZE (10K). **actor-only warmstart 推荐设大** "
+                        "(e.g. 50000 ≈ 40 epoch), 让冷启动的 reward critic 和 cost critic "
+                        "先单独把 Q 学到合理量级, 再放开 actor 和 λ 更新. 必须 >= INITIAL_REPLAY_SIZE.")
+    p.add_argument("--n_eval_episodes", type=int, default=None,
+                   help="评估 episode 数. 默认自动取 num_envs, 并要求能被 num_envs 整除")
 
     # ---- Lagrangian 专属 ----------------------------------------------------
     p.add_argument("--cost_limit", type=float, required=True,
@@ -110,12 +135,23 @@ def parse_args():
     p.add_argument("--clearance_hard", type=float, default=None)
     p.add_argument("--proxy_arm_radius", type=float, default=None)
     p.add_argument("--proxy_ee_radius", type=float, default=None)
+    p.add_argument("--exclude_ee_from_physx_self_collision", action="store_true",
+                   help="Stage 3 peg/hole 真实 collider 用: PhysX arm_L vs arm_R "
+                        "self-collision 分组排除左右 EE link, 避免正常 peg-hole "
+                        "接触被 hard absorbing 误杀. EE 区域仍由 sphere-proxy 兜底.")
 
     # obs
-    p.add_argument("--use_axis_resid_obs", action="store_true")
+    p.add_argument("--use_axis_resid_obs", action="store_true",
+                   help="agent obs 32 → 34 维: axis_dot[1] 替换成 axis_resid[3] = "
+                        "peg_axis + hole_axis (world frame). 模长 ∈ [0, 2], "
+                        "0 = 完美反对齐 (preinsert), 2 = 同向 (home pose). "
+                        "全程光滑无奇异, 且 axis_err = ||resid||²/2 = 1+dot 与 reward 同语义, "
+                        "success_axis_threshold 仍然用旧的 1+dot 量纲 (0.2 ≈ ±37° 锥). "
+                        "**注意**: obs 维度变, 32 维 checkpoint 不能 warm-start 到 34 维.")
 
     # wandb
     p.add_argument("--wandb_project", type=str, default="bimanual_peghole")
+    p.add_argument("--wandb_entity", type=str, default=None)
     p.add_argument("--wandb_run_name", type=str, default=None)
     p.add_argument("--wandb_group", type=str, default=None)
     p.add_argument("--no_wandb", action="store_true")
@@ -178,6 +214,8 @@ def main():
             env_kwargs[key] = value
     if args.use_axis_resid_obs:
         env_kwargs["use_axis_resid_obs"] = True
+    if args.exclude_ee_from_physx_self_collision:
+        env_kwargs["exclude_ee_from_physx_self_collision"] = True
     env_kwargs["success_hold_steps"] = args.hold_success_steps
     mdp = DualArmPegHoleCostEnv(**env_kwargs)
     mdp.seed(args.seed)
@@ -287,6 +325,11 @@ def main():
     logger.info(f"obs_dim={obs_dim} ({obs_mode})  "
                 f"act_dim={act_dim}  horizon={mdp.info.horizon}")
     logger.info(f"action_scale={mdp._action_scale:.3f}")
+    logger.info(
+        "physx_self_collision_group="
+        + ("arm_links_only" if mdp._exclude_ee_from_physx_self_collision
+           else "arm_links_plus_ee")
+    )
     logger.info(f"preinsert_pos_th={mdp._preinsert_success_pos_threshold:.3f}m  "
                 f"axis_th={mdp._success_axis_threshold:.3f}  "
                 f"w_pos={mdp._w_pos:.3f}  w_axis={mdp._w_axis:.3f}  "
@@ -320,13 +363,17 @@ def main():
     logger.info("reset stats: "
                 f"in_thresh_rate={float(in_thresh_mask.float().mean()):.3f}  "
                 f"pos_err_mean={float(pos_err.mean()):.4f}m  "
-                f"axis_err_mean={float(axis_err.mean()):.4f}")
+                f"pos_err_min={float(pos_err.min()):.4f}m  "
+                f"pos_err_max={float(pos_err.max()):.4f}m  "
+                f"axis_err_mean={float(axis_err.mean()):.4f}  "
+                f"axis_err_max={float(axis_err.max()):.4f}")
 
     wandb_run = None
     if not args.no_wandb:
         import wandb
         wandb_run = wandb.init(
-            project=args.wandb_project, name=args.wandb_run_name,
+            project=args.wandb_project, entity=args.wandb_entity,
+            name=args.wandb_run_name,
             group=args.wandb_group,
             config={**vars(args), "algo": "SACLagrangian",
                     "target_entropy_resolved": target_entropy,
@@ -371,8 +418,15 @@ def main():
     core.learn(n_steps=INITIAL_REPLAY_SIZE, n_steps_per_fit=INITIAL_REPLAY_SIZE)
 
     fits_per_epoch = args.n_steps_per_epoch // args.n_steps_per_fit
-    logger.info(f"utd={args.utd}  fits/epoch={fits_per_epoch}  "
-                f"total-fits/epoch={fits_per_epoch * args.utd}")
+    vector_steps_per_fit = args.n_steps_per_fit / args.num_envs
+    vector_steps_per_epoch = args.n_steps_per_epoch / args.num_envs
+    effective_utd = args.utd / args.n_steps_per_fit
+    logger.info(f"utd={args.utd}  collect-fits/epoch={fits_per_epoch}  "
+                f"total-fits/epoch={fits_per_epoch * args.utd}  "
+                f"true_UTD={effective_utd:.3f}  "
+                f"env-steps/epoch={args.n_steps_per_epoch}  "
+                f"vector-steps/fit≈{vector_steps_per_fit:.1f}  "
+                f"vector-steps/epoch≈{vector_steps_per_epoch:.1f}")
 
     best_J = -np.inf
     best_score = -np.inf

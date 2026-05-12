@@ -15,7 +15,7 @@ train_script: scripts/record_video.py
 
 # --- checkpoint 目录 (替代单 agent 的 agent_path) ---
 # 路径相对于容器内项目根目录 /workspace/Safe_RL_Peg_in_hole
-checkpoint_dir: results/checkpoints/2026-05-07/11-59-24
+checkpoint_dir: results/checkpoints/2026-05-10/10-06-17
 
 # --- env (必须与训练时一致) ---
 num_envs: 2              # cloner bug 要求 >= 2; 录制只用 viz_env_idx=0
@@ -23,7 +23,8 @@ use_axis_resid_obs: true
 preinsert_success_pos_threshold: 0.10
 rew_home: 0.0005
 hold_success_steps: 10
-clearance_hard: -.inf    # phase1/2 训练时均禁用球形代理碰撞; 不设置默认 0.0 会提前截断 episode
+clearance_hard: -.inf    # 录制时禁用 sphere-proxy (训练时为 0.0 即启用). null 会回落到 env
+                         # 默认值 0.0, 球壳一接触即截断 episode, 视频会提前结束.
 
 # --- 录制参数 ---
 n_episodes: 1            # 每个 agent 录制的 episode 数

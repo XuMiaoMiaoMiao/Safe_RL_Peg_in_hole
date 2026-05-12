@@ -232,7 +232,8 @@ class SACLagrangian(SAC):
         )
 
     def fit(self, dataset):
-        self._replay_memory.add(dataset)
+        if "cost" in dataset.info.data:
+            self._replay_memory.add(dataset)
         if not self._replay_memory.initialized:
             return
         s, a, r, c, sp, absorb, last = self._replay_memory.get(self._batch_size())

@@ -9,16 +9,23 @@ num_envs: 16
 render: false
 seed: 42
 use_axis_resid_obs: true
-n_epochs: 200
+n_epochs: 100
 n_steps_per_epoch: 1024
 n_steps_per_fit: null
 utd: null
 
-lr_actor: 1e-4
+# warm-start 保守值: Stage 1 cold-start 用 1e-4, Stage 2 actor_only_warmstart 下
+# 冷 critic 噪声大, 高 lr 会在 warmup 结束后立即破坏 preinsert 能力.
+# SAC Stage 2 oneshot 配方同为 5e-5.
+lr_actor: 5e-5
 lr_critic: 3e-4
 lr_alpha: 3e-4
-alpha_max: 0.1
-target_entropy: -7
+# Lagrangian warm-start 标准值. λ 给 actor 额外施压, alpha 过高易引发塌方.
+# Stage 1 cold-start 已用 0.05; Stage 2 warm-start 同样保守.
+alpha_max: 0.05
+# warm-start 更 deterministic: Stage 1 cold-start 用 -7, Stage 2 轴对齐需要精细控制.
+# SAC Stage 2 oneshot 配方同为 -10.
+target_entropy: -10
 n_eval_episodes: 16
 # critic_warmup_transitions: actor / α / λ 全部冻结，直到 replay 填满此值.
 # cold-start 后 critic 需要一段时间重建语义（reward 和 cost 都在同时预热）.
@@ -29,12 +36,20 @@ initial_joint_noise: null
 preinsert_success_pos_threshold: 0.10
 preinsert_offset: null
 rew_action: null
-rew_success: 2.0
+# SAC Stage 2 实验: rew_success=2.0 时 cliff 触发稀少, hold@axis_th=0%; 4.0 → 100%.
+# 加倍 cliff bonus 给 actor 更强的 sustain 信号.
+rew_success: 4.0
 rew_home: 0.0005
 home_weights: "1,1,1,1,0.75,0.5,0.5"
-rew_axis: 0.5
+# SAC Stage 2 实验: rew_axis=0.5 时轴对齐信号太弱 (axis_in_pos_mean=0.63 未改善);
+# 1.0 → axis_in_pos_mean 降至 0.41. 与 rew_success 一同加倍.
+rew_axis: 1.0
+# SAC Stage 2 实验: axis_th=0.20/0.30 时 cliff 触发率 <1% (训练失败);
+# 0.40 密集触发 (hold≈80%). 0.50 比 0.40 更松, cliff 更易触发, 可接受.
 success_axis_threshold: 0.50
+# Stage 1 位置保持锚点, 防 actor 在学轴对齐时遗忘 preinsert 位置.
 rew_pos_success: 1.0
+# pos_err > 0.40m 时 axis 惩罚关闭, 避免远端姿态被 axis loss 干扰.
 axis_gate_radius: 0.40
 terminal_hold_bonus: 0.0
 hold_success_steps: 10
@@ -54,7 +69,7 @@ clearance_hard: 0.0
 #
 # 运行前确认文件存在, 或传 --load_agent 覆盖:
 #   cp results/best_hold_lag.msh results/S1_lag_best_hold.msh
-load_agent: results/best_hold_lag.msh
+load_agent: results/checkpoints_lag/2026-05-10/12-05-51/best_agent.msh
 actor_only_warmstart: true
 keep_replay: false
 
@@ -82,12 +97,13 @@ lambda_max: 100.0
 # Stage 1 结束时 λ 可能已较高（说明 cost 被持续违反）；Stage 2 从 0 重新学
 # 会有一段 λ 爬升期. 若 Stage 1 final_lambda 偏高（如 >5），
 # 可设 init_log_lambda: 1.5~2.0（λ≈4.5~7.4）缩短爬升过渡.
-init_log_lambda: 0.0  # TODO: 参考 Stage 1 的 final_lambda 调整
+init_log_lambda: 0.0  # Stage 1 final_lambda ≈ 4.5e-5 (下限 clamp), 无需调高
 
 gamma_cost: null
 
 # --------------------------------------------------------------------------
 
 wandb_project: bimanual_peghole
-wandb_run_name: phase2_lag_axis05_gate040_cwarm50k_actoronly_200epochs
+wandb_entity: safe_rl_2026_lund
+wandb_run_name: lag_phase1_seed42
 no_wandb: false

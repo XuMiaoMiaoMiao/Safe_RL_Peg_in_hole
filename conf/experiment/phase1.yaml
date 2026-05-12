@@ -5,9 +5,9 @@ train_script: scripts/train_sac.py
 # pos_err < preinsert_success_pos_threshold.
 num_envs: 16
 render: false
-seed: 4
+seed: 42
 use_axis_resid_obs: true
-n_epochs: 100
+n_epochs: 50
 n_steps_per_epoch: 1024
 n_steps_per_fit: null
 utd: null
@@ -32,12 +32,17 @@ success_axis_threshold: .inf
 terminal_hold_bonus: 0.0
 hold_success_steps: 10
 
-# Sphere-proxy 兜底: clearance_hard=0.0 = 球壳一接触即触发 hard absorbing.
-# 与 PhysX 力检测 OR, 补偿 PhysX 在 1-5cm 近距离的失明区.
+# Sphere-proxy 自碰撞兜底 (PhysX 1-5cm 失明区补丁, 全 stage 通用):
+#   clearance_hard=0.0 = 球壳一接触即触发 hard absorbing (与 PhysX 力检测 OR).
+#   proxy_arm_radius: iiwa link 段球半径 0.06m (link 直径 ~6-10cm, 带 margin).
+#   proxy_ee_radius:  coupler + hande_link 段球半径 0.04m (更紧凑但也更宽).
 # 关闭请设 clearance_hard: -.inf (注意负数会走 --clearance_hard=-.inf 形式).
 clearance_hard: 0.0
+proxy_arm_radius: 0.06
+proxy_ee_radius: 0.04
 
 wandb_project: bimanual_peghole
-wandb_run_name: phase1_seed4
+wandb_entity: safe_rl_2026_lund
+wandb_run_name: SAC_phase1_seed42_new
 wandb_group: phase1_seed_sweep
 no_wandb: false
