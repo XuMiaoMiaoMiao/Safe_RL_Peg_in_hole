@@ -11,9 +11,9 @@
 
 ```
 Stage 1g (prepos):   ckpt = results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/best_hold.msh
-Stage 2g (preaxis):  ckpt = results/checkpoints/saved/Stage2_preaxis_for_stage3_2026-05-11_11-47-34_best_hold.msh
+Stage 2g (preaxis):  ckpt = results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00/best_hold.msh
 Stage 3g (insert):   ckpt = results/checkpoints/saved/SAC_v8_from_stage2_less_scrape_best_hold.msh
-                            (SAC v8 from preaxis, clean insertion verified)
+                            (SAC v8 from old 2026-05-11 preaxis; clean insertion verified)
 ```
 
 Stage 3g v8 SAC 用 5-channel reward (advance + dwell + pen + bad_entry + linear)
@@ -26,8 +26,8 @@ Stage 3g v8 SAC 用 5-channel reward (advance + dwell + pen + bad_entry + linear
 ## ⚠️ 关键 invariants (任何 SAC/Lagrangian 训练都要遵守)
 
 1. `n_steps_per_epoch = horizon × num_envs`. 当前 full-episode 主线:
-   Stage 1g h100 → **1600**, Stage 3g h200 → **3200**. 不要再把旧 1024 当
-   默认正式参数; 1024 只可用于复现旧 truncation / curriculum ablation.
+   Stage 1g h100 → **1600**, Stage 2g h150 → **2400**, Stage 3g h200 → **3200**.
+   不要再把旧 1024 当默认正式参数; 1024 只可用于复现旧 truncation / curriculum ablation.
    (silent bug 背景见 memory `feedback_mushroom_vectorcore_truncation.md`)
 2. Stage 3g insertion / 任何会发生 peg-hole 接触的训练必须传
    `--exclude_ee_from_physx_self_collision`. 副作用是 PhysX 物理层也不阻止
@@ -51,11 +51,12 @@ Stage 3g v8 SAC 用 5-channel reward (advance + dwell + pen + bad_entry + linear
 | Stage | 目标 | checkpoint |
 |---|---|---|
 | Stage 1g `prepos` | peg 到 hole 入口前的 preinsert 位置 | `results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/best_hold.msh` |
-| Stage 2g `preaxis` | preinsert 位置 + peg/hole 轴对齐 | `results/checkpoints/saved/Stage2_preaxis_for_stage3_2026-05-11_11-47-34_best_hold.msh` |
+| Stage 2g `preaxis` | preinsert 位置 + peg/hole 轴对齐 | `results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00/best_hold.msh` |
 | Stage 3g `insert` | 真实 clean insertion | `results/checkpoints/saved/SAC_v8_from_stage2_less_scrape_best_hold.msh` |
 
-注意: Stage 2g / Stage 3g 仍是 2026-05-11/12 verified chain; 它们尚未用
-2026-05-12 h100 full-episode Stage 1g 重新 warm-start 训练.
+注意: Stage 3g 仍是 2026-05-12 verified chain, 但它是从旧的 2026-05-11
+Stage 2g warm-start 训练得到; 尚未用 2026-05-12 h100/full-episode Stage 1g+2g
+新链路重新训练.
 
 当前 setup (post-Davide / collision-aware) 的关键事实:
 
@@ -177,6 +178,156 @@ python scripts/visualize_policy.py \
 图像判断: peg tip 应稳定在 hole entrance 前方的 preinsert 位置附近; 轴向
 `axis_err` 和整杆 `radial_max` 可以很大, 这是 Stage 1g 预期. Stage 2g
 才负责轴对齐和 `radial_max`.
+
+## Stage 2g (preaxis, **已训练完成 — h150 full-episode from h100 Stage 1g 2026-05-12**)
+
+### 当前状态
+
+**Stage 2g (`geom_stage="preaxis"`) 从新 Stage 1g h100 `best_hold` 一次性训练成功**:
+- canonical ckpt: `results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00/best_hold.msh`
+- 原始路径: `results/checkpoints/2026-05-12/19-50-00/best_hold.msh`
+- warm-start 源: `results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/best_hold.msh`
+- wandb run: `S2g_preaxis_h150_from_h100_stage1_seed0`
+- 训练 best: `geom_hold_rate=1.000`, `geom_max_run_mean=81.1/150`,
+  `best_score=81.125`, `best_J=-127.832`
+- 部署 / Stage 3g warm-start 用 `best_hold.msh`; `best_agent.msh` 只代表 best J.
+
+独立 eval (16 ep, deterministic, h150):
+- `J(γ)=-133.500`, `R=-170.333`
+- `geom_step_rate=0.535`, `geom_hold_rate=1.000`,
+  `geom_max_run_mean=76.6/150`, `final_success_rate=1.000`
+- `d_err_mean=0.0113m`, `radial_max_min=0.0095m`, `axis_err_min=0.022`
+- final: `d=-0.0757m`, `d_err=0.0043m`, `radial_max=0.0151m`
+  (max `0.0198m`), `axis_err=0.0289` (max `0.0443`)
+- penetration 全程 clean: `max_mean=0.00mm`, `max_max=0.00mm`
+- `insert=0.000` 是预期行为: Stage 2g 只对齐 preinsert, 不插入.
+
+### 目标
+
+Stage 2g 在 Stage 1g 的 prepos 基础上, 加入整根 peg 的径向约束和 peg/hole
+轴对齐:
+
+```text
+d_target = -0.0800m
+prepos mask  = |d - d_target| < geom_d_th  AND  radial_tip < geom_r_tip_th
+preaxis mask = prepos mask AND radial_max < geom_r_max_th AND axis_err < geom_axis_th
+
+本次阈值:
+geom_d_th=0.020, geom_r_tip_th=0.020, geom_r_max_th=0.025, geom_axis_th=0.300
+```
+
+此阶段仍然**不要求插入**. 末态应停在 hole 外侧 preinsert 附近, 但整根 peg
+已经和 hole axis 对齐.
+
+### Stage 2g 训练命令 (h150 full-episode, from Stage 1g best_hold)
+
+```bash
+cd ~/bimanual_peghole && conda activate safe_rl
+
+python scripts/train_sac.py \
+  --geom_stage preaxis \
+  --load_agent results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/best_hold.msh \
+  --actor_only_warmstart \
+  --critic_warmup_transitions 50000 \
+  --geom_d_target_neg -0.08 \
+  --geom_d_sat 0.30 --geom_radial_sat 1.0 \
+  --geom_d_th 0.020 --geom_r_tip_th 0.020 \
+  --geom_r_max_th 0.025 --geom_axis_th 0.300 \
+  --rew_geom_d 8.0 \
+  --rew_geom_radial_tip 2.0 \
+  --rew_geom_radial_max 5.0 \
+  --rew_geom_axis 1.2 \
+  --horizon 150 --n_epochs 120 --n_steps_per_epoch 2400 \
+  --num_envs 16 --n_eval_episodes 16 \
+  --hold_success_steps 10 --terminal_hold_bonus 0 \
+  --rew_home 0.00075 --home_weights 1,1,1,1,0.75,0.5,0.5 \
+  --lr_actor 3e-5 --lr_critic 3e-4 --lr_alpha 3e-4 \
+  --alpha_max 0.05 --target_entropy -7 \
+  --seed 0 \
+  --wandb_run_name S2g_preaxis_h150_from_h100_stage1_seed0 \
+  --wandb_group geom_repro
+```
+
+参数要点:
+- `horizon 150`, `n_steps_per_epoch 2400` 是 full-episode (`150 × 16`).
+- `--actor_only_warmstart` + `--critic_warmup_transitions 50000` 让 Stage 2g
+  冷 critic 先适应新 reward, 避免 Stage 1g critic 语义污染.
+- 不传 `--exclude_ee_from_physx_self_collision`: preaxis 仍在 hole 外, 没有
+  peg-hole 接触.
+
+训练结束后保存模型:
+
+```bash
+mkdir -p results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00
+cp results/checkpoints/2026-05-12/19-50-00/best_hold.msh \
+   results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00/
+cp results/checkpoints/2026-05-12/19-50-00/best_agent.msh \
+   results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00/
+cp results/checkpoints/2026-05-12/19-50-00/final_agent.msh \
+   results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00/
+```
+
+### Stage 2g eval
+
+```bash
+python scripts/eval_sac.py \
+  --agent_path results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00/best_hold.msh \
+  --geom_stage preaxis \
+  --geom_d_target_neg -0.08 \
+  --geom_d_sat 0.30 --geom_radial_sat 1.0 \
+  --geom_d_th 0.020 --geom_r_tip_th 0.020 \
+  --geom_r_max_th 0.025 --geom_axis_th 0.300 \
+  --rew_geom_d 8.0 \
+  --rew_geom_radial_tip 2.0 \
+  --rew_geom_radial_max 5.0 \
+  --rew_geom_axis 1.2 \
+  --horizon 150 \
+  --num_envs 16 --n_episodes 16 \
+  --hold_success_steps 10 \
+  --headless
+```
+
+期望独立 eval 数字:
+
+```text
+geom_hold_rate = 1.000
+geom_step_rate ≈ 0.53
+geom_max_run_mean ≈ 75-80 / 150
+final_success_rate = 1.000
+final radial_max ≈ 1.5cm
+final axis_err ≈ 0.03
+penetration max = 0.00mm
+insert_step_rate = 0.000
+```
+
+### Stage 2g visualization
+
+默认 `freeze_mode=first_hold` 会在第一次连续 10 步满足 preaxis mask 时冻结,
+看到的是刚达标的 entry 状态. 想看最终稳定对齐状态, 用固定 step:
+
+```bash
+python scripts/visualize_policy.py \
+  --agent_path results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00/best_hold.msh \
+  --geom_stage preaxis \
+  --geom_d_target_neg -0.08 \
+  --geom_d_sat 0.30 --geom_radial_sat 1.0 \
+  --geom_d_th 0.020 --geom_r_tip_th 0.020 \
+  --geom_r_max_th 0.025 --geom_axis_th 0.300 \
+  --rew_geom_d 8.0 \
+  --rew_geom_radial_tip 2.0 \
+  --rew_geom_radial_max 5.0 \
+  --rew_geom_axis 1.2 \
+  --horizon 150 \
+  --num_envs 4 --n_episodes 4 \
+  --hold_steps 10 \
+  --freeze_mode step \
+  --freeze_after_step 140 \
+  --freeze_seconds 30
+```
+
+图像判断: peg 应在 hole 外侧 preinsert 位置附近, 不插入; 但 peg/hole 轴应明显
+对齐, `radial_max` 小, `axis_err` 小. 若只想看刚达标瞬间, 去掉
+`--freeze_mode step --freeze_after_step 140` 即可回到 first-hold 行为.
 
 ## Stage 3 (insertion, **已训练完成 — SAC v8 2026-05-12**)
 
@@ -392,12 +543,18 @@ success 本身不终止, 避免 Q-target 边界断崖
 ## 保留结果
 
 ```text
-# Canonical saved best_hold chain (current main line)
+# Canonical saved best_hold chain (current h100/h150 Stage 1g+2g)
+results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/best_hold.msh
+results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00/best_hold.msh
+
+# Verified Stage 3g v8 (still trained from old 2026-05-11 Stage 2g)
+results/checkpoints/saved/SAC_v8_from_stage2_less_scrape_best_hold.msh
+
+# Older saved best_hold ckpts kept for reproducibility / ablation reference
 results/checkpoints/saved/Stage1_prepos_for_stage2_S1g_refine_seed0_best_hold.msh
 results/checkpoints/saved/Stage2_preaxis_strict_refine_parent_2026-05-11_10-38-18_best_hold.msh
 results/checkpoints/saved/Stage2_preaxis_for_stage3_2026-05-11_11-47-34_best_hold.msh
 results/checkpoints/saved/SAC_v7c_clean_entry_best_hold.msh
-results/checkpoints/saved/SAC_v8_from_stage2_less_scrape_best_hold.msh
 
 # Restored dated dirs (best_hold mirrors saved/)
 results/checkpoints/2026-05-10/22-16-55/
@@ -405,6 +562,8 @@ results/checkpoints/2026-05-11/10-38-18/
 results/checkpoints/2026-05-11/11-47-34/
 results/checkpoints/2026-05-12/00-46-20/
 results/checkpoints/2026-05-12/08-58-55/
+results/checkpoints/2026-05-12/18-35-31/
+results/checkpoints/2026-05-12/19-50-00/
 ```
 
 顶层 `results/*.msh` 已清空; 不再依赖会被训练覆盖的 flat checkpoint. 由于
