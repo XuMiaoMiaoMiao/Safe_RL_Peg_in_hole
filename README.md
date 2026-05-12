@@ -10,7 +10,7 @@
 `scripts/archive/v4_baseline.py` 还原 (含完整 reward 方法 + CLI args 快照).
 
 ```
-Stage 1g (prepos):   ckpt = results/checkpoints/saved/Stage1_prepos_for_stage2_S1g_refine_seed0_best_hold.msh
+Stage 1g (prepos):   ckpt = results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/best_hold.msh
 Stage 2g (preaxis):  ckpt = results/checkpoints/saved/Stage2_preaxis_for_stage3_2026-05-11_11-47-34_best_hold.msh
 Stage 3g (insert):   ckpt = results/checkpoints/saved/SAC_v8_from_stage2_less_scrape_best_hold.msh
                             (SAC v8 from preaxis, clean insertion verified)
@@ -25,11 +25,14 @@ Stage 3g v8 SAC 用 5-channel reward (advance + dwell + pen + bad_entry + linear
 
 ## ⚠️ 关键 invariants (任何 SAC/Lagrangian 训练都要遵守)
 
-1. `n_steps_per_epoch = horizon × num_envs` (= 200 × 16 = **3200**). 不能用旧
-   1024, 否则 VectorCore 每次 reset 全 envs, 训练永远只见 episode 前 64 步.
-   (silent bug, 见 memory `feedback_mushroom_vectorcore_truncation.md`)
-2. `--exclude_ee_from_physx_self_collision` 必传. 副作用是 PhysX 物理层也不阻止
-   peg 穿过 hole walls. 物理 feasibility 信号 = 几何 `penetration_max` 量.
+1. `n_steps_per_epoch = horizon × num_envs`. 当前 full-episode 主线:
+   Stage 1g h100 → **1600**, Stage 3g h200 → **3200**. 不要再把旧 1024 当
+   默认正式参数; 1024 只可用于复现旧 truncation / curriculum ablation.
+   (silent bug 背景见 memory `feedback_mushroom_vectorcore_truncation.md`)
+2. Stage 3g insertion / 任何会发生 peg-hole 接触的训练必须传
+   `--exclude_ee_from_physx_self_collision`. 副作用是 PhysX 物理层也不阻止
+   peg 穿过 hole walls, 因此物理 feasibility 信号 = 几何 `penetration_max` 量.
+   Stage 1g prepos 不接触 hole, 本次 h100 full-episode 训练没有使用该开关.
 3. `insert_mask` 含 `penetration_max < geom_pen_th` 项 (默认 1mm). 不含此项
    ckpt selection 会选穿模假成功.
 4. SAC seed=1 verified (seed=0 七次失败). multi-seed sweep 从 seed=1 起.
@@ -47,9 +50,12 @@ Stage 3g v8 SAC 用 5-channel reward (advance + dwell + pen + bad_entry + linear
 
 | Stage | 目标 | checkpoint |
 |---|---|---|
-| Stage 1g `prepos` | peg 到 hole 入口前的 preinsert 位置 | `results/checkpoints/saved/Stage1_prepos_for_stage2_S1g_refine_seed0_best_hold.msh` |
+| Stage 1g `prepos` | peg 到 hole 入口前的 preinsert 位置 | `results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/best_hold.msh` |
 | Stage 2g `preaxis` | preinsert 位置 + peg/hole 轴对齐 | `results/checkpoints/saved/Stage2_preaxis_for_stage3_2026-05-11_11-47-34_best_hold.msh` |
 | Stage 3g `insert` | 真实 clean insertion | `results/checkpoints/saved/SAC_v8_from_stage2_less_scrape_best_hold.msh` |
+
+注意: Stage 2g / Stage 3g 仍是 2026-05-11/12 verified chain; 它们尚未用
+2026-05-12 h100 full-episode Stage 1g 重新 warm-start 训练.
 
 当前 setup (post-Davide / collision-aware) 的关键事实:
 
@@ -60,6 +66,117 @@ Stage 3g v8 SAC 用 5-channel reward (advance + dwell + pen + bad_entry + linear
    `penetration_max` 判断物理可行性.
 
 ---
+
+## Stage 1g (prepos, **已训练完成 — h100 full-episode cold-start 2026-05-12**)
+
+### 当前状态
+
+**Stage 1g (`geom_stage="prepos"`) h100 full-episode cold-start 成功**:
+- canonical ckpt: `results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/best_hold.msh`
+- 原始路径: `results/checkpoints/2026-05-12/18-35-31/best_hold.msh`
+- wandb run: `S1g_prepos_h100_full_ep_balanced_seed0`
+- 训练 best: `geom_hold_rate=1.000`, `geom_max_run_mean=65.2/100`,
+  `best_score=65.188`, `best_J=-85.082`
+- 训练后期 actor 有漂移; **部署 / warm-start 用 `best_hold.msh`, 不用
+  `final_agent.msh`**.
+
+独立 eval (16 ep, deterministic, h100):
+- `J(γ)=-86.690`, `R=-99.146`
+- `geom_step_rate=0.621`, `geom_hold_rate=1.000`,
+  `geom_max_run_mean=55.7/100`, `final_success_rate=1.000`
+- `d_err_mean=0.0171m`, final `d_err=0.0083m`
+- penetration 全程 clean: `max_mean=0.00mm`, `max_max=0.00mm`
+- `preaxis=0.000`, `insert=0.000` 是预期行为: Stage 1g 不约束
+  `radial_max` / `axis_err`, 只学 prepos.
+
+### 目标
+
+Stage 1g 只要求 peg tip 到达 hole 入口前的 preinsert 几何位置:
+
+```text
+d_target = -0.0800m
+prepos mask = |d - d_target| < geom_d_th  AND  radial_tip < geom_r_tip_th
+默认阈值: geom_d_th=0.030, geom_r_tip_th=0.030
+```
+
+此阶段**不要求** peg/hole 轴对齐, 也不要求整根 peg 的 `radial_max` 小.
+这些由 Stage 2g (`preaxis`) 处理.
+
+### Stage 1g 训练命令 (h100 full-episode cold-start)
+
+```bash
+cd ~/bimanual_peghole && conda activate safe_rl
+
+python scripts/train_sac.py \
+  --geom_stage prepos \
+  --geom_radial_sat 1.5 --geom_d_sat 0.30 \
+  --rew_geom_d 8.0 --rew_geom_radial_tip 8.0 \
+  --horizon 100 --n_epochs 120 --n_steps_per_epoch 1600 \
+  --num_envs 16 --n_eval_episodes 16 \
+  --terminal_hold_bonus 0 --hold_success_steps 10 \
+  --rew_home 0.00075 --home_weights 1,1,1,1,0.75,0.5,0.5 \
+  --lr_actor 7e-5 --lr_critic 3e-4 --lr_alpha 3e-4 \
+  --alpha_max 0.15 --target_entropy -7 \
+  --seed 0 \
+  --wandb_run_name S1g_prepos_h100_full_ep_balanced_seed0 \
+  --wandb_group geom_repro
+```
+
+训练结束后保存模型:
+
+```bash
+mkdir -p results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31
+cp results/checkpoints/2026-05-12/18-35-31/best_hold.msh \
+   results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/
+cp results/checkpoints/2026-05-12/18-35-31/best_agent.msh \
+   results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/
+cp results/checkpoints/2026-05-12/18-35-31/final_agent.msh \
+   results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/
+```
+
+### Stage 1g eval
+
+```bash
+python scripts/eval_sac.py \
+  --agent_path results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/best_hold.msh \
+  --geom_stage prepos \
+  --geom_radial_sat 1.5 --geom_d_sat 0.30 \
+  --rew_geom_d 8.0 --rew_geom_radial_tip 8.0 \
+  --geom_d_th 0.030 --geom_r_tip_th 0.030 \
+  --horizon 100 \
+  --num_envs 16 --n_episodes 16 \
+  --hold_success_steps 10 \
+  --headless
+```
+
+期望独立 eval 数字:
+
+```text
+geom_hold_rate = 1.000
+geom_step_rate ≈ 0.62
+geom_max_run_mean ≈ 55-65 / 100
+final_success_rate = 1.000
+penetration max = 0.00mm
+```
+
+### Stage 1g visualization
+
+```bash
+python scripts/visualize_policy.py \
+  --agent_path results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/best_hold.msh \
+  --geom_stage prepos \
+  --geom_radial_sat 1.5 --geom_d_sat 0.30 \
+  --rew_geom_d 8.0 --rew_geom_radial_tip 8.0 \
+  --geom_d_th 0.030 --geom_r_tip_th 0.030 \
+  --horizon 100 \
+  --num_envs 4 --n_episodes 4 \
+  --hold_steps 10 \
+  --freeze_seconds 20
+```
+
+图像判断: peg tip 应稳定在 hole entrance 前方的 preinsert 位置附近; 轴向
+`axis_err` 和整杆 `radial_max` 可以很大, 这是 Stage 1g 预期. Stage 2g
+才负责轴对齐和 `radial_max`.
 
 ## Stage 3 (insertion, **已训练完成 — SAC v8 2026-05-12**)
 
