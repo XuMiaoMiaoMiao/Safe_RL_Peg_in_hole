@@ -4,7 +4,8 @@
     Stage 1 = pos-only         rew_axis=0,   success_axis_threshold=inf
     Stage 2 = pos + axis 对齐  rew_axis=0.5, success_axis_threshold=0.50
                               + axis_gate_radius=0.40m + rew_pos_success
-    Stage 3+ = 真插入 (radial/axial reward, 还没实现)
+    Stage 3g = 真插入          geom_stage="insert" (d / radial_max / axis /
+                              penetration-aware reward)
 
 切换 stage 不改 env 结构, 只改 reward 权重和 success_axis_threshold. Stage 1
 → Stage 2 用 --load_agent + --actor_only_warmstart 做 actor 转移, obs 维度
@@ -147,6 +148,27 @@ _PART_Z = 0.155
 # 2× 放大 (Step 2 重设计). hole_outer = 24mm 半径 = 48mm 直径, 给 Robotiq
 # Hande 50mm 开度留 2mm 安全余量. 长宽等比放大保持原始比例.
 _PEG_HEIGHT = 0.070
+# USD-verified geometry for penetration metric (codex 2026-05-11 议:
+# trajectory-level 几何约束, 不依赖 PhysX contact). 跟
+# assets/usd/dual_arm_iiwa/dual_arm_iiwa_with_peghole.usda 对齐:
+# - Peg = Cylinder radius=0.016 height=0.07 (peg 实体半径)
+# - Hole = 16 个 Cube wall ring, 内壁半径 0.020 (inner_r), 高 0.06 (沿 hole 轴)
+# - Bottom stopper Cylinder radius=0.020 在 hole 底 (z=-0.0315 局部)
+# 物理 clearance = 0.020 - 0.016 = 0.004m (peg shaft 表面到 hole 内壁的最小净空)
+_PEG_RADIUS = 0.016
+_HOLE_INNER_RADIUS = 0.020
+_HOLE_OUTER_RADIUS = 0.024
+_HOLE_WALL_THICKNESS = _HOLE_OUTER_RADIUS - _HOLE_INNER_RADIUS   # 0.004 = 4mm
+_HOLE_DEPTH = 0.060
+# axial 范围 (hole_entry 帧, hole_axis 指 OUT of hole):
+# - 0 = hole entrance plane
+# - -HOLE_DEPTH = hole bottom plane
+# 一个 sample 真正"跟 hole wall 物理相交"需要双重条件:
+#   1. axial_s ∈ [-_HOLE_DEPTH, 0]  (在 wall 的轴向范围内)
+#   2. radial_s < _HOLE_OUTER_RADIUS + _PEG_RADIUS  (peg cross-section 跟 wall ring
+#      有重叠的可能; 远场 peg 即使 axial 落入范围也不算穿模)
+# penetration 物理上限 = wall_thickness = 4mm (peg 完全穿过 4mm 厚的 wall 后,
+# peg 已在 wall 外侧空间, 不再"in wall"). 用 clamp(0, 4mm) 防 1.3m 这种远场假数据.
 _HOLE_HEIGHT = 0.060
 _PEG_TIP_LOCAL_Z = 0.5 * _PEG_HEIGHT       # 0.035
 _HOLE_ENTRY_LOCAL_Z = 0.5 * _HOLE_HEIGHT   # 0.030
@@ -177,8 +199,25 @@ _AGENT_OBS_JOINT_VEL = slice(14, 28)
 _AGENT_OBS_POS_VEC = slice(28, 31)
 _AGENT_OBS_AXIS_DOT = slice(31, 32)         # 仅 BASE
 _AGENT_OBS_AXIS_RESID = slice(31, 34)       # 仅 AXIS_RESID (替换 axis_dot)
+# Geom obs 在 AXIS_RESID 末尾追加 7 维 几何信号 (1+3+3):
+#   d            = -axial_dist  (peg 进入 hole 深度标量, d>0 = inserted)
+#   radial_vec   = (peg_tip - hole_entry) - axial_dist · hole_axis
+#                  ↑ 世界帧 3D 向量, 但已减掉 hole_axis 投影 → axial 分量 = 0
+#                    没做严格 hole-local frame rotation (省了构造正交 basis 的开销),
+#                    actor 可以靠 axis_resid 推 hole_axis 方向, joint state 推世界
+#                    朝向, 信息上等价于 hole-local 表示.
+#   peg_in_hole  = peg_tip - hole_entry  (世界帧 3D 相对位移, 含 axial+radial 全分量)
+_AGENT_OBS_STAGE3_D = slice(34, 35)
+_AGENT_OBS_STAGE3_RADIAL_VEC = slice(35, 38)
+_AGENT_OBS_STAGE3_PEG_IN_HOLE = slice(38, 41)
 AGENT_OBS_DIM_BASE = 32
 AGENT_OBS_DIM_AXIS_RESID = 34
+AGENT_OBS_DIM_GEOM = 41
+
+# Peg 沿轴采样偏移 (m, 从 tip 往 peg base 方向). peg 总长 7cm
+# (_PEG_HEIGHT=0.070), 不要超 -0.06 否则采到 EE coupler 段虚拟杆.
+# 用于 geom_stage radial_max / penetration_max 计算.
+DEFAULT_PEG_SAMPLE_OFFSETS = (0.0, -0.02, -0.04, -0.06)
 
 DEFAULT_PREINSERT_OFFSET = 0.05
 DEFAULT_HOME_WEIGHTS = (1.0,) * 14
@@ -232,6 +271,114 @@ class DualArmPegHoleEnv(IsaacSim):
         #                              全程光滑无奇异, 当前 Stage 2 推荐)
         #   False                   → 32 维 base (axis_dot 标量, Stage 1 默认)
         use_axis_resid_obs=False,
+        # Peg-shaft sample offsets — used by geom_stage radial_max /
+        # penetration_max sampling.  None → DEFAULT_PEG_SAMPLE_OFFSETS.
+        peg_sample_offsets=None,
+        # ──────────────── Geometric preinsert (Stage 1g/2g/3g) ────────────────
+        # 几何同源 reward 主线. obs 41D, 不用球形 pos_err.
+        # geom_stage:
+        #   None       → 旧 Stage 1/2 _compute_normal_reward (Lagrangian baseline 用)
+        #   "prepos"   → Stage 1g: -w_geom_d·|d-d_target| - w_geom_radial_tip·sat(rad_tip)
+        #   "preaxis"  → Stage 2g: + radial_max + axis dense (warm-start prepos ckpt)
+        #   "insert"   → Stage 3g: 同 preaxis, d_target 由 set_geom_epoch 从 d_target_neg
+        #                          线性 ramp 到 d_target_pos (insert 推进)
+        # 不带 hard success cliff; success 仅写入 info dict 给 eval / best_hold ckpt.
+        geom_stage=None,
+        # d_target schedule (insert mode only). prepos / preaxis 用 d_target_neg 不动.
+        geom_d_target_neg=-0.08,
+        geom_d_target_pos=+0.03,
+        geom_d_target_ramp_start=0,
+        geom_d_target_ramp_end=60,
+        # peak weights (per-step, 单位 m^-1 或无量纲, dense gradient only)
+        rew_geom_d=None,
+        rew_geom_radial_tip=None,
+        rew_geom_radial_max=None,
+        rew_geom_axis=None,
+        # saturation (clip 远场幅值, 防 cold start critic 难学)
+        geom_d_sat=0.12,
+        geom_radial_sat=0.10,
+        # optional Gaussian soft success well (default off — codex 拍板默认 0)
+        rew_geom_soft_success=0.0,
+        geom_soft_d_sigma=0.02,
+        geom_soft_radial_sigma=0.015,
+        geom_soft_axis_sigma=0.30,
+        # 可选: 把 penetration 纳入 soft well exponent (codex 2026-05-11 v4
+        # "clean_dwell" 提案). default None = 不纳入 (向后兼容 3-项 well).
+        # finite>0 = 加入第 4 项 exp(-(penetration/σ_pen)²), 让 well 只在
+        # "干净 dwell" 时给正奖励, 穿模 dwell 直接拿 ~0. 推荐 0.001 = 1mm.
+        geom_soft_penetration_sigma=None,
+        # bootstrap success thresholds (训练期 best_hold ckpt 用;
+        # 严格 eval 由 CLI 覆盖, 跑 strict eval 单独传更紧的值)
+        geom_d_th=0.03,
+        geom_r_tip_th=0.03,
+        geom_r_max_th=0.03,
+        geom_axis_th=0.40,
+        # insert mode 真 insert 阈值 (geom_stage="insert" 时取代 d_th)
+        geom_insert_d_ins=0.025,
+        geom_insert_r_max_th=0.025,    # bootstrap (strict eval 用 0.015)
+        # penetration 阈值 (codex 2026-05-11 v4): insert_mask 现加
+        # penetration_max < geom_pen_th. 否则 best_hold ckpt 会被穿模状态
+        # 误选 ("满 mask 但物理穿过 4mm wall" 假好). 默认 0.001 = 1mm 数值噪声
+        # 容忍; 严格 eval 用 0.0005.
+        geom_pen_th=0.001,
+        # ─── Alignment-gated progress reward (codex 提案, 解决 additive 不强制
+        # joint 满足问题). r_progress = w_progress · clamp(d - d_target_neg,
+        # 0, d_target_pos - d_target_neg) · exp(-(rm/σ_r)² - (axis/σ_a)²).
+        # w_progress=0 (默认) 关闭, 与原 additive 行为兼容. 推荐 insert 配方:
+        # w_progress=8-10, σ_r=0.025 (= r_max_th), σ_a=0.30 (= axis_th).
+        rew_geom_progress=None,
+        geom_gate_radial_sigma=0.025,
+        geom_gate_axis_sigma=0.30,
+        # ─── Penetration-aware reward (SAC vs Lagrangian SAC 对比所需).
+        # penetration_max 已经在 env 里算 (per-step physical 穿模量, [0, 4mm]).
+        # 这里加 reward 接入 + cost signal switch:
+        # - rew_geom_penetration: 软 penalty -w_pen·penetration_max. 默认 0=关.
+        #   推荐 SAC: 10-20. Lagrangian SAC: 0 (用 cost 信号代替).
+        # - geom_gate_penetration_sigma: gate 里 penetration 项的 σ. 设 finite 值
+        #   (e.g. 0.002 = 2mm) 把 penetration 纳入 alignment_gate 乘子, 让 progress
+        #   reward 在穿模时趋 0. 默认 None=不纳入 gate.
+        # - cost_signal: 'collision' (老的 0/1 indicator) 或 'penetration'
+        #   (= penetration_max 连续 [0, 4mm]). Lagrangian SAC 配 'penetration'.
+        rew_geom_penetration=None,
+        geom_gate_penetration_sigma=None,
+        cost_signal="collision",
+        # progress floor (codex 2026-05-11 v2): progress reward 起点.
+        # 默认 0.0 = 只奖励 peg 真正越过 hole 入口 (d > 0). 旧行为 (奖励
+        # "从 preinsert 接近 entrance") 用 -0.08 (= d_target_neg).
+        # 改默认到 0.0 是因为旧公式让 agent 学到 "hover at entrance" 局部最优,
+        # 不真插入也能拿 70%+ progress reward. 见 SAC_pen_aware_v1 失败分析.
+        geom_progress_floor=0.0,
+        # ─── Delta-progress (potential-based) reward (codex 2026-05-11 v3 提案).
+        # 旧 state-based progress 让 agent "占位赚钱", 改成 Δphi 让 agent 必须
+        # "前进才赚钱". phi(s) = clean_gate(s) × clamp((d - d_neg)/(d_pos - d_neg), 0, 1).
+        # r_advance = w_advance × (phi_t - phi_{t-1}). 关键工程点: phi_prev 在
+        # episode reset 时必须无效化, 否则跨 episode delta 会有 spurious 大值.
+        # 默认 0 = off (向后兼容).
+        rew_geom_advance=None,
+        # ─── Task-ordering 修复 (codex 2026-05-11 v6 提案): clean insertion 是
+        # 有顺序约束的任务 (先对齐再越过 entrance), 不是几项 reward 简单相加.
+        # 之前所有 SAC 失败 (v1-v5) 共同模式: agent 找到"d 满足但 radial/axis 不
+        # 满足"的捷径状态 (v5 ep37: d=+0.048 但 radial=16.8cm).
+        # 两个 reward 结构修法:
+        #
+        # 1) geom_d_gate_mode: r_d 是否乘 alignment_gate, 让 r_d 只在 aligned
+        #    状态有奖励. 默认 "off" (向后兼容); "alignment" 启用 codex 修法.
+        #
+        # 2) rew_geom_bad_entry: 显式惩罚 "d > 0 但对齐不达标". 当前公式
+        #    使用归一化 violation 并 clamp 上界:
+        #    depth_norm = clamp(d / d_target_pos, 0, 2)
+        #    violation_i = clamp(metric_i / safe_i - 1, 0, 3)
+        #    r_bad_entry = -w_be × depth_norm × clamp(sum_i violation_i, 0, 3)
+        #    d ≤ 0 (peg 在 hole 外): 项 = 0
+        #    d > 0 + 对齐 OK: 项 = 0
+        #    d > 0 + 对齐烂: 越深越罚, 越烂越罚
+        #    强制 task ordering: agent 必须在 d<0 阶段把对齐做对, 才敢越过 entrance.
+        #    默认 0 = off.
+        geom_d_gate_mode="off",
+        rew_geom_bad_entry=None,
+        geom_bad_entry_radial_safe=0.010,    # 10mm — 比 r_max_th 严
+        geom_bad_entry_axis_safe=0.10,        # ~26° — 比 axis_th 严
+        geom_bad_entry_pen_safe=0.0005,       # 0.5mm — 比 pen_th 严
         usd_path=None,
     ):
         self._action_scale = action_scale
@@ -299,11 +446,222 @@ class DualArmPegHoleEnv(IsaacSim):
         self._exclude_ee_from_physx_self_collision = bool(
             exclude_ee_from_physx_self_collision
         )
+        # Geometric preinsert 设置必须先于 obs dim 决定:
+        # geom_stage 启用时隐含 use_axis_resid_obs=True, obs = AXIS_RESID 34 + 7 维几何 = 41 维.
+        if geom_stage is None or geom_stage == "":
+            self._geom_stage = None
+        else:
+            self._geom_stage = str(geom_stage).lower()
+            if self._geom_stage not in ("prepos", "preaxis", "insert"):
+                raise ValueError(
+                    "geom_stage 必须是 None / 'prepos' / 'preaxis' / 'insert', "
+                    f"got {geom_stage!r}"
+                )
+        # geom_stage 设计原则: dense reward + hold-N 仅作 eval 指标. 若 terminal_hold_bonus>0,
+        # is_absorbing 会把 hold-N absorbing 接回 geom_success_mask, 等价于把 geom success
+        # 变成 hard cliff (违反 Rule 1: 边界 Q-cliff; 也违反 cliff reward 训中心不训 floor).
+        # 这是个容易误用的脚枪, 直接 raise 而不是 warn.
+        if self._geom_stage is not None and self._terminal_hold_bonus > 0.0:
+            raise ValueError(
+                f"geom_stage={self._geom_stage!r} 与 terminal_hold_bonus={self._terminal_hold_bonus} > 0 互斥: "
+                "几何路径必须靠 dense reward, 不用 hold-N absorbing 把 success 变 hard cliff. "
+                "请关掉 terminal_hold_bonus (默认 0), 或切回 geom_stage=None."
+            )
+        if self._geom_stage is not None:
+            use_axis_resid_obs = True
+
         self._use_axis_resid_obs = bool(use_axis_resid_obs)
-        if self._use_axis_resid_obs:
+        if self._geom_stage is not None:
+            self._agent_obs_dim = AGENT_OBS_DIM_GEOM
+        elif self._use_axis_resid_obs:
             self._agent_obs_dim = AGENT_OBS_DIM_AXIS_RESID
         else:
             self._agent_obs_dim = AGENT_OBS_DIM_BASE
+
+        # Peg-shaft sample offsets — used by geom_stage radial_max / penetration_max.
+        if peg_sample_offsets is None:
+            offsets = DEFAULT_PEG_SAMPLE_OFFSETS
+        else:
+            offsets = tuple(float(x) for x in peg_sample_offsets)
+            if any(o > 0.0 or o < -_PEG_HEIGHT for o in offsets):
+                raise ValueError(
+                    f"peg_sample_offsets 元素必须 ∈ [-{_PEG_HEIGHT:.3f}, 0]; "
+                    f"got {offsets}"
+                )
+        self._peg_sample_offsets = offsets
+
+        # Geometric preinsert (Stage 1g/2g/3g) presets. CLI 可逐项覆盖; 未覆盖时
+        # 根据 geom_stage 选择安全默认值. 旧路径 geom_stage=None 时这些值闲置.
+        geom_presets = {
+            # progress=0 默认 → 跟旧 additive 行为完全等价. CLI 显式 >0 才开 gated.
+            "prepos": dict(d=8.0, radial_tip=8.0, radial_max=0.0, axis=0.0, progress=0.0),
+            "preaxis": dict(d=8.0, radial_tip=2.0, radial_max=5.0, axis=1.0, progress=0.0),
+            "insert": dict(d=5.0, radial_tip=0.0, radial_max=5.0, axis=1.0, progress=0.0),
+            None: dict(d=8.0, radial_tip=8.0, radial_max=0.0, axis=0.0, progress=0.0),
+        }
+        gp = geom_presets[self._geom_stage]
+        self._w_geom_d = float(gp["d"] if rew_geom_d is None else rew_geom_d)
+        self._w_geom_radial_tip = float(
+            gp["radial_tip"] if rew_geom_radial_tip is None else rew_geom_radial_tip
+        )
+        self._w_geom_radial_max = float(
+            gp["radial_max"] if rew_geom_radial_max is None else rew_geom_radial_max
+        )
+        self._w_geom_axis = float(gp["axis"] if rew_geom_axis is None else rew_geom_axis)
+        self._w_geom_progress = float(
+            gp["progress"] if rew_geom_progress is None else rew_geom_progress
+        )
+        self._geom_gate_radial_sigma = float(geom_gate_radial_sigma)
+        self._geom_gate_axis_sigma = float(geom_gate_axis_sigma)
+        self._w_geom_penetration = float(rew_geom_penetration or 0.0)
+        # geom_gate_penetration_sigma=None → 不进 gate; finite>0 → 进 gate
+        self._geom_gate_penetration_sigma = (
+            float(geom_gate_penetration_sigma)
+            if geom_gate_penetration_sigma is not None
+            else None
+        )
+        if (self._geom_gate_penetration_sigma is not None
+                and not (math.isfinite(self._geom_gate_penetration_sigma)
+                         and self._geom_gate_penetration_sigma > 0.0)):
+            raise ValueError(
+                "geom_gate_penetration_sigma 必须 None (不用) 或 finite>0, "
+                f"got {geom_gate_penetration_sigma}"
+            )
+        if not (math.isfinite(self._w_geom_penetration)
+                and self._w_geom_penetration >= 0.0):
+            raise ValueError(
+                f"rew_geom_penetration must be finite and >= 0, got {self._w_geom_penetration}"
+            )
+        if cost_signal not in ("collision", "penetration"):
+            raise ValueError(
+                f"cost_signal 必须 'collision' 或 'penetration', got {cost_signal!r}"
+            )
+        self._cost_signal = cost_signal
+        # d_target 必须先赋值, 因为下面 progress_floor 校验依赖它.
+        self._geom_d_target_neg = float(geom_d_target_neg)
+        self._geom_d_target_pos = float(geom_d_target_pos)
+        self._geom_d_target_eff = self._geom_d_target_neg
+        self._geom_progress_floor = float(geom_progress_floor)
+        if not math.isfinite(self._geom_progress_floor):
+            raise ValueError(
+                f"geom_progress_floor must be finite, got {geom_progress_floor}"
+            )
+        # progress_floor 应该 ≥ d_target_neg (起点之前的位置), ≤ d_target_pos (终点),
+        # 否则 progress 区间没意义.
+        if not (self._geom_d_target_neg <= self._geom_progress_floor <= self._geom_d_target_pos):
+            raise ValueError(
+                f"geom_progress_floor ({self._geom_progress_floor:+.4f}) 必须 ∈ "
+                f"[{self._geom_d_target_neg:+.4f}, {self._geom_d_target_pos:+.4f}] "
+                "(d_target_neg, d_target_pos 区间内)"
+            )
+        # delta-progress (PBRS): phi 用 clean_gate × normalized_position
+        self._w_geom_advance = float(rew_geom_advance or 0.0)
+        if not (math.isfinite(self._w_geom_advance) and self._w_geom_advance >= 0.0):
+            raise ValueError(
+                f"rew_geom_advance must be finite and >= 0, got {self._w_geom_advance}"
+            )
+        # Task-ordering 修复 (codex 2026-05-11 v6)
+        if geom_d_gate_mode not in ("off", "alignment"):
+            raise ValueError(
+                f"geom_d_gate_mode 必须 'off' 或 'alignment', got {geom_d_gate_mode!r}"
+            )
+        self._geom_d_gate_mode = geom_d_gate_mode
+        self._w_geom_bad_entry = float(rew_geom_bad_entry or 0.0)
+        if not (math.isfinite(self._w_geom_bad_entry) and self._w_geom_bad_entry >= 0.0):
+            raise ValueError(
+                f"rew_geom_bad_entry must be finite and >= 0, got {self._w_geom_bad_entry}"
+            )
+        self._geom_bad_entry_radial_safe = float(geom_bad_entry_radial_safe)
+        self._geom_bad_entry_axis_safe = float(geom_bad_entry_axis_safe)
+        self._geom_bad_entry_pen_safe = float(geom_bad_entry_pen_safe)
+        for name, value in (
+            ("geom_bad_entry_radial_safe", self._geom_bad_entry_radial_safe),
+            ("geom_bad_entry_axis_safe", self._geom_bad_entry_axis_safe),
+            ("geom_bad_entry_pen_safe", self._geom_bad_entry_pen_safe),
+        ):
+            if not (math.isfinite(value) and value > 0.0):
+                raise ValueError(f"{name} must be finite > 0, got {value}")
+        self._geom_d_target_ramp_start = int(geom_d_target_ramp_start)
+        self._geom_d_target_ramp_end = int(geom_d_target_ramp_end)
+        if self._geom_d_target_ramp_end < self._geom_d_target_ramp_start:
+            raise ValueError(
+                f"geom_d_target_ramp_end ({self._geom_d_target_ramp_end}) must >= "
+                f"geom_d_target_ramp_start ({self._geom_d_target_ramp_start})"
+            )
+        self._geom_d_sat = float(geom_d_sat)
+        self._geom_radial_sat = float(geom_radial_sat)
+        self._w_geom_soft_success = float(rew_geom_soft_success)
+        self._geom_soft_d_sigma = float(geom_soft_d_sigma)
+        self._geom_soft_radial_sigma = float(geom_soft_radial_sigma)
+        self._geom_soft_axis_sigma = float(geom_soft_axis_sigma)
+        self._geom_soft_penetration_sigma = (
+            float(geom_soft_penetration_sigma)
+            if geom_soft_penetration_sigma is not None
+            else None
+        )
+        if (self._geom_soft_penetration_sigma is not None
+                and not (math.isfinite(self._geom_soft_penetration_sigma)
+                         and self._geom_soft_penetration_sigma > 0.0)):
+            raise ValueError(
+                "geom_soft_penetration_sigma 必须 None (不用) 或 finite>0, "
+                f"got {geom_soft_penetration_sigma}"
+            )
+        self._geom_d_th = float(geom_d_th)
+        self._geom_r_tip_th = float(geom_r_tip_th)
+        self._geom_r_max_th = float(geom_r_max_th)
+        self._geom_axis_th = float(geom_axis_th)
+        self._geom_insert_d_ins = float(geom_insert_d_ins)
+        self._geom_insert_r_max_th = float(geom_insert_r_max_th)
+        self._geom_pen_th = float(geom_pen_th)
+        for name, value in (
+            ("geom_d_sat", self._geom_d_sat),
+            ("geom_radial_sat", self._geom_radial_sat),
+            ("geom_soft_d_sigma", self._geom_soft_d_sigma),
+            ("geom_soft_radial_sigma", self._geom_soft_radial_sigma),
+            ("geom_soft_axis_sigma", self._geom_soft_axis_sigma),
+            ("geom_d_th", self._geom_d_th),
+            ("geom_r_tip_th", self._geom_r_tip_th),
+            ("geom_r_max_th", self._geom_r_max_th),
+            ("geom_axis_th", self._geom_axis_th),
+            ("geom_insert_d_ins", self._geom_insert_d_ins),
+            ("geom_insert_r_max_th", self._geom_insert_r_max_th),
+            ("geom_pen_th", self._geom_pen_th),
+            ("geom_gate_radial_sigma", self._geom_gate_radial_sigma),
+            ("geom_gate_axis_sigma", self._geom_gate_axis_sigma),
+        ):
+            if not (math.isfinite(value) and value > 0.0):
+                raise ValueError(f"{name} must be finite and > 0, got {value}")
+        if not (math.isfinite(self._w_geom_progress) and self._w_geom_progress >= 0.0):
+            raise ValueError(
+                f"rew_geom_progress must be finite and >= 0, got {self._w_geom_progress}"
+            )
+        # gated progress 需要 d_target_pos > d_target_neg 才有意义的 progress 区间.
+        # 只在 insert 模式或显式开启 gated progress (w_progress > 0) 时强制此约束,
+        # 防止 prepos / preaxis 调试时误伤 (那两个 stage 不读 d_target_pos).
+        _gated_active = (
+            self._geom_stage == "insert" or self._w_geom_progress > 0.0
+        )
+        if _gated_active and self._geom_d_target_pos <= self._geom_d_target_neg:
+            raise ValueError(
+                f"geom_d_target_pos ({self._geom_d_target_pos:+.4f}) must > "
+                f"geom_d_target_neg ({self._geom_d_target_neg:+.4f}) "
+                f"when geom_stage=insert or rew_geom_progress > 0; "
+                "gated progress range otherwise 是负的或 0, reward 信号无效."
+            )
+        # geom_stage 启用时: obs 里 pos_vec = peg_tip - (hole_entry + preinsert_offset·hole_axis),
+        # reward 里 d_target_eff 从 geom_d_target_neg 起算. 若 preinsert_offset != abs(d_target_neg),
+        # obs target 和 reward target 是不同深度, agent 学到的 anchor 跟 reward 实际推的目标错位.
+        # train_sac/eval/viz 已在 CLI 端自动同步, 但直接构造 env (e.g. notebook / 调试脚本) 时
+        # 没人兜底, 所以在 env 端 fail-fast.
+        if self._geom_stage is not None:
+            expected_offset = abs(self._geom_d_target_neg)
+            if abs(self._preinsert_offset - expected_offset) > 1e-4:
+                raise ValueError(
+                    f"geom_stage={self._geom_stage!r} 启用时, preinsert_offset "
+                    f"(={self._preinsert_offset:+.4f}) 必须等于 abs(geom_d_target_neg) "
+                    f"(={expected_offset:.4f}); 否则 obs 里 pos_vec 的 target 跟 reward 的 "
+                    "d_target 是两个不同深度, agent 学到的 anchor 与 reward 实际推的目标错位."
+                )
         if not (math.isfinite(self._proxy_arm_radius) and self._proxy_arm_radius > 0.0):
             raise ValueError(
                 f"proxy_arm_radius 必须是有限正数, 传入 {proxy_arm_radius}"
@@ -334,6 +692,19 @@ class DualArmPegHoleEnv(IsaacSim):
         # _preprocess_action → reward 链路里缓存 pre-scale 的 raw action,
         # 用于 L2 惩罚. 这样 w_action 和 action_scale 解耦.
         self._last_raw_action = None
+        # Geom 几何 cache — 仅 geom_stage 非空时由 _create_observation 写入,
+        # _compute_geom_reward_components 读. Lagrangian (None) 路径不读这些字段.
+        self._cached_d = None
+        self._cached_radial_vec = None
+        self._cached_radial_err_tip = None
+        self._cached_radial_max = None
+        self._cached_penetration_max = None
+        self._cached_peg_in_hole = None
+        # phi (PBRS potential) per-env cache. None = 还没构造; 构造后是 tensor (n_envs,).
+        # _phi_first_step_mask[i]=True 表示 env i 刚 reset, 第一次 reward 计算时
+        # Δphi 应当置 0 (上一 episode 末态 phi 不能跨 episode 用做 prev).
+        self._cached_phi_prev = None
+        self._phi_first_step_mask = None
 
         observation_spec = [
             ("joint_pos", "", ObservationType.JOINT_POS, ARM_JOINTS),
@@ -467,7 +838,7 @@ class DualArmPegHoleEnv(IsaacSim):
         jv_high = raw_high[jv_idx].to(dtype)
         pos_lo = torch.full((3,), -5.0, device=jp_low.device, dtype=dtype)
         pos_hi = torch.full((3,), 5.0, device=jp_low.device, dtype=dtype)
-        if self._use_axis_resid_obs:
+        if self._use_axis_resid_obs or self._geom_stage is not None:
             # axis_resid = peg_axis + hole_axis, 每分量 ∈ [-2, +2] (两个单位向量和).
             resid_lo = torch.full((3,), -2.0, device=jp_low.device, dtype=dtype)
             resid_hi = torch.full((3,), +2.0, device=jp_low.device, dtype=dtype)
@@ -478,6 +849,18 @@ class DualArmPegHoleEnv(IsaacSim):
             axis_hi = torch.full((1,), 1.0, device=jp_low.device, dtype=dtype)
             chunks_low = [jp_low, jv_low, pos_lo, axis_lo]
             chunks_high = [jp_high, jv_high, pos_hi, axis_hi]
+        if self._geom_stage is not None:
+            # Geometric preinsert 末尾 7 维:
+            #   d (1D, 深度) + radial_vec (3D, world-frame 法向)
+            #   + peg_in_hole (3D, world-frame 相对). 所有量都是米, 半世界尺度足够.
+            d_lo = torch.full((1,), -0.5, device=jp_low.device, dtype=dtype)
+            d_hi = torch.full((1,), +0.5, device=jp_low.device, dtype=dtype)
+            radvec_lo = torch.full((3,), -0.5, device=jp_low.device, dtype=dtype)
+            radvec_hi = torch.full((3,), +0.5, device=jp_low.device, dtype=dtype)
+            peg_lo = torch.full((3,), -1.0, device=jp_low.device, dtype=dtype)
+            peg_hi = torch.full((3,), +1.0, device=jp_low.device, dtype=dtype)
+            chunks_low.extend([d_lo, radvec_lo, peg_lo])
+            chunks_high.extend([d_hi, radvec_hi, peg_hi])
         new_obs_low = torch.cat(chunks_low, dim=0)
         new_obs_high = torch.cat(chunks_high, dim=0)
         mdp_info.observation_space = Box(new_obs_low, new_obs_high, data_type=dtype)
@@ -490,14 +873,16 @@ class DualArmPegHoleEnv(IsaacSim):
         return clipped * self._action_scale
 
     def _create_observation(self, obs):
-        """raw obs (42 dim) → agent obs (32 或 34 dim, 取决于 use_axis_resid_obs).
+        """raw obs (42 dim) → agent obs (32 / 34 / 41 dim).
 
         raw 布局 (与 observation_spec 顺序一致):
             joint_pos[14] joint_vel[14] left_ee_pos[3] right_ee_pos[3]
             left_ee_rot[4] right_ee_rot[4]
         agent obs 布局 (见 _AGENT_OBS_* 切片):
-            joint_pos[14] joint_vel[14] pos_vec[3] axis_dot[1]                  ← 32D
-            joint_pos[14] joint_vel[14] pos_vec[3] axis_resid[3]                ← 34D
+            joint_pos[14] joint_vel[14] pos_vec[3] axis_dot[1]                       ← 32D
+            joint_pos[14] joint_vel[14] pos_vec[3] axis_resid[3]                     ← 34D
+            joint_pos[14] joint_vel[14] pos_vec[3] axis_resid[3]
+                d[1] radial_vec[3] peg_in_hole[3]                                    ← 41D (geom)
         """
         joint_pos = self.observation_helper.get_from_obs(obs, "joint_pos")
         joint_vel = self.observation_helper.get_from_obs(obs, "joint_vel")
@@ -523,9 +908,80 @@ class DualArmPegHoleEnv(IsaacSim):
         axis_err = 1.0 + axis_dot.squeeze(-1)
 
         # cache 给 is_absorbing / reward 复用 (避免再算一遍 quat 旋转).
-        # M3+ 想加 radial_vec / axial_dist 时, 在这里 cache 即可.
         self._cached_pos_vec = pos_vec
         self._cached_axis_err = axis_err
+
+        if self._geom_stage is not None:
+            # Geometric preinsert 几何 (世界帧表达, 没做 hole-local rotation):
+            #   d = -axial_dist 让 d>0 = inserted.
+            #   axial_dist = (peg_tip - hole_entry) · hole_axis. sign 验证见
+            #   scripts/archive/sanity_eval_stage3.py (在 preinsert axial_dist ≈ +preinsert_offset).
+            peg_in_hole = peg_tip - hole_entry
+            axial_dist = (peg_in_hole * hole_axis).sum(dim=-1)
+            d_depth = -axial_dist
+            radial_vec = peg_in_hole - axial_dist.unsqueeze(-1) * hole_axis
+            radial_err_tip = torch.norm(radial_vec, dim=-1)
+
+            # radial_max: 沿 peg 反向多采样点, 取径向距离 max. 杆身斜了 tip 单点严重低估.
+            # penetration_max (codex 2026-05-11 v2): peg 表面相对 hole 内壁的物理
+            # 穿模量. 三个 fix vs v1:
+            #   (a) 加 radial 区间检查: sample 必须 radial_s < OUTER+PEG_R, 否则
+            #       远场 peg 即使 axial 落入范围也不算"in wall" (v1 给过 1316mm 假数据)
+            #   (b) 加上限 clamp: penetration 物理上限 = wall_thickness = 4mm
+            #       (peg 完全穿过 4mm wall 后, peg 已在外侧空间, 不再"in wall")
+            #   (c) 完全 dense, 不依赖 PhysX contact, 不引入 absorb
+            radial_max = radial_err_tip.clone()
+            wall_intersect_radial_limit = _HOLE_OUTER_RADIUS + _PEG_RADIUS  # 0.040m
+            # tip 样本 (offset=0) 也参与: 复用 axial_dist / radial_err_tip 节省计算.
+            tip_in_wall = (
+                (axial_dist < 0.0) & (axial_dist > -_HOLE_DEPTH)
+                & (radial_err_tip < wall_intersect_radial_limit)
+            )
+            tip_penetration = torch.where(
+                tip_in_wall,
+                torch.clamp(
+                    radial_err_tip + _PEG_RADIUS - _HOLE_INNER_RADIUS,
+                    min=0.0, max=_HOLE_WALL_THICKNESS,
+                ),
+                torch.zeros_like(radial_err_tip),
+            )
+            penetration_max = tip_penetration
+            for off in self._peg_sample_offsets:
+                if off == 0.0:
+                    continue
+                sample_pos = peg_tip + off * peg_axis
+                d_s = sample_pos - hole_entry
+                axial_s = (d_s * hole_axis).sum(dim=-1)
+                radial_v_s = d_s - axial_s.unsqueeze(-1) * hole_axis
+                rad_s = torch.norm(radial_v_s, dim=-1)
+                radial_max = torch.maximum(radial_max, rad_s)
+                # 双重检查 + clamp 后 penetration ∈ [0, 0.004m]
+                sample_in_wall = (
+                    (axial_s < 0.0) & (axial_s > -_HOLE_DEPTH)
+                    & (rad_s < wall_intersect_radial_limit)
+                )
+                pen_s = torch.where(
+                    sample_in_wall,
+                    torch.clamp(
+                        rad_s + _PEG_RADIUS - _HOLE_INNER_RADIUS,
+                        min=0.0, max=_HOLE_WALL_THICKNESS,
+                    ),
+                    torch.zeros_like(rad_s),
+                )
+                penetration_max = torch.maximum(penetration_max, pen_s)
+
+            self._cached_d = d_depth
+            self._cached_radial_vec = radial_vec
+            self._cached_radial_err_tip = radial_err_tip
+            self._cached_radial_max = radial_max
+            self._cached_penetration_max = penetration_max
+            self._cached_peg_in_hole = peg_in_hole
+
+            axis_resid = peg_axis + hole_axis
+            return torch.cat([
+                joint_pos, joint_vel, pos_vec, axis_resid,
+                d_depth.unsqueeze(-1), radial_vec, peg_in_hole,
+            ], dim=-1)
 
         if self._use_axis_resid_obs:
             # axis_resid = peg_axis + hole_axis. 同向 (home pose) 模长 2,
@@ -564,6 +1020,54 @@ class DualArmPegHoleEnv(IsaacSim):
         )
         return pos_err, axis_err, success_mask
 
+    def _compute_geom_success_masks(self):
+        """Geometric preinsert success masks from cached 41D geom geometry.
+
+        prepos:  axial depth target + tip radial.
+        preaxis: prepos plus whole-peg radial_max + dense axis threshold.
+        insert:  positive insertion depth + radial_max + axis threshold.
+
+        These masks are for eval / best_hold / optional hold-N only. They are not
+        used as hard reward cliffs in _compute_geom_reward_components.
+        """
+        d = self._cached_d
+        radial_tip = self._cached_radial_err_tip
+        radial_max = self._cached_radial_max
+        penetration_max = self._cached_penetration_max
+        axis_err = self._cached_axis_err
+        d_err = torch.abs(d - self._geom_d_target_eff)
+        prepos_mask = (
+            (d_err < self._geom_d_th)
+            & (radial_tip < self._geom_r_tip_th)
+        )
+        preaxis_mask = (
+            prepos_mask
+            & (radial_max < self._geom_r_max_th)
+            & (axis_err < self._geom_axis_th)
+        )
+        # insert_mask 加 `d_err < geom_d_th` (codex 2026-05-11 fix): 防止 peg
+        # overshoot (d=+0.08, target=+0.03) 被算成功. 没这个深度窗口, mask 只要
+        # peg 越过 d_ins=0.025 就 True, 即使 overshoot 5cm. 加了后 success window
+        # 是 d ∈ [d_ins, d_target_eff + d_th] (典型 [0.025, 0.050]).
+        # 2026-05-11 v4: 同时要求 penetration_max < geom_pen_th, 否则
+        # best_hold 会保存 "mask 满足但穿过 hole wall" 的假成功状态.
+        insert_mask = (
+            (d > self._geom_insert_d_ins)
+            & (d_err < self._geom_d_th)
+            & (radial_max < self._geom_insert_r_max_th)
+            & (axis_err < self._geom_axis_th)
+            & (penetration_max < self._geom_pen_th)
+        )
+        if self._geom_stage == "prepos":
+            active_mask = prepos_mask
+        elif self._geom_stage == "preaxis":
+            active_mask = preaxis_mask
+        elif self._geom_stage == "insert":
+            active_mask = insert_mask
+        else:
+            active_mask = torch.zeros_like(prepos_mask)
+        return prepos_mask, preaxis_mask, insert_mask, active_mask
+
     def is_absorbing(self, obs):
         physx_collision = self._check_collision("arm_L", "arm_R", self._collision_threshold,
                                                 dt=self._timestep)
@@ -588,7 +1092,12 @@ class DualArmPegHoleEnv(IsaacSim):
         pos_err = torch.norm(self._cached_pos_vec, dim=-1)
         axis_err = self._cached_axis_err
         pos_in_thresh = pos_err < self._preinsert_success_pos_threshold
-        success_mask = pos_in_thresh & (axis_err < self._success_axis_threshold)
+        if self._geom_stage is not None:
+            geom_prepos, _, _, geom_success = self._compute_geom_success_masks()
+            success_mask = geom_success
+            pos_in_thresh = geom_prepos
+        else:
+            success_mask = pos_in_thresh & (axis_err < self._success_axis_threshold)
         self._last_pos_err = pos_err
         self._last_axis_err = axis_err
         self._last_pos_success_mask = pos_in_thresh
@@ -610,27 +1119,42 @@ class DualArmPegHoleEnv(IsaacSim):
         return collision | hold_done
 
     def _create_info_dictionary(self, obs):
-        # cost = collision indicator (PhysX OR sphere-proxy), 给 SACLagrangian 用.
-        # is_absorbing 在 step_all 里早于本方法调用 (isaacsim_env.py:174 vs :176),
-        # 因此 _last_collision_mask 已经是当前 step 的最新值.
-        if self._last_collision_mask is None:
+        # cost = constraint cost signal for Lagrangian SAC.
+        # cost_signal='collision' (default, 老语义): 0/1 indicator from PhysX OR
+        #   sphere-proxy. is_absorbing 已 cache _last_collision_mask.
+        # cost_signal='penetration': 连续 [0, 4mm] = peg 表面相对 hole 内壁的
+        #   physical overlap. 几何信号, 不依赖 PhysX contact. 适合 Lagrangian SAC.
+        if self._cost_signal == "penetration" and self._cached_penetration_max is not None:
+            cost = self._cached_penetration_max.to(torch.float32)
+        elif self._last_collision_mask is None:
             cost = torch.zeros(self._n_envs, dtype=torch.float32, device=self._device)
         else:
             cost = self._last_collision_mask.to(torch.float32)
-        return {"cost": cost}
+        info = {"cost": cost}
+        if self._geom_stage is not None and self._cached_d is not None:
+            geom_prepos, geom_preaxis, geom_insert, geom_success = (
+                self._compute_geom_success_masks()
+            )
+            info["geom_d"] = self._cached_d.to(torch.float32)
+            info["geom_d_target"] = torch.full_like(
+                self._cached_d, self._geom_d_target_eff, dtype=torch.float32
+            )
+            info["geom_radial_tip"] = self._cached_radial_err_tip.to(torch.float32)
+            info["geom_radial_max"] = self._cached_radial_max.to(torch.float32)
+            info["geom_axis_err"] = self._cached_axis_err.to(torch.float32)
+            # penetration_max: peg 表面相对 hole 内壁的几何穿模量, > 0 = 物理穿模.
+            # 不进 reward / mask (step 1 instrumentation only), 仅写 info 给 eval
+            # 聚合穿模分布. 后续 step 2/3 决定是否进 reward.
+            info["geom_penetration_max"] = self._cached_penetration_max.to(torch.float32)
+            info["geom_prepos_mask"] = geom_prepos.to(torch.float32)
+            info["geom_preaxis_mask"] = geom_preaxis.to(torch.float32)
+            info["geom_insert_mask"] = geom_insert.to(torch.float32)
+            info["geom_success_mask"] = geom_success.to(torch.float32)
+        return info
 
-    def _compute_normal_reward(self, next_obs):
-        """shaped reward，不含 collision/hold-N absorbing 分支.
-
-        供 reward() 和子类（DualArmPegHoleCostEnv）共用，避免重复实现
-        joint-limit / action / home / axis-gate 等计算逻辑.
-        """
-        joint_pos = next_obs[..., _AGENT_OBS_JOINT_POS]
-        pos_err = self._last_pos_err
-        axis_err = self._last_axis_err
-        full_success = self._last_success_mask.to(pos_err.dtype)
-        pos_success = self._last_pos_success_mask.to(pos_err.dtype)
-
+    def _compute_joint_limit_norm(self, joint_pos):
+        """归一化关节越限惩罚: 各 DoF 越 margin 后线性 ramp [margin_frac, 1] → [0, 1],
+        平方求和. 单位无量纲, w_joint_limit 在 Stage 1/2/3 之间量纲一致."""
         joint_range = self._joint_upper - self._joint_lower
         joint_center = 0.5 * (self._joint_upper + self._joint_lower)
         excess = torch.clamp(
@@ -639,18 +1163,38 @@ class DualArmPegHoleEnv(IsaacSim):
             / (1.0 - self._joint_limit_margin_frac),
             min=0.0, max=1.0,
         )
-        joint_limit_norm = torch.sum(excess ** 2, dim=-1)
+        return torch.sum(excess ** 2, dim=-1)
 
-        action_sq = (self._last_raw_action ** 2).sum(dim=-1)
-
-        home_dev = (joint_pos - self._default_joint_pos.unsqueeze(0)) / joint_range.unsqueeze(0)
-        home_norm = (self._home_weights.unsqueeze(0) * (home_dev ** 2)).sum(dim=-1)
-
+    def _compute_axis_gate(self, pos_err):
+        """axis 惩罚的距离门控: pos_err >= gate_radius 时关 (gate=0); 进入
+        [pos_th, gate_radius] 区间线性 ramp; pos 进阈后 gate=1.
+        gate_radius=inf 退化为不门控."""
         if math.isfinite(self._axis_gate_radius):
             denom = max(self._axis_gate_radius - self._preinsert_success_pos_threshold, 1e-6)
-            axis_gate = ((self._axis_gate_radius - pos_err) / denom).clamp(0.0, 1.0)
-        else:
-            axis_gate = torch.ones_like(pos_err)
+            return ((self._axis_gate_radius - pos_err) / denom).clamp(0.0, 1.0)
+        return torch.ones_like(pos_err)
+
+    def _compute_home_norm(self, joint_pos):
+        joint_range = self._joint_upper - self._joint_lower
+        home_dev = (joint_pos - self._default_joint_pos.unsqueeze(0)) / joint_range.unsqueeze(0)
+        return (self._home_weights.unsqueeze(0) * (home_dev ** 2)).sum(dim=-1)
+
+    def _compute_normal_reward(self, next_obs):
+        """[SUPERSEDED 2026-05-12 — kept as baseline; main line is `_compute_geom_reward_components` via `--geom_stage`.]
+
+        旧 Stage 1/2 球形 pos_err shaped reward, 不含 collision/hold-N absorbing 分支.
+        DualArmPegHoleCostEnv (Lagrangian 路径) 仍调用. 不要扩展.
+        """
+        joint_pos = next_obs[..., _AGENT_OBS_JOINT_POS]
+        pos_err = self._last_pos_err
+        axis_err = self._last_axis_err
+        full_success = self._last_success_mask.to(pos_err.dtype)
+        pos_success = self._last_pos_success_mask.to(pos_err.dtype)
+
+        joint_limit_norm = self._compute_joint_limit_norm(joint_pos)
+        action_sq = (self._last_raw_action ** 2).sum(dim=-1)
+        home_norm = self._compute_home_norm(joint_pos)
+        axis_gate = self._compute_axis_gate(pos_err)
 
         return (
             -self._w_pos * pos_err
@@ -662,9 +1206,238 @@ class DualArmPegHoleEnv(IsaacSim):
             + self._w_success * full_success
         )
 
+    def _compute_geom_reward_components(self, next_obs):
+        """Geometric preinsert reward components.
+
+        This path is the root-cause replacement for old spherical pos_err
+        preinsert rewards. It uses the same 41D geometry as Stage 3, but keeps
+        the old learning order:
+
+        - prepos:  depth target + tip radial only (no hidden axis pressure).
+        - preaxis: add radial_max and axis dense terms.
+        - insert:  same geometry, with d_target scheduled toward positive depth.
+
+        Success masks are deliberately excluded from the reward by default. The
+        optional soft well is Gaussian and off unless rew_geom_soft_success > 0.
+
+        Optional alignment-gated progress (codex 提案 2026-05-11): when
+        rew_geom_progress > 0, adds
+            +w_progress · clamp(d - d_target_neg, 0, d_target_pos - d_target_neg)
+                        · exp(-(rm/σ_r)² - (axis/σ_a)²)
+        让"轴向推进"reward 只在 radial/axis 同时好时才被取到. 解决 additive
+        reward 不强制 joint 满足的问题. additive 项 (r_geom_d / radial / axis)
+        仍保留, 用户可通过 CLI 把 r_geom_d 设 0 让 gated progress 主导, 或保留
+        作 anchor.
+        """
+        joint_pos = next_obs[..., _AGENT_OBS_JOINT_POS]
+        d = self._cached_d
+        radial_tip = self._cached_radial_err_tip
+        radial_max = self._cached_radial_max
+        axis_err = self._cached_axis_err
+
+        d_err = torch.abs(d - self._geom_d_target_eff)
+        d_err_sat = torch.clamp(d_err, max=self._geom_d_sat)
+        radial_tip_sat = torch.clamp(radial_tip, max=self._geom_radial_sat)
+        radial_max_sat = torch.clamp(radial_max, max=self._geom_radial_sat)
+        penetration_max = self._cached_penetration_max
+
+        # alignment_gate 提到前面 (codex 2026-05-11 v6), 因为 r_d 现在可选乘它
+        # 来强制 task ordering. 公式跟下面 progress / advance 用的同一份.
+        gate_exponent = (
+            - (radial_max / self._geom_gate_radial_sigma) ** 2
+            - (axis_err / self._geom_gate_axis_sigma) ** 2
+        )
+        if self._geom_gate_penetration_sigma is not None:
+            gate_exponent = gate_exponent - (
+                penetration_max / self._geom_gate_penetration_sigma
+            ) ** 2
+        alignment_gate = torch.exp(gate_exponent)
+
+        # r_geom_d: 可选 gating (codex 2026-05-11 v6).
+        # mode="off" (默认): r_d = -w · d_err_sat, 跟旧行为完全一致
+        # mode="alignment": r_d = -w · d_err_sat · alignment_gate
+        # ⚠️ SIGN WARNING (codex 2026-05-11 v6 catch): r_d 是 negative penalty.
+        # 乘 alignment_gate 后, "misaligned → penalty 消失" 反而**激励 misalignment**
+        # (aligned 时暴露 d_err penalty, misaligned 时藏起来). 用 mode="alignment"
+        # 当心这个 perverse incentive. 推荐做法是 --rew_geom_d 0 关掉 d anchor,
+        # 让 r_advance (positive, gate 正乘 → 同号) 主管 depth, 不用 r_d gating.
+        r_geom_d_raw = -self._w_geom_d * d_err_sat
+        if self._geom_d_gate_mode == "alignment":
+            r_geom_d = r_geom_d_raw * alignment_gate
+        else:
+            r_geom_d = r_geom_d_raw
+        r_geom_radial_tip = -self._w_geom_radial_tip * radial_tip_sat
+        r_geom_radial_max = -self._w_geom_radial_max * radial_max_sat
+        r_geom_axis = -self._w_geom_axis * axis_err
+
+        # r_geom_bad_entry (codex 2026-05-11 v6.1 normalized): 显式 task ordering penalty.
+        # 公式 (normalized): -w × depth_norm × Σ(relu(metric/safe - 1))
+        #   depth_norm = clamp(d / d_target_pos, 0, 2)     ← 越过 entrance 才生效
+        #   *_violation = relu(metric/safe - 1)             ← 单位 = "几倍 safe 阈值"
+        #
+        # **v6.0 → v6.1 修复 scale bug**: 旧公式 -w × d × (metric - safe) 中,
+        # d 是米 (0.03), violations 是米 (0.001~0.01), 乘积 ~1e-4. 即使 w=50
+        # 实际只罚 -0.004/step, 被 dwell +1/step 完全淹没. 归一化后 w=1.0 量级合理:
+        # 1cm 超 1cm 阈值 (radial 大 100%) + d 在 target 处 → -1.0/step.
+        # w_bad_entry=0 (默认) 关闭, 跟旧行为完全一致.
+        if self._w_geom_bad_entry > 0.0:
+            d_pos_safe = max(1e-6, self._geom_d_target_pos)
+            depth_norm = torch.clamp(d / d_pos_safe, min=0.0, max=2.0)
+            # codex 2026-05-12 v6.2 fix: per-violation clamp at 3.0 + total clamp at 3.0.
+            # 没 cap 时 radial=1.4m → radial_v=139 → penalty -139/step 打爆 critic
+            # (v7a ep 7 J=-4598 实证). cap 后 max penalty = w·2·3 = 6w/step, 强但不毁.
+            radial_violation = torch.clamp(
+                radial_max / self._geom_bad_entry_radial_safe - 1.0,
+                min=0.0, max=3.0,
+            )
+            axis_violation = torch.clamp(
+                axis_err / self._geom_bad_entry_axis_safe - 1.0,
+                min=0.0, max=3.0,
+            )
+            pen_violation = torch.clamp(
+                penetration_max / self._geom_bad_entry_pen_safe - 1.0,
+                min=0.0, max=3.0,
+            )
+            total_violation = torch.clamp(
+                radial_violation + axis_violation + pen_violation,
+                max=3.0,
+            )
+            r_geom_bad_entry = -self._w_geom_bad_entry * depth_norm * total_violation
+        else:
+            r_geom_bad_entry = torch.zeros_like(d)
+
+        if self._w_geom_soft_success > 0.0:
+            # 3 项 well (d, radial, axis) + 可选 penetration (codex 2026-05-11
+            # v4 "clean_dwell"). σ_pen=None 时跟原 3 项行为完全等价.
+            # penetration 用 _cached_penetration_max, 在 _create_observation 里写过.
+            soft_exponent = (
+                - (d_err / self._geom_soft_d_sigma) ** 2
+                - (radial_max / self._geom_soft_radial_sigma) ** 2
+                - (axis_err / self._geom_soft_axis_sigma) ** 2
+            )
+            if self._geom_soft_penetration_sigma is not None:
+                pen = self._cached_penetration_max
+                soft_exponent = soft_exponent - (
+                    pen / self._geom_soft_penetration_sigma
+                ) ** 2
+            soft = torch.exp(soft_exponent)
+            r_geom_soft_success = self._w_geom_soft_success * soft
+        else:
+            r_geom_soft_success = torch.zeros_like(d)
+
+        # Alignment-gated progress (codex 提案). w_progress=0 时 r_geom_progress
+        # 全 0, 跟旧 additive 行为完全等价. progress 是 peg 相对起点 d_target_neg
+        # 的单调位移, **cap 到当前 d_target_eff** (随 set_geom_epoch ramp 移动),
+        # 不是 cap 到 d_target_pos. 否则 ramp_end 之前 agent 也能直接拿到 full
+        # progress 奖励, ramp 失效 (codex 2026-05-11 catch). alignment_gate 是
+        # Gaussian, 对齐越好越接近 1, 越差越接近 0.
+        # progress 公式 (codex 2026-05-11 v2 fix):
+        # progress = clamp(d - floor, 0, current_ramp_max - floor)
+        # 默认 floor=0 (= hole entrance). 只奖励 peg 真正进入 hole 部分 (d > 0).
+        # current_ramp_max = max(floor, d_target_eff): ramp 把 d_target_eff 从
+        # d_target_neg 推到 d_target_pos, 但 cap 不下 floor.
+        progress_floor = self._geom_progress_floor
+        progress_range_full = max(0.0, self._geom_d_target_pos - progress_floor)
+        progress_cap = max(
+            0.0,
+            min(progress_range_full, self._geom_d_target_eff - progress_floor),
+        )
+        progress = torch.clamp(
+            d - progress_floor,
+            min=0.0,
+            max=progress_cap,
+        )
+        # alignment_gate / penetration_max 已在 r_d gating 时计算 (v6 refactor),
+        # 此处直接复用. 旧版有重复计算, 现去重.
+        r_geom_progress = self._w_geom_progress * progress * alignment_gate
+        # 可选 soft penalty (默认 0=关). 跟 gate 互补 — gate 让"穿模时拿不到 reward",
+        # penalty 让"穿模时被扣 reward". 推荐 SAC: gate + 小 penalty (10-20).
+        # Lagrangian SAC: gate + 0 penalty (用 cost 信号代替).
+        r_geom_penetration = -self._w_geom_penetration * penetration_max
+        # Delta-progress (PBRS, codex 2026-05-11 v3):
+        # phi(s) = clean_gate(s) × clamp((d - d_neg) / (d_pos - d_neg), 0, 1).
+        # r_advance = w_advance × (phi_t - phi_{t-1}). Episode reset 时 phi_prev
+        # 通过 first_step_mask 标记无效化, 该 step Δphi 强制 0.
+        d_neg = self._geom_d_target_neg
+        d_pos = self._geom_d_target_pos
+        normalized_pos = torch.clamp(
+            (d - d_neg) / max(1e-6, d_pos - d_neg),
+            min=0.0,
+            max=1.0,
+        )
+        phi_t = alignment_gate * normalized_pos
+        if self._cached_phi_prev is None:
+            # 第一次 reward 计算 (env 启动后), 全 env 视为 first step.
+            self._cached_phi_prev = phi_t.detach().clone()
+            self._phi_first_step_mask = torch.ones_like(phi_t, dtype=torch.bool)
+        if self._phi_first_step_mask is None:
+            self._phi_first_step_mask = torch.zeros_like(phi_t, dtype=torch.bool)
+        delta_phi = torch.where(
+            self._phi_first_step_mask,
+            torch.zeros_like(phi_t),
+            phi_t - self._cached_phi_prev,
+        )
+        r_geom_advance = self._w_geom_advance * delta_phi
+        # 更新 cache: phi_t 成为下一步的 phi_prev. 同步清 first_step mask.
+        self._cached_phi_prev = phi_t.detach().clone()
+        self._phi_first_step_mask = torch.zeros_like(phi_t, dtype=torch.bool)
+
+        joint_limit_norm = self._compute_joint_limit_norm(joint_pos)
+        action_sq = (self._last_raw_action ** 2).sum(dim=-1)
+        home_norm = self._compute_home_norm(joint_pos)
+        r_joint_limit = -self._w_joint_limit * joint_limit_norm
+        r_action = -self._w_action * action_sq
+        r_home = -self._w_home * home_norm
+
+        return {
+            "r_geom_d": r_geom_d,
+            "r_geom_radial_tip": r_geom_radial_tip,
+            "r_geom_radial_max": r_geom_radial_max,
+            "r_geom_axis": r_geom_axis,
+            "r_geom_soft_success": r_geom_soft_success,
+            "r_geom_progress": r_geom_progress,
+            "r_geom_penetration": r_geom_penetration,
+            "r_geom_advance": r_geom_advance,
+            "r_geom_bad_entry": r_geom_bad_entry,
+            "r_joint_limit": r_joint_limit,
+            "r_action": r_action,
+            "r_home": r_home,
+        }
+
+    def _compute_geom_reward(self, next_obs):
+        comps = self._compute_geom_reward_components(next_obs)
+        return sum(comps.values())
+
+    def set_geom_epoch(self, epoch):
+        """Actor-relative geometric schedule.
+
+        prepos/preaxis keep d_target fixed at geom_d_target_neg. insert linearly
+        moves d_target from geom_d_target_neg to geom_d_target_pos, preserving a
+        V-shaped / absolute-error depth objective without an overshoot plateau.
+        """
+        if self._geom_stage is None:
+            return
+        if self._geom_stage != "insert":
+            self._geom_d_target_eff = self._geom_d_target_neg
+            return
+        s, e = self._geom_d_target_ramp_start, self._geom_d_target_ramp_end
+        if epoch < s:
+            t = 0.0
+        elif epoch < e:
+            t = (epoch - s) / max(e - s, 1)
+        else:
+            t = 1.0
+        self._geom_d_target_eff = (
+            (1.0 - t) * self._geom_d_target_neg + t * self._geom_d_target_pos
+        )
+
     def reward(self, obs, action, next_obs, absorbing):
-        normal = self._compute_normal_reward(next_obs)
+        if self._geom_stage is not None:
+            normal = self._compute_geom_reward(next_obs)
+        else:
+            normal = self._compute_normal_reward(next_obs)
         # 三路选择: collision (硬 absorbing) > hold-N (软 absorbing) > normal
+        # geom hold-N 默认关 (terminal_hold_bonus=0), 等价 normal 路径.
         absorbing_r = self._r_min / (1.0 - self.info.gamma)
         r = torch.where(
             self._last_collision_mask,
@@ -688,6 +1461,14 @@ class DualArmPegHoleEnv(IsaacSim):
 
         idx_tensor = torch.as_tensor(env_indices, device=self._device, dtype=torch.long)
         self._consecutive_inthresh[idx_tensor] = 0
+        # PBRS phi 跨 episode 必须无效化, 否则新 episode 第一步 Δphi 含
+        # 上一 episode 末态 phi (~0.9) - 新 episode 初始 phi (~0) = 巨大 spurious
+        # delta. 标记 first_step, reward 函数里看到该 mask 时 Δphi=0.
+        if self._phi_first_step_mask is None:
+            self._phi_first_step_mask = torch.zeros(
+                self._n_envs, dtype=torch.bool, device=self._device
+            )
+        self._phi_first_step_mask[idx_tensor] = True
 
         # set_joint_positions 只写 DOF buffer; 不 step 的话 BODY_POS / BODY_ROT
         # view 还是 reset 前的值, reset_all 读到的 EE pose 是 stale.
