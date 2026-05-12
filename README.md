@@ -688,3 +688,64 @@ python scripts/train_hydra.py --multirun experiment@train=record_checkpoint \
     train.checkpoint_dir=results/checkpoints_lag/2026-05-10/12-02-15 \
     train.tag=lag_phase1
 ```
+
+---
+
+## Stage 2 训练
+
+### Troubleshooting
+
+#### Mushroom-rl `last` 语义: 不要把 fit dataset 的 `last.sum()` 当真实 episode 数
+
+`VectorizedDataset.flatten()` 会在交给 `agent.fit()` 前把当前数据块最后一行强制标成
+`last=True`:
+
+```python
+last_padded = self._data.last
+last_padded[-1, :] = True
+```
+
+这个 `last` 更像 trajectory segment / fit chunk boundary, 不总是环境真实 episode
+结束。当前默认 `n_steps_per_fit = num_envs = 16`, 每次 fit 只有 1 个 vector-step,
+因此 fit dataset 里的 `last` 往往整行都是 True, 即使真实 episode 还没到 `horizon`
+也没碰撞终止。
+
+这不会破坏 SAC / Lagrangian SAC 主体训练:
+
+- SAC reward critic target 用 `absorbing` 决定是否 bootstrap, 标准 SAC 直接丢弃 replay
+  里的 `last`
+- Lagrangian SAC reward critic / cost critic target 也用 `absorbing`
+- replay 是 1-step transition; `last` 不参与 1-step Bellman target
+
+真正要小心的是 `lambda_update_mode == "episode_rate"`。不要用:
+
+```python
+cost.sum() / dataset.last.sum()
+```
+
+或 replay random batch 里的:
+
+```python
+cost.sum() / last.sum()
+```
+
+来估计每集平均碰撞次数。前者会被 fit chunk boundary 污染, 后者来自随机 transition
+采样, `last.sum()` 也不是完整 episode 数。
+
+当前默认配置使用 `lambda_update_mode: max_recent_replay`, `cost_limit` 是 per-step
+collision rate 预算, λ 更新走 `cost.mean()` / `recent_cost.mean()` 语义, 不依赖
+`last.sum()`。
+
+如果切到 `lambda_update_mode: episode_rate`, 当前实现会走独立路径:
+
+```python
+agent.update_lambda_from_episode_statistics(
+    cost_episode_rate=c["cost_episode_sum_mean"],
+    source="eval_episode_rate",
+)
+```
+
+也就是每个 epoch 的完整 eval episodes 结束后, 用
+`compute_cost_metrics()["cost_episode_sum_mean"] = sum(cost) / n_eval_episodes`
+更新 λ。cost critic 仍继续 off-policy 用 replay 学; 只有 λ 的 dual update 不再使用
+replay random batch 或 flattened dataset 的 `last`。

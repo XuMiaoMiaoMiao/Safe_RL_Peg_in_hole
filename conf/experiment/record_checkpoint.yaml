@@ -1,5 +1,7 @@
 train_script: scripts/record_video.py
 
+# 同时适用于 phase1 和 phase2 的 checkpoint 录制
+
 # checkpoint 目录录制配置.
 # 自动录制 checkpoint_dir 下所有 .msh 文件, Isaac Sim 只启动一次顺序录制.
 # 视频文件名: <tag>_<agent_stem>_episode_000.mp4, ...

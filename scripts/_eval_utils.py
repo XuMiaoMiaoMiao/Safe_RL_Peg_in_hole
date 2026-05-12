@@ -313,7 +313,7 @@ def compute_cost_metrics(dataset, n_eval_episodes):
     """从 eval flatten dataset 的 info.data["cost"] 算 cost_rate / per-ep cost sum.
 
     依赖 env._create_info_dictionary 把 cost 写进 step_info; flatten 后顺序与
-    reward 对齐. cost = 0/1 per-step collision indicator.
+    reward 对齐. cost 可为 0/1 collision indicator, 也可为 penetration 连续量.
     """
     import torch
     cost = dataset.info.data.get("cost")

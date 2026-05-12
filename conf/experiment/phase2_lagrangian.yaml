@@ -1,109 +1,116 @@
 train_script: scripts/train_sac_lagrangian.py
 
-# Stage 2 (Lagrangian SAC): position + axis alignment, warm-start from Stage 1.
-# obs_dim must stay 34 (use_axis_resid_obs=True) to match Stage 1 checkpoint.
-# Reward adds axis term and tightens success threshold vs Stage 1.
-# Collision still goes to cost constraint; reward critic only sees task progress.
+# Stage 2 Lagrangian SAC — 冷启动配置
+#
+# 设计原则（见 envs/dual_arm_peg_hole_cost_env.py）:
+#   - reward 复用 DualArmPegHoleEnv 的非 geom 任务 reward
+#     (_compute_normal_reward), 但不使用父类 reward() 里的 collision hard
+#     negative absorbing penalty.
+#   - cost = collision indicator，由 Lagrangian λ·Q_C 约束处理.
+#   - collision 仍由父类 is_absorbing() 终止 episode，只是不再直接写进 reward.
+#
+# 当前 cold-start 配置未启用这些 warm-start 补丁:
+#   - rew_pos_success  : 父类默认 0.0
+#   - axis_gate_radius : 父类默认 inf (不门控)
+#   - home_weights     : 父类默认均匀权重
+#   - terminal_hold_bonus / hold-N absorbing
+#   - critic_warmup_transitions 50000 (≈39 epoch 冻结 actor → 解冻时梯度爆炸)
 
+# --------------------------------------------------------------------------
+# 运行环境
+# --------------------------------------------------------------------------
 num_envs: 16
 render: false
 seed: 42
-use_axis_resid_obs: true
-n_epochs: 100
-n_steps_per_epoch: 1024
-n_steps_per_fit: null
-utd: null
+use_axis_resid_obs: true   # 34 维 obs (axis_resid 替换 axis_dot), 全程光滑
 
-# warm-start 保守值: Stage 1 cold-start 用 1e-4, Stage 2 actor_only_warmstart 下
-# 冷 critic 噪声大, 高 lr 会在 warmup 结束后立即破坏 preinsert 能力.
-# SAC Stage 2 oneshot 配方同为 5e-5.
-lr_actor: 5e-5
+# --------------------------------------------------------------------------
+# 训练节奏
+# --------------------------------------------------------------------------
+n_epochs: 200
+n_steps_per_epoch: 2400
+n_steps_per_fit: null      # 默认 = num_envs (每 vector-step fit 一次)
+utd: null                  # 默认 = n_steps_per_fit → true_UTD ≈ 1
+n_eval_episodes: 16
+
+# critic_warmup_transitions: 冷启动不需要长时间冻结 actor.
+# 默认 = INITIAL_REPLAY_SIZE (10000) = replay 填充后立即开始全部更新.
+critic_warmup_transitions: null
+
+# --------------------------------------------------------------------------
+# 学习率与 entropy
+# --------------------------------------------------------------------------
+# 冷启动双目标任务: lr_actor 用 1e-4 (Stage 1 冷启动同款).
+# target_entropy=-7 (=-act_dim/2): 引导 SAC 略倾向集中，加速早期收敛.
+lr_actor: 1e-4
 lr_critic: 3e-4
 lr_alpha: 3e-4
-# Lagrangian warm-start 标准值. λ 给 actor 额外施压, alpha 过高易引发塌方.
-# Stage 1 cold-start 已用 0.05; Stage 2 warm-start 同样保守.
-alpha_max: 0.05
-# warm-start 更 deterministic: Stage 1 cold-start 用 -7, Stage 2 轴对齐需要精细控制.
-# SAC Stage 2 oneshot 配方同为 -10.
-target_entropy: -10
-n_eval_episodes: 16
-# critic_warmup_transitions: actor / α / λ 全部冻结，直到 replay 填满此值.
-# cold-start 后 critic 需要一段时间重建语义（reward 和 cost 都在同时预热）.
-# 50000 ≈ 49 epoch @ 1024 steps/epoch.
-critic_warmup_transitions: 50000
+alpha_max: 0.2             # 冷启动需要更多探索 (Stage 1 cold-start 同款)
+target_entropy: -7
 
-initial_joint_noise: null
+# --------------------------------------------------------------------------
+# env 参数
+# --------------------------------------------------------------------------
+initial_joint_noise: null  # 默认 0.1 rad (父类)
 preinsert_success_pos_threshold: 0.10
-preinsert_offset: null
-rew_action: null
-# SAC Stage 2 实验: rew_success=2.0 时 cliff 触发稀少, hold@axis_th=0%; 4.0 → 100%.
-# 加倍 cliff bonus 给 actor 更强的 sustain 信号.
-rew_success: 4.0
-rew_home: 0.0005
-home_weights: "1,1,1,1,0.75,0.5,0.5"
-# SAC Stage 2 实验: rew_axis=0.5 时轴对齐信号太弱 (axis_in_pos_mean=0.63 未改善);
-# 1.0 → axis_in_pos_mean 降至 0.41. 与 rew_success 一同加倍.
-rew_axis: 1.0
-# SAC Stage 2 实验: axis_th=0.20/0.30 时 cliff 触发率 <1% (训练失败);
-# 0.40 密集触发 (hold≈80%). 0.50 比 0.40 更松, cliff 更易触发, 可接受.
+preinsert_offset: null     # 默认 0.05 m (父类)
+
+# Stage 2 任务 reward 权重
+# 量纲平衡 @ home: pos_err≈0.5m → 贡献-0.5; axis_err≈2.0 → 贡献-1.0; 两项相近
+# 注意: 当前 DualArmPegHoleCostEnv.reward() 复用父类 _compute_normal_reward;
+# rew_axis_progress 是旧 Stage-2 Lagrangian 独立 reward 的字段，当前不再使用。
+rew_pos: 1.0
+rew_axis: 0.5
+rew_success: 2.0
+rew_action: 0.005
+rew_home: 0.001
+# rew_joint_limit 当前由父类默认值 0.02 生效；train_sac_lagrangian.py 暂未暴露该 CLI.
+
+# success 定义: pos_err<0.10m AND axis_err<0.50 (1+dot<0.50 → 偏离理想±60°)
+# 0.50 是训练期 bootstrap 阈值；严格 eval 可另行传
+# --success_axis_threshold 0.30 或 0.20 覆盖.
 success_axis_threshold: 0.50
-# Stage 1 位置保持锚点, 防 actor 在学轴对齐时遗忘 preinsert 位置.
-rew_pos_success: 1.0
-# pos_err > 0.40m 时 axis 惩罚关闭, 避免远端姿态被 axis loss 干扰.
-axis_gate_radius: 0.40
-terminal_hold_bonus: 0.0
+
+# hold_success_steps: 仅影响 eval 指标 (compute_hold_metrics), 不影响训练 reward
 hold_success_steps: 10
 
-# Sphere-proxy 兜底: clearance_hard=0.0 = 球壳一接触即触发 hard absorbing.
+# Sphere-proxy 自碰撞兜底: clearance_hard=0.0 = 球壳一接触即触发 hard absorbing
 clearance_hard: 0.0
 
 # --------------------------------------------------------------------------
-# Warm-start (Stage 1 → Stage 2)
+# Lagrangian 专属
 # --------------------------------------------------------------------------
-# 支持两种来源:
-#   A. Lagrangian Stage 1 checkpoint (推荐): --actor_only_warmstart
-#      cost critic / λ / replay 全部冷启, 与新 cost_limit 和 axis reward 对齐.
-#      全量 warmstart (actor_only_warmstart: false) 也可, 但须确认 reward/cost 结构
-#      未变（Stage 2 加了 rew_axis, reward critic 语义已变 → 建议 actor-only）.
-#   B. SAC Stage 1 checkpoint: 必须 --actor_only_warmstart (SAC 无 cost critic/λ).
-#
-# 运行前确认文件存在, 或传 --load_agent 覆盖:
-#   cp results/best_hold_lag.msh results/S1_lag_best_hold.msh
-load_agent: results/checkpoints_lag/2026-05-10/12-05-51/best_agent.msh
-actor_only_warmstart: true
+# rollout_episode_rate: cost_limit = 每集平均碰撞次数.
+# collision 是 terminal 且每集最多一次时, 0.10 ≈ 允许 10% episode 碰撞.
+# λ 用当前 stochastic rollout 中完成的真实 episode cost 更新, 不使用 replay batch、
+# deterministic eval 或 Mushroom flattened dataset.last.
+cost_limit: 0.10
+
+# rollout_episode_rate 比 eval-based episode_rate 少一层滞后, 且与训练 policy 分布一致.
+lambda_update_mode: rollout_episode_rate
+lr_lambda: 5e-2
+lambda_max: 100.0
+lambda_min: 0.05           # 防止 cost=0 时 λ 指数衰减为零、安全信号消失
+
+# init_log_lambda=0 → λ_init=1. 冷启动无遗留 λ 状态，从 1 开始合理.
+init_log_lambda: 1
+gamma_cost: null
+
+# actor_grad_clip: 防止 actor 首次更新梯度爆炸 (冷启动 critic 早期噪声大)
+actor_grad_clip: 1.0
+
+# --------------------------------------------------------------------------
+# 可选从已有 checkpoint 续训 — 冷启动请保持以下两行注释
+# --------------------------------------------------------------------------
+# load_agent: results/best_agent_lag.msh
+# actor_only_warmstart: true
 keep_replay: false
 
 # --------------------------------------------------------------------------
-# Lagrangian 专属参数
+# wandb
 # --------------------------------------------------------------------------
-
-# cost_limit: Stage 2 的 per-step collision 预算.
-#
-# 标定方法:
-#   1. 用 Stage 1 best actor 在 Stage 2 env 参数（rew_axis=0.5）下跑 eval.
-#   2. 或直接用 Stage 1 同一 env 的 collision rate（Stage 2 任务更难，rate 通常不低）.
-#   3. 取 baseline collision rate 的 0.5 倍.
-#
-# Stage 2 比 Stage 1 任务更难（轴对齐），碰撞率可能持平甚至上升，
-# 通常 cost_limit 不低于 Stage 1. 如需更严格安全保证可收紧.
-#
-# 占位值 0.02 = 2% per-step collision rate. 请在 Stage 1 eval 后更新此值.
-cost_limit: 0.02  # TODO: 用 Stage 1 actor eval 结果标定
-
-lr_lambda: 1e-3
-lambda_max: 100.0
-
-# actor_only_warmstart 时 λ 从 init_log_lambda 冷启.
-# Stage 1 结束时 λ 可能已较高（说明 cost 被持续违反）；Stage 2 从 0 重新学
-# 会有一段 λ 爬升期. 若 Stage 1 final_lambda 偏高（如 >5），
-# 可设 init_log_lambda: 1.5~2.0（λ≈4.5~7.4）缩短爬升过渡.
-init_log_lambda: 0.0  # Stage 1 final_lambda ≈ 4.5e-5 (下限 clamp), 无需调高
-
-gamma_cost: null
-
-# --------------------------------------------------------------------------
-
 wandb_project: bimanual_peghole
 wandb_entity: safe_rl_2026_lund
-wandb_run_name: lag_phase1_seed42
+wandb_run_name: lag_stage2_coldstart_axis_claude_fix
+wandb_group: null
 no_wandb: false
