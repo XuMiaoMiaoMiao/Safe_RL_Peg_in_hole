@@ -3,8 +3,8 @@
 约束化 SAC: 把 collision 等安全约束信号 (env._create_info_dictionary["cost"])
 从 reward 里剥出来, 用 cost critic Q_C 单独学; actor 目标变为
     max E[ Q_R - λ·Q_C - α·log π ]
-λ 默认通过 latest env batch 与 replay batch 的较大 per-step cost rate 做 dual ascent:
-    log_λ ← log_λ + lr_λ · (max(mean(c_recent), mean(c_replay)) - cost_limit_per_step)
+λ 主线通过当前 rollout 中完成的真实 episode 统计做 dual ascent:
+    log_λ ← log_λ + lr_λ · (mean(episode_cost_sums) - cost_limit_per_episode)
 episode_rate 模式 (eval-based, 有滞后): λ 只接受来自 eval 的完整 episode 统计
     log_λ ← log_λ + lr_λ · (cost_sum / n_episodes - cost_limit_per_episode)
     不使用 replay random batch, 不依赖 Mushroom flattened dataset 的 last 标志;
@@ -14,8 +14,8 @@ rollout_episode_rate 模式 (推荐): λ 使用当前 policy rollout 中完成�
     信号来自 EpisodeCostTracker (train_sac_lagrangian.py 中的 callback_step 钩子),
     逐 vector-step 实时累计 cost, episode 完成时推入滑动窗口, epoch 结束后 drain 更新 λ.
     避免了 episode_rate 的 epoch 级滞后与 deterministic policy 偏差.
-也可用旧版 discounted_q 模式:
-    log_λ ← log_λ + lr_λ · ((Q_C·(1−γ_c)) - cost_limit_per_step)
+也可用 recent_cost_rate 做 per-step 消融:
+    log_λ ← log_λ + lr_λ · (mean(c_recent) - cost_limit_per_step)
 
 数据流 (已验证):
     env._create_info_dictionary 返回 {"cost": tensor}
@@ -151,16 +151,12 @@ class SACLagrangian(SAC):
 
     actor loss: (α·logπ - Q_R + λ·Q_C).mean()
     cost critic: 普通 Bellman, q_c_target = c + γ_c · max_θ' Q_C^target(s', π(s'))
-    λ 更新默认用 max_recent_replay:
-        violation = max(mean(c_recent), mean(c_replay)) - cost_limit
-    batch_cost_rate / recent_cost_rate 可作为消融模式.
+    λ 默认由训练脚本通过 rollout_episode_rate 外部更新:
+        violation = mean(episode_cost_sums) - cost_limit
+    recent_cost_rate 可作为 per-step on-policy 消融模式.
     episode_rate 不在 fit() 里更新; 必须由训练脚本用完整 episode 统计显式调用
     update_lambda_from_episode_statistics(). 这样不会把 replay batch 的 last.sum()
     或 VectorizedDataset.flatten() 注入的 last=True 当成 episode 数。
-    旧版 discounted_q 可通过 lambda_update_mode="discounted_q" 启用:
-        violation = Q_C·(1-γ_c) - cost_limit
-        (Q_C 是 discounted sum, 乘 (1-γ_c) 还原到 per-step 量纲)
-
     cost critic 在 critic warmup 期间也学 (跟 reward critic 同步), actor / α / λ
     在 warmup 后才更新.
     """
@@ -171,14 +167,14 @@ class SACLagrangian(SAC):
                  cost_limit, lr_lambda,
                  lambda_max=100.0, lambda_min=0.0, init_log_lambda=0.0,
                  cost_critic_params=None, gamma_cost=None,
-                 lambda_update_mode="max_recent_replay",
+                 lambda_update_mode="rollout_episode_rate",
                  actor_grad_clip=None,
                  use_log_alpha_loss=False, log_std_min=-20, log_std_max=2,
                  target_entropy=None, critic_fit_params=None):
         """
         Args:
-            cost_limit (float): cost 预算. per-step 模式下是每步 cost rate;
-                episode_rate 下是每集平均 cost sum.
+            cost_limit (float): cost 预算. recent_cost_rate 下是每步 cost rate;
+                episode_rate / rollout_episode_rate 下是每集平均 cost sum.
             lr_lambda (float): Lagrange 乘子学习率. 通常 1e-3 ~ 1e-4, 比 lr_actor 低.
             lambda_max (float): λ clamp 上限 (默认 100).
             lambda_min (float): λ clamp 下限 (默认 0). 设 >0 防止约束信号完全消失,
@@ -198,23 +194,17 @@ class SACLagrangian(SAC):
                     fit() 不更新 λ; 必须由训练脚本在 eval 后显式调用
                     update_lambda_from_episode_statistics(). 使用 deterministic policy
                     的 eval 数据, 与训练 policy 存在一个 epoch 的滞后.
-                "max_recent_replay": 用最新 env batch 与 replay batch per-step cost
-                    rate 的较大值, 在 fit() 中更新.
-                "batch_cost_rate": 仅用 replay batch per-step rate, 在 fit() 中更新.
                 "recent_cost_rate": 仅用最新 env batch per-step rate, 在 fit() 中更新.
-                "discounted_q": Q_C×(1-gamma_cost) 缩放到 per-step 量纲, 在 fit() 中更新.
             actor_grad_clip (float, None): actor 梯度 L2 norm 上限. None = 不裁剪.
                 warmstart 后 critic warmup 结束时第一次 actor 更新容易梯度爆炸, 建议 1.0.
             其余参数同 SAC.
         """
         valid_lambda_modes = (
-            "max_recent_replay", "batch_cost_rate", "recent_cost_rate", "discounted_q",
-            "episode_rate", "rollout_episode_rate",
+            "recent_cost_rate", "episode_rate", "rollout_episode_rate",
         )
         if lambda_update_mode not in valid_lambda_modes:
             raise ValueError(
-                "lambda_update_mode 必须是 'max_recent_replay', 'batch_cost_rate', "
-                "'recent_cost_rate', 'discounted_q', 'episode_rate' 或 "
+                "lambda_update_mode 必须是 'recent_cost_rate', 'episode_rate' 或 "
                 f"'rollout_episode_rate', 当前 {lambda_update_mode!r}"
             )
 
@@ -271,11 +261,8 @@ class SACLagrangian(SAC):
         self._lambda_max = float(lambda_max)
         self._lambda_min = float(lambda_min)
         self._lambda_update_mode = str(lambda_update_mode)
-        self._lambda_qc_mean = float("nan")
-        self._lambda_batch_cost_rate = float("nan")
-        self._lambda_recent_cost_rate = float("nan")
-        self._lambda_selected_cost_rate = float("nan")
-        self._lambda_internal_violation = float("nan")
+        self._rollout_ep_cost = float("nan")       # mean(episode_cost_sums) from rollout
+        self._rollout_ep_violation = float("nan")  # rollout_ep_cost - cost_limit
         self._lambda_update_source = "none"
         self._actor_grad_clip = float(actor_grad_clip) if actor_grad_clip is not None else None
         if gamma_cost is None:
@@ -292,11 +279,8 @@ class SACLagrangian(SAC):
             _lambda_max='primitive',
             _lambda_min='primitive',
             _lambda_update_mode='primitive',
-            _lambda_qc_mean='primitive',
-            _lambda_batch_cost_rate='primitive',
-            _lambda_recent_cost_rate='primitive',
-            _lambda_selected_cost_rate='primitive',
-            _lambda_internal_violation='primitive',
+            _rollout_ep_cost='primitive',
+            _rollout_ep_violation='primitive',
             _lambda_update_source='primitive',
             _actor_grad_clip='primitive',
             _gamma_cost='primitive',
@@ -318,20 +302,19 @@ class SACLagrangian(SAC):
         s, a, r, c, sp, absorb, last = self._replay_memory.get(self._batch_size())
 
         # actor / α 仅在 critic warmup 后更新; cost critic & reward critic 总是更新.
-        # λ: per-step modes update here. episode_rate is updated externally from
-        # complete episode statistics after eval.
+        # λ: recent_cost_rate updates here from the current rollout chunk.
+        # episode_rate / rollout_episode_rate are updated externally from
+        # complete episode statistics.
         if self._replay_memory.size > self._warmup_transitions():
             a_new, log_prob = self.policy.compute_action_and_log_prob_t(s)
             loss = self._loss(s, a_new, log_prob)
             self._optimize_actor_parameters(loss)
             self._update_alpha(log_prob.detach())
-            # episode_rate: λ is updated externally after eval via
-            #   update_lambda_from_episode_statistics().
-            # rollout_episode_rate: λ is updated externally after core.learn() via
-            #   update_lambda_from_rollout_episodes() (EpisodeCostTracker).
-            # All other modes: update λ here from the current fit batch.
-            if self._lambda_update_mode not in ("episode_rate", "rollout_episode_rate"):
-                self._update_lambda_from_fit_batch(s, c, recent_cost_rate)
+            # episode_rate / rollout_episode_rate update λ externally from
+            # complete episodes. recent_cost_rate is the only fit-time λ update
+            # path and uses the current rollout chunk, never replay samples.
+            if self._lambda_update_mode == "recent_cost_rate":
+                self._update_lambda_from_recent_batch(recent_cost_rate)
 
         # reward critic: 同 SAC.
         q_next = self._next_q(sp, absorb)
@@ -372,28 +355,16 @@ class SACLagrangian(SAC):
             return float(value.detach().cpu().item())
         return float(value)
 
-    def _apply_lambda_violation(
-        self,
-        violation,
-        selected_cost_rate,
-        *,
-        q_c_mean=None,
-        batch_cost_rate=None,
-        recent_cost_rate=None,
-        source="unknown",
-    ):
+    def _apply_lambda_violation(self, ep_cost, violation, *, source="unknown"):
+        ep_cost = torch.as_tensor(
+            ep_cost, dtype=torch.float32, device=self._log_lambda.device
+        )
         violation = torch.as_tensor(
             violation, dtype=torch.float32, device=self._log_lambda.device
         )
-        selected_cost_rate = torch.as_tensor(
-            selected_cost_rate, dtype=torch.float32, device=self._log_lambda.device
-        )
 
-        self._lambda_qc_mean = self._scalar_to_float(q_c_mean)
-        self._lambda_batch_cost_rate = self._scalar_to_float(batch_cost_rate)
-        self._lambda_recent_cost_rate = self._scalar_to_float(recent_cost_rate)
-        self._lambda_selected_cost_rate = self._scalar_to_float(selected_cost_rate)
-        self._lambda_internal_violation = self._scalar_to_float(violation)
+        self._rollout_ep_cost = self._scalar_to_float(ep_cost)
+        self._rollout_ep_violation = self._scalar_to_float(violation)
         self._lambda_update_source = str(source)
 
         loss_lambda = -(self._log_lambda * violation.detach())
@@ -407,61 +378,19 @@ class SACLagrangian(SAC):
 
         return True
 
-    def _update_lambda_from_fit_batch(self, state, cost, recent_cost_rate=None):
+    def _update_lambda_from_recent_batch(self, recent_cost_rate=None):
+        if recent_cost_rate is None:
+            self._lambda_update_source = "recent_per_step_missing"
+            return False
+
         with torch.no_grad():
-            a, _ = self.policy.compute_action_and_log_prob(state)
-            q_c = torch.max(
-                self._cost_critic_approximator(state, a, idx=0),
-                self._cost_critic_approximator(state, a, idx=1),
-            )
-            q_c_mean = q_c.mean()
-            cost_f = cost.float()
-            batch_cost_rate = cost_f.mean()
-
-            if recent_cost_rate is None:
-                recent_rate = None
-                recent_rate_for_log = torch.full_like(batch_cost_rate, float("nan"))
-            else:
-                recent_rate = recent_cost_rate.to(batch_cost_rate.device)
-                recent_rate_for_log = recent_rate
-
-            if self._lambda_update_mode == "batch_cost_rate":
-                selected_cost_rate = batch_cost_rate
-                violation = selected_cost_rate - self._cost_limit
-                source = "replay_batch_per_step"
-            elif self._lambda_update_mode == "recent_cost_rate":
-                if recent_rate is None:
-                    self._lambda_update_source = "recent_per_step_missing"
-                    return False
-                selected_cost_rate = recent_rate if recent_rate is not None else batch_cost_rate
-                violation = selected_cost_rate - self._cost_limit
-                source = "recent_rollout_per_step"
-            elif self._lambda_update_mode == "max_recent_replay":
-                if recent_rate is None:
-                    selected_cost_rate = batch_cost_rate
-                    source = "replay_batch_per_step"
-                else:
-                    selected_cost_rate = torch.maximum(batch_cost_rate, recent_rate)
-                    source = "max_recent_replay_per_step"
-                violation = selected_cost_rate - self._cost_limit
-            else:
-                # Q_C ≈ Σ γ_c^t c_t, per-step cost ≈ Q_C·(1-γ_c). γ_c=1 退化为
-                # average-cost, 此时 cost_limit 直接是 Q_C 量纲, 不缩放.
-                if self._gamma_cost < 1.0:
-                    per_step_cost = q_c_mean * (1.0 - self._gamma_cost)
-                else:
-                    per_step_cost = q_c_mean
-                violation = per_step_cost - self._cost_limit
-                selected_cost_rate = per_step_cost
-                source = "discounted_cost_critic"
+            selected_cost_rate = recent_cost_rate.to(self._log_lambda.device)
+            violation = selected_cost_rate - self._cost_limit
 
         return self._apply_lambda_violation(
-            violation,
             selected_cost_rate,
-            q_c_mean=q_c_mean,
-            batch_cost_rate=batch_cost_rate,
-            recent_cost_rate=recent_rate_for_log,
-            source=source,
+            violation,
+            source="recent_rollout_per_step",
         )
 
     def update_lambda_from_episode_statistics(
@@ -505,11 +434,8 @@ class SACLagrangian(SAC):
         violation = selected_cost_rate - self._cost_limit
 
         return self._apply_lambda_violation(
-            violation,
             selected_cost_rate,
-            q_c_mean=None,
-            batch_cost_rate=None,
-            recent_cost_rate=selected_cost_rate,
+            violation,
             source=source,
         )
 
@@ -560,11 +486,8 @@ class SACLagrangian(SAC):
         violation = selected_cost_rate - self._cost_limit
 
         return self._apply_lambda_violation(
-            violation,
             selected_cost_rate,
-            q_c_mean=None,
-            batch_cost_rate=None,
-            recent_cost_rate=selected_cost_rate,
+            violation,
             source=f"{source}(n_ep={n_episodes})",
         )
 
@@ -578,17 +501,24 @@ class SACLagrangian(SAC):
     def _post_load(self):
         super()._post_load()
         if not hasattr(self, "_lambda_update_mode"):
-            self._lambda_update_mode = "discounted_q"
-        if not hasattr(self, "_lambda_qc_mean"):
-            self._lambda_qc_mean = float("nan")
-        if not hasattr(self, "_lambda_batch_cost_rate"):
-            self._lambda_batch_cost_rate = float("nan")
-        if not hasattr(self, "_lambda_recent_cost_rate"):
-            self._lambda_recent_cost_rate = float("nan")
-        if not hasattr(self, "_lambda_selected_cost_rate"):
-            self._lambda_selected_cost_rate = float("nan")
-        if not hasattr(self, "_lambda_internal_violation"):
-            self._lambda_internal_violation = float("nan")
+            self._lambda_update_mode = "rollout_episode_rate"
+        # Backward compatibility only: old checkpoints may carry fit-time λ
+        # modes that read replay data. Normalize them to the current on-policy
+        # episode mode on load; no implementation remains for these modes.
+        if self._lambda_update_mode in (
+            "max_recent_replay", "batch_cost_rate", "discounted_q"
+        ):
+            self._lambda_update_mode = "rollout_episode_rate"
+        # Migrate old checkpoint attribute names to current names.
+        if not hasattr(self, "_rollout_ep_cost"):
+            self._rollout_ep_cost = float(
+                getattr(self, "_lambda_recent_cost_rate",
+                        getattr(self, "_lambda_selected_cost_rate", float("nan")))
+            )
+        if not hasattr(self, "_rollout_ep_violation"):
+            self._rollout_ep_violation = float(
+                getattr(self, "_lambda_internal_violation", float("nan"))
+            )
         if not hasattr(self, "_lambda_update_source"):
             self._lambda_update_source = "unknown"
         self._update_lambda_optimizer_parameters()

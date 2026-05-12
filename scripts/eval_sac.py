@@ -276,9 +276,12 @@ def main():
             f"preaxis={mg['geom_preaxis_step_rate']:.3f}  "
             f"insert={mg['geom_insert_step_rate']:.3f}"
         )
+        entry_label = (
+            "first d>0" if mdp._geom_stage == "insert" else "first active mask"
+        )
         # entry/final diagnostics: 区分 "approach-then-dwell" vs "tilt-then-align"
         print(
-            f"  ↳ entry @ first active mask "
+            f"  ↳ entry @ {entry_label} "
             f"(n_ep={mg['geom_n_ep_with_entry']}): "
             f"d={mg['geom_entry_d_mean']:+.4f}m  "
             f"d_err={mg['geom_entry_d_err_mean']:.4f}m  "

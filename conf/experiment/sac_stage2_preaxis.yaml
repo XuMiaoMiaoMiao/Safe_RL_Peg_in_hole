@@ -1,0 +1,129 @@
+train_script: scripts/train_sac.py
+
+# SAC Stage 2g (preaxis) — geom_stage 主线, 从 Stage 1g best_hold warm-start.
+#
+# 目标: prepos mask (d + radial_tip) AND 整根 peg 径向 (radial_max) + 轴对齐 (axis_err).
+# 在 Stage 1g reward 基础上新增 rew_geom_radial_max + rew_geom_axis 两个信号.
+#
+# geom_stage=preaxis 自动启用 41D obs (joint_pos[14] + joint_vel[14]
+#   + pos_vec[3] + axis_resid[3] + d[1] + radial_vec[3] + peg_in_hole[3]).
+#
+# Invariants (README):
+#   1. n_steps_per_epoch = horizon × num_envs = 150 × 16 = 2400
+#   2. Stage 2g preaxis 仍在 hole 外, 不传 exclude_ee_from_physx_self_collision
+#   3. actor_only_warmstart + critic_warmup_transitions=50000: Stage 2g critic 冷启动
+#      以适应新 reward 语义, 避免 Stage 1g critic 污染
+#   4. seed=0 (Stage 2g verified successful run)
+
+# Runtime / env count.
+num_envs: 16
+horizon: 150
+render: false
+seed: 0
+use_axis_resid_obs: true
+exclude_ee_from_physx_self_collision: false
+
+# SAC collection / update cadence.
+n_epochs: 120
+n_steps_per_epoch: 2400          # = horizon × num_envs = 150 × 16
+n_steps_per_fit: 16              # one vector-step per fit at num_envs=16
+utd: null                        # defaults to n_steps_per_fit → true UTD ≈ 1
+critic_warmup_transitions: 50000
+n_eval_episodes: 16
+
+# Optimizer / entropy (conservative actor-only warm-start).
+lr_actor: 3e-5
+lr_critic: 3e-4
+lr_alpha: 3e-4
+alpha_max: 0.05
+target_entropy: -7               # ≈ -act_dim/2 for 14-DoF
+
+# Base env.
+initial_joint_noise: 0.1
+preinsert_success_pos_threshold: 0.10
+preinsert_offset: null           # auto-synced to abs(geom_d_target_neg) = 0.08
+
+# Geom Stage 2g reward design.
+# preaxis 在 Stage 1g (rew_geom_d + rew_geom_radial_tip) 基础上加入:
+#   rew_geom_radial_max: 杆身整体径向约束
+#   rew_geom_axis:       peg/hole 轴对齐
+# 三阶段分工:
+#   Stage 1g prepos  : rew_geom_d + rew_geom_radial_tip
+#   Stage 2g preaxis : + rew_geom_radial_max + rew_geom_axis (本配置)
+#   Stage 3g insert  : + rew_geom_advance (PBRS) + rew_geom_penetration + bad_entry
+
+geom_stage: preaxis
+geom_d_target_neg: -0.08        # preaxis 目标深度 d = -8cm (hole 入口前 8cm)
+geom_d_target_pos: 0.03         # insert 模式才用; preaxis 不读, 但构造时需要合法值
+geom_d_target_ramp_start: 0
+geom_d_target_ramp_end: 20      # insert 模式 ramp 参数; preaxis 阶段不生效
+
+geom_d_sat: 0.30                # 轴向误差 reward 饱和上界 (30cm)
+geom_radial_sat: 1.0            # 径向误差 reward 饱和上界 (1m)
+
+# 成功判断阈值 (用于 eval metric 与 best_hold ckpt 选择).
+geom_d_th: 0.020                # preaxis 轴向深度窗口 ±2cm
+geom_r_tip_th: 0.020            # tip 单点径向阈值 2cm
+geom_r_max_th: 0.025            # 杆身最大径向阈值 2.5cm (preaxis mask 项)
+geom_axis_th: 0.300             # 轴对齐阈值 (preaxis mask 项)
+geom_insert_d_ins: 0.025        # insert 深度阈值 (Stage 3g 用)
+geom_insert_r_max_th: 0.025     # insert 杆身径向阈值 (Stage 3g 用)
+geom_pen_th: 0.001              # clean step 穿模阈值 1mm
+
+# Reward weights — Stage 2g preaxis.
+rew_geom_d: 8.0                 # 轴向深度误差线性罚
+rew_geom_radial_tip: 2.0        # tip 单点径向误差线性罚 (Stage 2g 降权, 让位给 radial_max)
+rew_geom_radial_max: 5.0        # 杆身整体径向误差罚 (Stage 2g 新增主信号)
+rew_geom_axis: 1.2              # 轴对齐误差罚 (Stage 2g 新增主信号)
+rew_geom_progress: 0.0          # 对齐门控 state-progress reward (不用)
+rew_geom_advance: 0.0           # delta-progress PBRS reward (Stage 3g 才开)
+
+# alignment_gate 参数 (preaxis 阶段 gate 权重均为 0, sigma 仍需合法值以通过校验).
+geom_gate_radial_sigma: 0.025
+geom_gate_axis_sigma: 0.30
+geom_gate_penetration_sigma: null  # 不把穿模引入 gate (preaxis 阶段)
+geom_d_gate_mode: "off"            # 不对 r_geom_d 做 alignment gating
+
+# 穿模软惩罚 (preaxis 阶段 peg 不接触 hole, 关闭).
+rew_geom_penetration: 0.0
+
+# Soft success dwell well (preaxis 阶段关闭, Stage 2g 不需要 dwell).
+rew_geom_soft_success: 0.0
+geom_soft_d_sigma: 0.020
+geom_soft_radial_sigma: 0.015
+geom_soft_axis_sigma: 0.30
+geom_soft_penetration_sigma: null
+
+# Bad-entry task-ordering 惩罚 (Stage 3g 才有意义, 此处关闭).
+rew_geom_bad_entry: 0.0
+geom_bad_entry_radial_safe: 0.014
+geom_bad_entry_axis_safe: 0.10
+geom_bad_entry_pen_safe: 0.00075
+
+# Cost signal: preaxis 阶段 peg 不进入 hole, 用 collision 作为双臂安全 cost 即可.
+cost_signal: collision
+
+# Regularization.
+rew_action: 0.005
+rew_home: 0.00075
+home_weights: "1,1,1,1,0.75,0.5,0.5"  # 每单臂 7 关节权重; 末端关节权重降低
+
+# Hold-N 仅作 eval 指标; terminal_hold_bonus=0 保持 episode 跑满 horizon.
+terminal_hold_bonus: 0.0
+hold_success_steps: 10
+
+# Sphere-proxy 双臂自碰撞 (OR 联合 PhysX 接触力).
+clearance_hard: 0.0
+proxy_arm_radius: 0.06
+proxy_ee_radius: 0.04
+
+# Warm-start: 从 Stage 1g best_hold actor-only 热启动; critic / α / replay 冷启动.
+load_agent: results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/best_hold.msh
+actor_only_warmstart: true
+keep_replay: false
+
+wandb_project: bimanual_peghole
+wandb_entity: safe_rl_2026_lund
+wandb_run_name: S2g_preaxis_h150_from_h100_stage1_seed0
+wandb_group: geom_repro
+no_wandb: false
