@@ -63,6 +63,13 @@ def parse_args():
                    help="VectorCore.evaluate 跑几集. 一般冻结发生在第一集就够看")
     p.add_argument("--freeze_seconds", type=float, default=15.0,
                    help="冻结多少秒, Ctrl-C 可提前退出")
+    p.add_argument("--freeze_mode", type=str, default="first_hold",
+                   choices=("first_hold", "episode_end", "step"),
+                   help="画面冻结时机: first_hold=首次连续 hold_steps 成功时冻结(旧行为); "
+                        "episode_end=目标 env episode 末尾冻结; "
+                        "step=目标 env 到 --freeze_after_step 时冻结.")
+    p.add_argument("--freeze_after_step", type=int, default=None,
+                   help="--freeze_mode step 时使用: 在目标 env episode 的第 N 步冻结.")
     p.add_argument("--stochastic", action="store_true",
                    help="用 SAC 采样策略而不是 deterministic tanh(mu)")
     p.add_argument("--rew_pos_success", type=float, default=None,
@@ -77,10 +84,59 @@ def parse_args():
     p.add_argument("--proxy_ee_radius", type=float, default=None,
                    help="覆盖 EE sphere proxy 半径. 应与 train 一致.")
     p.add_argument("--exclude_ee_from_physx_self_collision", action="store_true",
-                   help="Stage 3 可视化用: PhysX self-collision 分组排除 EE link, "
+                   help="geom insert 可视化用: PhysX self-collision 分组排除 EE link, "
                         "避免 peg-hole 正常接触被 hard absorbing 截断.")
     p.add_argument("--use_axis_resid_obs", action="store_true",
                    help="34 维 obs (axis_resid 替换 axis_dot). 应与 train 一致.")
+    p.add_argument("--horizon", type=int, default=None,
+                   help="覆盖 env 默认 horizon. geom insert 训练用 200, 不传走 env 默认 150.")
+
+    # Geometric preinsert viz: freeze trigger uses active geom success mask.
+    p.add_argument("--geom_stage", type=str, default=None,
+                   choices=("prepos", "preaxis", "insert"),
+                   help="启用 geom env (41D obs); freeze 触发改用 active geom success mask.")
+    p.add_argument("--geom_eval_epoch", type=int, default=None,
+                   help="viz 前调用 set_geom_epoch(epoch). 默认: insert 用 ramp_end, "
+                        "prepos/preaxis 用 0.")
+    p.add_argument("--geom_d_target_neg", type=float, default=None)
+    p.add_argument("--geom_d_target_pos", type=float, default=None)
+    p.add_argument("--geom_d_target_ramp_start", type=int, default=None)
+    p.add_argument("--geom_d_target_ramp_end", type=int, default=None)
+    p.add_argument("--rew_geom_d", type=float, default=None)
+    p.add_argument("--rew_geom_radial_tip", type=float, default=None)
+    p.add_argument("--rew_geom_radial_max", type=float, default=None)
+    p.add_argument("--rew_geom_axis", type=float, default=None)
+    p.add_argument("--geom_d_sat", type=float, default=None)
+    p.add_argument("--geom_radial_sat", type=float, default=None)
+    p.add_argument("--rew_geom_soft_success", type=float, default=None)
+    p.add_argument("--geom_soft_d_sigma", type=float, default=None)
+    p.add_argument("--geom_soft_radial_sigma", type=float, default=None)
+    p.add_argument("--geom_soft_axis_sigma", type=float, default=None)
+    p.add_argument("--geom_d_th", type=float, default=None)
+    p.add_argument("--geom_r_tip_th", type=float, default=None)
+    p.add_argument("--geom_r_max_th", type=float, default=None)
+    p.add_argument("--geom_axis_th", type=float, default=None)
+    p.add_argument("--geom_insert_d_ins", type=float, default=None)
+    p.add_argument("--geom_insert_r_max_th", type=float, default=None)
+    p.add_argument("--geom_pen_th", type=float, default=None)
+    p.add_argument("--geom_soft_penetration_sigma", type=float, default=None)
+    # Alignment-gated progress reward
+    p.add_argument("--rew_geom_progress", type=float, default=None)
+    p.add_argument("--geom_gate_radial_sigma", type=float, default=None)
+    p.add_argument("--geom_gate_axis_sigma", type=float, default=None)
+    # Penetration-aware reward
+    p.add_argument("--rew_geom_penetration", type=float, default=None)
+    p.add_argument("--geom_gate_penetration_sigma", type=float, default=None)
+    p.add_argument("--cost_signal", type=str, default=None,
+                   choices=["collision", "penetration"])
+    p.add_argument("--geom_progress_floor", type=float, default=None)
+    p.add_argument("--rew_geom_advance", type=float, default=None)
+    p.add_argument("--geom_d_gate_mode", type=str, default=None,
+                   choices=["off", "alignment"])
+    p.add_argument("--rew_geom_bad_entry", type=float, default=None)
+    p.add_argument("--geom_bad_entry_radial_safe", type=float, default=None)
+    p.add_argument("--geom_bad_entry_axis_safe", type=float, default=None)
+    p.add_argument("--geom_bad_entry_pen_safe", type=float, default=None)
     return p.parse_args()
 
 
@@ -90,6 +146,11 @@ def main():
         raise ValueError(
             f"--viz_env_idx ({args.viz_env_idx}) 必须落在 [0, {args.num_envs - 1}]"
         )
+    if args.freeze_mode == "step":
+        if args.freeze_after_step is None:
+            raise ValueError("--freeze_mode step 需要同时传 --freeze_after_step N")
+        if args.freeze_after_step <= 0:
+            raise ValueError("--freeze_after_step 必须 > 0")
 
     from envs import DualArmPegHoleEnv
 
@@ -101,6 +162,8 @@ def main():
         success_hold_steps=args.hold_steps,
         terminal_hold_bonus=0.0,
     )
+    if args.horizon is not None:
+        env_kwargs["horizon"] = args.horizon
     if args.preinsert_offset is not None:
         env_kwargs["preinsert_offset"] = args.preinsert_offset
     if args.rew_axis is not None:
@@ -112,53 +175,163 @@ def main():
     if args.success_axis_threshold is not None:
         env_kwargs["success_axis_threshold"] = args.success_axis_threshold
     for key in ("rew_pos_success", "axis_gate_radius",
-                "clearance_hard", "proxy_arm_radius", "proxy_ee_radius"):
+                "clearance_hard", "proxy_arm_radius", "proxy_ee_radius",
+                # Geom reward / threshold params.
+                "geom_stage", "geom_d_target_neg", "geom_d_target_pos",
+                "geom_d_target_ramp_start", "geom_d_target_ramp_end",
+                "rew_geom_d", "rew_geom_radial_tip", "rew_geom_radial_max",
+                "rew_geom_axis", "geom_d_sat", "geom_radial_sat",
+                "rew_geom_soft_success", "geom_soft_d_sigma",
+                "geom_soft_radial_sigma", "geom_soft_axis_sigma",
+                "geom_d_th", "geom_r_tip_th", "geom_r_max_th",
+                "geom_axis_th", "geom_insert_d_ins", "geom_insert_r_max_th",
+                "geom_pen_th", "geom_soft_penetration_sigma",
+                "rew_geom_progress", "geom_gate_radial_sigma",
+                "geom_gate_axis_sigma",
+                "rew_geom_penetration", "geom_gate_penetration_sigma", "cost_signal",
+                "geom_progress_floor", "rew_geom_advance",
+                "geom_d_gate_mode", "rew_geom_bad_entry",
+                "geom_bad_entry_radial_safe", "geom_bad_entry_axis_safe",
+                "geom_bad_entry_pen_safe"):
         value = getattr(args, key)
         if value is not None:
             env_kwargs[key] = value
+    # geom_stage 下默认同步 preinsert_offset = abs(geom_d_target_neg), 满足 env 的
+    # 一致性 fail-fast (env __init__ 现在强制 preinsert_offset == abs(geom_d_target_neg),
+    # 否则 obs pos_vec target 和 reward d_target 是不同深度). 用户显式传不一致的值时
+    # env 会 raise — CLI 不绕过 env invariant.
+    if args.geom_stage is not None and args.preinsert_offset is None:
+        d_target_neg = (
+            args.geom_d_target_neg
+            if args.geom_d_target_neg is not None
+            else -0.08
+        )
+        env_kwargs["preinsert_offset"] = abs(float(d_target_neg))
     if args.use_axis_resid_obs:
         env_kwargs["use_axis_resid_obs"] = True
     if args.exclude_ee_from_physx_self_collision:
         env_kwargs["exclude_ee_from_physx_self_collision"] = True
     mdp = DualArmPegHoleEnv(**env_kwargs)
-    print(f"[VIZ STAGE] pos_th={mdp._preinsert_success_pos_threshold:.3f}m  "
-          f"axis_th={mdp._success_axis_threshold:.3f}  "
-          f"w_axis={mdp._w_axis:.3f}  "
-          f"w_pos_success={mdp._w_pos_success:.3f}  "
-          f"w_home={mdp._w_home:.4f}  "
-          f"axis_gate_radius={mdp._axis_gate_radius:.3f}m")
+    if args.geom_stage is not None:
+        if args.geom_eval_epoch is not None:
+            geom_eval_epoch = args.geom_eval_epoch
+        elif mdp._geom_stage == "insert":
+            geom_eval_epoch = mdp._geom_d_target_ramp_end
+        else:
+            geom_eval_epoch = 0
+        mdp.set_geom_epoch(geom_eval_epoch)
+        print(f"[VIZ GEOM] stage={mdp._geom_stage}  "
+              f"d_target_eff={mdp._geom_d_target_eff:+.4f}m  "
+              f"hold_steps={args.hold_steps}  freeze 触发: 连续 hold_steps 步 active geom mask=True")
+        print(f"[VIZ GEOM] thresh: d_th={mdp._geom_d_th:.3f}  "
+              f"r_tip_th={mdp._geom_r_tip_th:.3f}  "
+              f"r_max_th={mdp._geom_r_max_th:.3f}  "
+              f"axis_th={mdp._geom_axis_th:.3f}  "
+              f"insert_d_ins={mdp._geom_insert_d_ins:+.3f}  "
+              f"insert_r_max_th={mdp._geom_insert_r_max_th:.3f}  "
+              f"pen_th={mdp._geom_pen_th*1000:.1f}mm")
+    else:
+        print(f"[VIZ STAGE 1/2] pos_th={mdp._preinsert_success_pos_threshold:.3f}m  "
+              f"axis_th={mdp._success_axis_threshold:.3f}  "
+              f"w_axis={mdp._w_axis:.3f}  "
+              f"w_pos_success={mdp._w_pos_success:.3f}  "
+              f"w_home={mdp._w_home:.4f}  "
+              f"axis_gate_radius={mdp._axis_gate_radius:.3f}m")
 
     from mushroom_rl.core import Agent, VectorCore
 
     agent = Agent.load(args.agent_path)
     print(f"[VIZ] loaded agent from {args.agent_path}")
-    print(f"[VIZ] watching env {args.viz_env_idx} for {args.hold_steps} consecutive in_thresh steps")
+    eval_horizon = int(args.horizon if args.horizon is not None else mdp.info.horizon)
+    if args.freeze_mode == "first_hold":
+        print(f"[VIZ] watching env {args.viz_env_idx} for "
+              f"{args.hold_steps} consecutive in_thresh steps")
+    elif args.freeze_mode == "episode_end":
+        print(f"[VIZ] watching env {args.viz_env_idx}; freeze at episode end "
+              f"(horizon={eval_horizon})")
+    else:
+        print(f"[VIZ] watching env {args.viz_env_idx}; freeze at episode step "
+              f"{args.freeze_after_step}")
 
+    # Geom: per-env mask 连续计数器 (hooked is_absorbing 维护).
+    # Stage 1/2 legacy: 沿用 env 的 _consecutive_inthresh.
+    custom_consec = torch.zeros(mdp._n_envs, dtype=torch.int64, device=mdp._device)
+    episode_steps = torch.zeros(mdp._n_envs, dtype=torch.int64, device=mdp._device)
     state = {"frozen": False, "step_idx": 0}
     original_is_absorbing = mdp.is_absorbing
 
     def freeze_on_success(obs):
         result = original_is_absorbing(obs)
         state["step_idx"] += 1
-        cnt = int(mdp._consecutive_inthresh[args.viz_env_idx].item())
-        if cnt > 0 and state["step_idx"] % 5 == 0:
-            pos_err = mdp._last_pos_err
-            axis_err = mdp._last_axis_err
-            print(f"  step {state['step_idx']}  env {args.viz_env_idx}  "
-                  f"hold count={cnt}  "
-                  f"pos_err={float(pos_err[args.viz_env_idx]):.4f}m  "
-                  f"axis_err={float(axis_err[args.viz_env_idx]):.4f}")
-        if not state["frozen"] and cnt >= args.hold_steps:
-            pos_err = mdp._last_pos_err
-            axis_err = mdp._last_axis_err
-            print(
-                f"\n[FREEZE] env {args.viz_env_idx} reached hold-{args.hold_steps} "
-                f"at step {state['step_idx']}\n"
-                f"  pos_err  = {float(pos_err[args.viz_env_idx]):.4f}m\n"
-                f"  axis_err = {float(axis_err[args.viz_env_idx]):.4f}  "
-                f"(0 = perfect; success_axis_threshold = {mdp._success_axis_threshold:.3f})\n"
-                f"  freezing for {args.freeze_seconds:.1f}s, Ctrl-C to exit early"
+        episode_steps.add_(1)
+        if args.geom_stage is not None and mdp._cached_d is not None:
+            geom_prepos, geom_preaxis, geom_insert, geom_success = (
+                mdp._compute_geom_success_masks()
             )
+            custom_consec.copy_(
+                torch.where(geom_success, custom_consec + 1, torch.zeros_like(custom_consec))
+            )
+            cnt = int(custom_consec[args.viz_env_idx].item())
+            label = f"geom_{mdp._geom_stage}"
+        else:
+            cnt = int(mdp._consecutive_inthresh[args.viz_env_idx].item())
+            label = "in_thresh"
+        if cnt > 0 and state["step_idx"] % 5 == 0:
+            if args.geom_stage is not None and mdp._cached_d is not None:
+                print(f"  step {state['step_idx']}  env {args.viz_env_idx}  "
+                      f"{label} count={cnt}  "
+                      f"d={float(mdp._cached_d[args.viz_env_idx]):+.4f}m  "
+                      f"d_target={mdp._geom_d_target_eff:+.4f}m  "
+                      f"radial_tip={float(mdp._cached_radial_err_tip[args.viz_env_idx]):.4f}m  "
+                      f"radial_max={float(mdp._cached_radial_max[args.viz_env_idx]):.4f}m  "
+                      f"axis_err={float(mdp._cached_axis_err[args.viz_env_idx]):.4f}")
+            else:
+                pos_err = mdp._last_pos_err
+                axis_err = mdp._last_axis_err
+                print(f"  step {state['step_idx']}  env {args.viz_env_idx}  "
+                      f"{label} count={cnt}  "
+                      f"pos_err={float(pos_err[args.viz_env_idx]):.4f}m  "
+                      f"axis_err={float(axis_err[args.viz_env_idx]):.4f}")
+        target_ep_step = int(episode_steps[args.viz_env_idx].item())
+        if args.freeze_mode == "first_hold":
+            should_freeze = cnt >= args.hold_steps
+            freeze_reason = f"hold-{args.hold_steps}"
+        elif args.freeze_mode == "episode_end":
+            should_freeze = target_ep_step >= eval_horizon
+            freeze_reason = f"episode-end step {target_ep_step}/{eval_horizon}"
+        else:
+            should_freeze = target_ep_step >= int(args.freeze_after_step)
+            freeze_reason = f"episode-step {target_ep_step}"
+
+        if not state["frozen"] and should_freeze:
+            if args.geom_stage is not None and mdp._cached_d is not None:
+                print(
+                    f"\n[FREEZE] env {args.viz_env_idx} reached {freeze_reason} "
+                    f"(geom-{mdp._geom_stage}) "
+                    f"at step {state['step_idx']}\n"
+                    f"  d          = {float(mdp._cached_d[args.viz_env_idx]):+.4f}m\n"
+                    f"  d_target   = {mdp._geom_d_target_eff:+.4f}m\n"
+                    f"  radial_tip = {float(mdp._cached_radial_err_tip[args.viz_env_idx]):.4f}m  "
+                    f"(r_tip_th={mdp._geom_r_tip_th:.3f})\n"
+                    f"  radial_max = {float(mdp._cached_radial_max[args.viz_env_idx]):.4f}m  "
+                    f"(r_max_th={mdp._geom_r_max_th:.3f}, insert_r_max_th={mdp._geom_insert_r_max_th:.3f})\n"
+                    f"  axis_err   = {float(mdp._cached_axis_err[args.viz_env_idx]):.4f}  "
+                    f"(axis_th={mdp._geom_axis_th:.3f})\n"
+                    f"  penetration= {float(mdp._cached_penetration_max[args.viz_env_idx])*1000:.2f}mm  "
+                    f"(pen_th={mdp._geom_pen_th*1000:.1f}mm)\n"
+                    f"  freezing for {args.freeze_seconds:.1f}s, Ctrl-C to exit early"
+                )
+            else:
+                pos_err = mdp._last_pos_err
+                axis_err = mdp._last_axis_err
+                print(
+                    f"\n[FREEZE] env {args.viz_env_idx} reached {freeze_reason} "
+                    f"at step {state['step_idx']}\n"
+                    f"  pos_err  = {float(pos_err[args.viz_env_idx]):.4f}m\n"
+                    f"  axis_err = {float(axis_err[args.viz_env_idx]):.4f}  "
+                    f"(0 = perfect; success_axis_threshold = {mdp._success_axis_threshold:.3f})\n"
+                    f"  freezing for {args.freeze_seconds:.1f}s, Ctrl-C to exit early"
+                )
             state["frozen"] = True
             end_t = time.monotonic() + args.freeze_seconds
             try:
@@ -168,6 +341,19 @@ def main():
             except KeyboardInterrupt:
                 pass
             print("[FREEZE] released, evaluation will continue (or end)")
+        if isinstance(result, torch.Tensor):
+            done = result.to(dtype=torch.bool, device=mdp._device).flatten()
+        else:
+            done = torch.as_tensor(result, dtype=torch.bool, device=mdp._device)
+            if done.ndim == 0:
+                done = done.repeat(mdp._n_envs)
+            else:
+                done = done.flatten()
+        horizon_done = episode_steps >= eval_horizon
+        done = done | horizon_done
+        if done.any():
+            custom_consec[done] = 0
+            episode_steps[done] = 0
         return result
 
     mdp.is_absorbing = freeze_on_success
