@@ -1,7 +1,27 @@
 # Training outputs
+# Ignore generated results by default.  Only the current canonical
+# full-chain SAC artifacts below are intentionally tracked for GitHub.
 results/**
+!results/
 !results/video_local/
 !results/video_local/**
+
+# Canonical full-chain SAC checkpoints (2026-05-12)
+!results/checkpoints/
+!results/checkpoints/saved/
+!results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/
+!results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/best_hold.msh
+!results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00/
+!results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00/best_hold.msh
+!results/checkpoints/saved/Stage3g_insert_h200_from_h100_h150_stage2_2026-05-12_21-01-11/
+!results/checkpoints/saved/Stage3g_insert_h200_from_h100_h150_stage2_2026-05-12_21-01-11/best_hold.msh
+
+# Canonical full-chain SAC videos (one best_hold episode per stage)
+!results/videos/
+!results/videos/full_chain_best_hold_2026-05-12/
+!results/videos/full_chain_best_hold_2026-05-12/stage1g_prepos_best_hold_episode_000.mp4
+!results/videos/full_chain_best_hold_2026-05-12/stage2g_preaxis_best_hold_episode_000.mp4
+!results/videos/full_chain_best_hold_2026-05-12/stage3g_insert_best_hold_episode_000.mp4
 logs/
 runs/
 wandb/

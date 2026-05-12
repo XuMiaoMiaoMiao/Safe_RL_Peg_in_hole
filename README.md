@@ -12,8 +12,8 @@
 ```
 Stage 1g (prepos):   ckpt = results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/best_hold.msh
 Stage 2g (preaxis):  ckpt = results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00/best_hold.msh
-Stage 3g (insert):   ckpt = results/checkpoints/saved/SAC_v8_from_stage2_less_scrape_best_hold.msh
-                            (SAC v8 from old 2026-05-11 preaxis; clean insertion verified)
+Stage 3g (insert):   ckpt = results/checkpoints/saved/Stage3g_insert_h200_from_h100_h150_stage2_2026-05-12_21-01-11/best_hold.msh
+                            (SAC v8 full-chain retrain from current h100/h150 Stage 1g+2g; clean insertion verified)
 ```
 
 Stage 3g v8 SAC 用 5-channel reward (advance + dwell + pen + bad_entry + linear)
@@ -52,11 +52,11 @@ Stage 3g v8 SAC 用 5-channel reward (advance + dwell + pen + bad_entry + linear
 |---|---|---|
 | Stage 1g `prepos` | peg 到 hole 入口前的 preinsert 位置 | `results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/best_hold.msh` |
 | Stage 2g `preaxis` | preinsert 位置 + peg/hole 轴对齐 | `results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00/best_hold.msh` |
-| Stage 3g `insert` | 真实 clean insertion | `results/checkpoints/saved/SAC_v8_from_stage2_less_scrape_best_hold.msh` |
+| Stage 3g `insert` | 真实 clean insertion | `results/checkpoints/saved/Stage3g_insert_h200_from_h100_h150_stage2_2026-05-12_21-01-11/best_hold.msh` |
 
-注意: Stage 3g 仍是 2026-05-12 verified chain, 但它是从旧的 2026-05-11
-Stage 2g warm-start 训练得到; 尚未用 2026-05-12 h100/full-episode Stage 1g+2g
-新链路重新训练.
+Stage 3g 已用 2026-05-12 h100/full-episode Stage 1g + h150/full-episode
+Stage 2g 新链路重新训练并通过 eval. 旧的
+`SAC_v8_from_stage2_less_scrape_best_hold.msh` 保留为旧 preaxis chain 的复现参考.
 
 当前 setup (post-Davide / collision-aware) 的关键事实:
 
@@ -329,15 +329,29 @@ python scripts/visualize_policy.py \
 对齐, `radial_max` 小, `axis_err` 小. 若只想看刚达标瞬间, 去掉
 `--freeze_mode step --freeze_after_step 140` 即可回到 first-hold 行为.
 
-## Stage 3 (insertion, **已训练完成 — SAC v8 2026-05-12**)
+## Stage 3 (insertion, **已训练完成 — h200 full-chain SAC v8 2026-05-12**)
 
 ### 当前状态
 
-**Stage 3g (geom_stage="insert") SAC v8 clean insertion 训练成功**:
-- ckpt: `results/checkpoints/saved/SAC_v8_from_stage2_less_scrape_best_hold.msh`
-- 原始路径: `results/checkpoints/2026-05-12/08-58-55/best_hold.msh`
-- final: insert_step_rate=0.554, hold_rate=1.000, entry pen=0.17mm mean, final pen=0mm
-- best_score=125.75, max_run_mean=110.8/200 steps
+**Stage 3g (`geom_stage="insert"`) 从新 Stage 2g h150 `best_hold` 一次性训练成功**:
+- canonical ckpt: `results/checkpoints/saved/Stage3g_insert_h200_from_h100_h150_stage2_2026-05-12_21-01-11/best_hold.msh`
+- 原始路径: `results/checkpoints/2026-05-12/21-01-11/best_hold.msh`
+- warm-start 源: `results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00/best_hold.msh`
+- wandb run: `SAC_v8_from_h100_h150_stage2_seed1`
+- 训练 best: `geom_hold_rate=1.000`, `geom_max_run_mean=113.7/200`,
+  `best_score=113.688`, `best_J=-57.228`
+- 本次 run 结束时 `best_agent.msh` / `best_hold.msh` / `final_agent.msh`
+  md5 相同; 仍以 `best_hold.msh` 作为部署 / 后续 warm-start 入口.
+
+独立 eval (16 ep, deterministic, h200):
+- `J(γ)=-53.489`, `R=23.489`
+- `geom_step_rate=0.577`, `geom_hold_rate=1.000`,
+  `geom_max_run_mean=115.5/200`, `final_success_rate=1.000`
+- entry: `d=+0.0258m`, `radial_max=0.0059m`, `axis_err=0.0100`,
+  `penetration=0.04mm mean / 0.65mm max`
+- final: `d=+0.0343m`, `radial_max=0.0029m`, `axis_err=0.0014`,
+  `penetration=0.00mm`
+- active mask 内 penetration max `0.65mm < 1.0mm`; clean insertion verified.
 
 ### 目标
 
@@ -364,7 +378,7 @@ e_axis     = 1 + cos(peg_axis, hole_axis)           # peg/hole 反向时 = 0
 历史 `d` sign 验证脚本归档在 `scripts/archive/sanity_eval_stage3.py` (post-v4-removal
 不可直接运行, 但 docstring 仍然记录验证流程).
 
-### Stage 3g 训练命令 (SAC v8 verified recipe, 2026-05-12)
+### Stage 3g 训练命令 (h200 full-chain SAC v8, from current Stage 2g)
 
 **这是当前主线**. 走 geom_stage 路径:
 - `--geom_stage insert` 启用 geom reward + 41D obs
@@ -377,7 +391,7 @@ cd ~/bimanual_peghole && conda activate safe_rl
 
 python scripts/train_sac.py \
   --geom_stage insert \
-  --load_agent results/checkpoints/saved/Stage2_preaxis_for_stage3_2026-05-11_11-47-34_best_hold.msh \
+  --load_agent results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00/best_hold.msh \
   --actor_only_warmstart \
   --critic_warmup_transitions 30000 \
   --exclude_ee_from_physx_self_collision \
@@ -388,14 +402,15 @@ python scripts/train_sac.py \
   --geom_d_th 0.020 --geom_r_tip_th 0.015 --geom_r_max_th 0.025 --geom_axis_th 0.300 \
   --geom_insert_d_ins 0.025 --geom_insert_r_max_th 0.025 \
   --geom_pen_th 0.001 \
-  --rew_geom_d 0.0 --rew_geom_radial_tip 0 --rew_geom_radial_max 5.0 --rew_geom_axis 1.0 \
+  --rew_geom_d 1.0 --rew_geom_radial_tip 0 --rew_geom_radial_max 5.0 --rew_geom_axis 1.0 \
   --rew_geom_progress 0.0 --rew_geom_advance 25.0 \
   --geom_gate_radial_sigma 0.025 --geom_gate_axis_sigma 0.30 \
-  --rew_geom_penetration 15.0 --geom_gate_penetration_sigma 0.005 \
+  --rew_geom_penetration 20.0 --geom_gate_penetration_sigma 0.005 \
   --rew_geom_soft_success 1.25 \
-  --geom_soft_d_sigma 0.020 --geom_soft_radial_sigma 0.010 \
+  --geom_soft_d_sigma 0.018 --geom_soft_radial_sigma 0.009 \
   --geom_soft_axis_sigma 0.15 --geom_soft_penetration_sigma 0.0025 \
-  --rew_geom_bad_entry 0.3 \
+  --geom_d_gate_mode off \
+  --rew_geom_bad_entry 0.30 \
   --geom_bad_entry_radial_safe 0.014 \
   --geom_bad_entry_axis_safe 0.10 \
   --geom_bad_entry_pen_safe 0.00075 \
@@ -404,47 +419,117 @@ python scripts/train_sac.py \
   --num_envs 16 --n_eval_episodes 16 \
   --hold_success_steps 10 --terminal_hold_bonus 0 \
   --rew_home 0.001 --home_weights 1,1,1,1,0.75,0.5,0.5 \
-  --lr_actor 1e-5 --alpha_max 0.015 --target_entropy -7 \
+  --lr_actor 1e-5 --lr_critic 3e-4 --lr_alpha 3e-4 \
+  --alpha_max 0.015 --target_entropy -7 \
   --seed 1 \
-  --wandb_run_name SAC_v8_from_stage2_seed1 --wandb_group sac_lagr
+  --wandb_run_name SAC_v8_from_h100_h150_stage2_seed1 \
+  --wandb_group geom_repro
 ```
 
 5 个 reward channel 职责:
 1. `r_geom_radial_max + r_geom_axis` (linear, always-on): 拉对齐
 2. `r_geom_advance` (PBRS Δφ, w=25): 主推进信号, 只在 aligned 时给奖
-3. `r_geom_penetration` (linear -15·pen): 直接罚穿模
+3. `r_geom_penetration` (linear -20·pen): 直接罚穿模
 4. `r_geom_soft_success` (4-项 Gaussian dwell well, w=1.25): clean target 处持续 +1/step
 5. `r_geom_bad_entry` (normalized w=0.3, capped): task ordering — d>0+misaligned 罚
 
 详见 memory `feedback_bimanual_sac_v8_recipe.md`.
 
-期望 final 数字:
-- insert_step_rate (strict mask) > 0.5
-- geom_hold_rate = 1.000
-- entry penetration mean < 0.5mm
-- final state: d≈+0.026, axis_err≈0, radial≈3mm, penetration=0
+本次 eval 验收数字:
+- insert_step_rate / `geom_step_rate` = 0.577
+- `geom_hold_rate = 1.000`, `geom_max_run_mean=115.5/200`
+- entry penetration mean = 0.04mm, active-mask max = 0.65mm
+- final state: `d=+0.0343m`, `axis_err=0.0014`, `radial_max=0.0029m`,
+  penetration=0.00mm
 
 ### Stage 3g eval / viz
 
 eval:
 ```bash
-python scripts/eval_sac.py --headless --num_envs 16 --n_episodes 64 \
-  --agent_path results/checkpoints/saved/SAC_v8_from_stage2_less_scrape_best_hold.msh \
-  --geom_stage insert --horizon 200 --geom_eval_epoch 20 \
+python scripts/eval_sac.py \
+  --agent_path results/checkpoints/saved/Stage3g_insert_h200_from_h100_h150_stage2_2026-05-12_21-01-11/best_hold.msh \
+  --geom_stage insert \
+  --geom_eval_epoch 20 \
   --exclude_ee_from_physx_self_collision \
   --geom_d_target_neg -0.08 --geom_d_target_pos 0.03 \
   --geom_d_target_ramp_start 0 --geom_d_target_ramp_end 20 \
-  --geom_d_th 0.020 --geom_r_max_th 0.025 --geom_axis_th 0.300 \
-  --geom_insert_d_ins 0.025 --geom_insert_r_max_th 0.025 --geom_pen_th 0.001 \
-  --rew_geom_radial_max 5.0 --rew_geom_axis 1.0 --rew_geom_advance 25.0 \
-  --rew_geom_penetration 15.0 --geom_gate_penetration_sigma 0.005 \
-  --rew_geom_soft_success 1.25 --geom_soft_penetration_sigma 0.0025 \
-  --rew_geom_bad_entry 0.3 --geom_bad_entry_radial_safe 0.014 --geom_bad_entry_pen_safe 0.00075 \
-  --rew_home 0.001 --home_weights 1,1,1,1,0.75,0.5,0.5
+  --geom_progress_floor 0.0 \
+  --geom_d_sat 0.30 --geom_radial_sat 1.0 \
+  --geom_d_th 0.020 --geom_r_tip_th 0.015 \
+  --geom_r_max_th 0.025 --geom_axis_th 0.300 \
+  --geom_insert_d_ins 0.025 --geom_insert_r_max_th 0.025 \
+  --geom_pen_th 0.001 \
+  --rew_geom_d 1.0 \
+  --rew_geom_radial_tip 0 \
+  --rew_geom_radial_max 5.0 \
+  --rew_geom_axis 1.0 \
+  --rew_geom_progress 0.0 \
+  --rew_geom_advance 25.0 \
+  --geom_gate_radial_sigma 0.025 \
+  --geom_gate_axis_sigma 0.30 \
+  --rew_geom_penetration 20.0 \
+  --geom_gate_penetration_sigma 0.005 \
+  --rew_geom_soft_success 1.25 \
+  --geom_soft_d_sigma 0.018 \
+  --geom_soft_radial_sigma 0.009 \
+  --geom_soft_axis_sigma 0.15 \
+  --geom_soft_penetration_sigma 0.0025 \
+  --geom_d_gate_mode off \
+  --rew_geom_bad_entry 0.30 \
+  --geom_bad_entry_radial_safe 0.014 \
+  --geom_bad_entry_axis_safe 0.10 \
+  --geom_bad_entry_pen_safe 0.00075 \
+  --cost_signal collision \
+  --horizon 200 \
+  --num_envs 16 --n_episodes 16 \
+  --hold_success_steps 10 --terminal_hold_bonus 0 \
+  --rew_home 0.001 --home_weights 1,1,1,1,0.75,0.5,0.5 \
+  --headless
 ```
 
-viz: 同 eval, 改 `scripts/visualize_policy.py` + 加 `--num_envs 4 --n_episodes 4 --freeze_seconds 20 --hold_steps 50`.
-带 `--hold_steps 50` 让 freeze 触发在 agent 已稳定 dwell 时, 看真 dwell 状态.
+visualization:
+```bash
+python scripts/visualize_policy.py \
+  --agent_path results/checkpoints/saved/Stage3g_insert_h200_from_h100_h150_stage2_2026-05-12_21-01-11/best_hold.msh \
+  --geom_stage insert \
+  --geom_eval_epoch 20 \
+  --exclude_ee_from_physx_self_collision \
+  --geom_d_target_neg -0.08 --geom_d_target_pos 0.03 \
+  --geom_d_target_ramp_start 0 --geom_d_target_ramp_end 20 \
+  --geom_progress_floor 0.0 \
+  --geom_d_sat 0.30 --geom_radial_sat 1.0 \
+  --geom_d_th 0.020 --geom_r_tip_th 0.015 \
+  --geom_r_max_th 0.025 --geom_axis_th 0.300 \
+  --geom_insert_d_ins 0.025 --geom_insert_r_max_th 0.025 \
+  --geom_pen_th 0.001 \
+  --rew_geom_d 1.0 \
+  --rew_geom_radial_tip 0 \
+  --rew_geom_radial_max 5.0 \
+  --rew_geom_axis 1.0 \
+  --rew_geom_progress 0.0 \
+  --rew_geom_advance 25.0 \
+  --geom_gate_radial_sigma 0.025 \
+  --geom_gate_axis_sigma 0.30 \
+  --rew_geom_penetration 20.0 \
+  --geom_gate_penetration_sigma 0.005 \
+  --rew_geom_soft_success 1.25 \
+  --geom_soft_d_sigma 0.018 \
+  --geom_soft_radial_sigma 0.009 \
+  --geom_soft_axis_sigma 0.15 \
+  --geom_soft_penetration_sigma 0.0025 \
+  --geom_d_gate_mode off \
+  --rew_geom_bad_entry 0.30 \
+  --geom_bad_entry_radial_safe 0.014 \
+  --geom_bad_entry_axis_safe 0.10 \
+  --geom_bad_entry_pen_safe 0.00075 \
+  --cost_signal collision \
+  --horizon 200 \
+  --num_envs 4 --n_episodes 4 \
+  --hold_steps 10 \
+  --freeze_mode first_hold \
+  --freeze_seconds 20 \
+  --rew_home 0.001 --home_weights 1,1,1,1,0.75,0.5,0.5
+```
 
 ### Best ckpt 选择 (geom_stage 模式)
 
@@ -543,17 +628,16 @@ success 本身不终止, 避免 Q-target 边界断崖
 ## 保留结果
 
 ```text
-# Canonical saved best_hold chain (current h100/h150 Stage 1g+2g)
+# Canonical saved best_hold chain (current h100/h150/h200 full-chain SAC)
 results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/best_hold.msh
 results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00/best_hold.msh
-
-# Verified Stage 3g v8 (still trained from old 2026-05-11 Stage 2g)
-results/checkpoints/saved/SAC_v8_from_stage2_less_scrape_best_hold.msh
+results/checkpoints/saved/Stage3g_insert_h200_from_h100_h150_stage2_2026-05-12_21-01-11/best_hold.msh
 
 # Older saved best_hold ckpts kept for reproducibility / ablation reference
 results/checkpoints/saved/Stage1_prepos_for_stage2_S1g_refine_seed0_best_hold.msh
 results/checkpoints/saved/Stage2_preaxis_strict_refine_parent_2026-05-11_10-38-18_best_hold.msh
 results/checkpoints/saved/Stage2_preaxis_for_stage3_2026-05-11_11-47-34_best_hold.msh
+results/checkpoints/saved/SAC_v8_from_stage2_less_scrape_best_hold.msh
 results/checkpoints/saved/SAC_v7c_clean_entry_best_hold.msh
 
 # Restored dated dirs (best_hold mirrors saved/)
@@ -564,6 +648,7 @@ results/checkpoints/2026-05-12/00-46-20/
 results/checkpoints/2026-05-12/08-58-55/
 results/checkpoints/2026-05-12/18-35-31/
 results/checkpoints/2026-05-12/19-50-00/
+results/checkpoints/2026-05-12/21-01-11/
 ```
 
 顶层 `results/*.msh` 已清空; 不再依赖会被训练覆盖的 flat checkpoint. 由于
