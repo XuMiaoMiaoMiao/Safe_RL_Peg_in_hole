@@ -4,23 +4,23 @@
 - 算法换成 algorithm.lagrangian_sac.SACLagrangian (在 PROJECT_ROOT/algorithm/ 下).
 - env._create_info_dictionary 必须返回 {"cost": tensor} (已在
   envs/dual_arm_peg_hole_cost_env.py 实现).
-- 多了 --cost_limit / --lr_lambda / --lambda_max / --init_log_lambda /
+- 多了 --cost_limit_per_ep / --lr_lambda / --lambda_max / --init_log_lambda /
   --gamma_cost flags.
-- 每 epoch eval 多算 cost_rate, wandb 加 lambda / cost_q_mean.
+- 每 epoch eval 多算 eval_step_cost / eval_ep_cost, wandb 加 lambda / rollout_ep_cost.
 
 Warmstart 注意:
 - 从 SAC checkpoint warm-start: **必须 --actor_only_warmstart**, 否则报错
   (SAC 没有 cost critic / lambda, 全量 load 会缺字段).
 - 从 SACLagrangian checkpoint warm-start: 可全量 (默认) 或 actor-only.
 
-Cost signal 调标:
+Cost signal 调标 (当前仅用 rollout_episode_rate 模式):
 - env 的 cost 由 DualArmPegHoleCostEnv.cost() 选择:
     cost_signal="collision"    → PhysX OR sphere-proxy collision indicator (0/1)
     cost_signal="penetration"  → geom penetration_max 连续值 [0, 4mm]
-- per-step λ 模式: cost_limit 与 mean(cost) 同量纲；collision 是 rate,
-  penetration 是平均穿模米数.
-- episode_rate / rollout_episode_rate: cost_limit 是每集平均 cost sum.
-  collision 近似每集碰撞次数；penetration 是 episode 内 penetration 累积量.
+- cost_limit_per_ep (--cost_limit_per_ep) 始终是每集平均 cost sum (per-episode):
+    collision 模式: ≈ 每集碰撞次数 (e.g., 0.10 = 平均 0.1 次碰撞/集)
+    penetration 模式: episode 内 penetration_max 累积量 (米·步)
+- λ 更新信号来自 rollout EpisodeCostTracker, 不依赖 replay batch 或 eval.
 
 整体架构：
   envs/dual_arm_peg_hole_cost_env.py   ← cost 信号来源 (DualArmPegHoleCostEnv)
@@ -48,6 +48,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from networks import ActorNetwork, CriticNetwork
 from scripts._eval_utils import (
+    compute_geom_metrics,
     compute_cost_metrics,
     compute_hold_metrics,
     deterministic_policy,
@@ -245,14 +246,6 @@ class EpisodeCostTracker:
         return len(self._completed)
 
 
-def _nanmean(values):
-    return float(np.mean(values)) if len(values) else float("nan")
-
-
-def _nanmin_tensor(x):
-    return float(x.min()) if x.numel() else float("nan")
-
-
 def _actor_net(approximator):
     return approximator.model.network
 
@@ -304,116 +297,6 @@ def warmstart_actor_with_optional_partial(agent, old_agent, *, allow_partial):
     return mu_mode if mu_mode == sigma_mode else f"mu={mu_mode}, sigma={sigma_mode}"
 
 
-def compute_geom_metrics(dataset, mdp, hold_n_steps):
-    """Compute geom-stage metrics from env info tensors in an eval dataset."""
-    info = dataset.info.data
-    required = (
-        "geom_d", "geom_d_target", "geom_radial_tip", "geom_radial_max",
-        "geom_axis_err", "geom_penetration_max", "geom_prepos_mask",
-        "geom_preaxis_mask", "geom_insert_mask", "geom_success_mask",
-    )
-    missing = [k for k in required if k not in info]
-    if missing:
-        raise KeyError(
-            "geom metrics requested but dataset.info.data is missing keys: "
-            f"{missing}. 确认 env 使用 geom_stage 并且 _create_info_dictionary 保留父类 geom info."
-        )
-
-    def t(key):
-        value = info[key]
-        return value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
-
-    d = t("geom_d").float()
-    d_target = t("geom_d_target").float()
-    d_err = torch.abs(d - d_target)
-    radial_tip = t("geom_radial_tip").float()
-    radial_max = t("geom_radial_max").float()
-    axis_err = t("geom_axis_err").float()
-    penetration = t("geom_penetration_max").float()
-    prepos_mask = t("geom_prepos_mask").float()
-    preaxis_mask = t("geom_preaxis_mask").float()
-    insert_mask = t("geom_insert_mask").float()
-    success_mask = t("geom_success_mask").float() > 0.5
-
-    _, _, _, _, _, last = dataset.parse(to="torch")
-    last_np = last.cpu().numpy().astype(bool)
-    success_np = success_mask.cpu().numpy().astype(bool)
-    d_np = d.cpu().numpy()
-
-    end_indices = np.flatnonzero(last_np)
-    ep_max_runs, ep_success_rates, ep_final_success = [], [], []
-    entry_indices = []
-    start = 0
-    for end in end_indices:
-        ep_success = success_np[start:end + 1]
-        max_run, cur = 0, 0
-        for flag in ep_success:
-            cur = cur + 1 if flag else 0
-            max_run = max(max_run, cur)
-        ep_max_runs.append(max_run)
-        ep_success_rates.append(float(ep_success.mean()) if len(ep_success) else 0.0)
-        ep_final_success.append(bool(ep_success[-1]) if len(ep_success) else False)
-
-        ep_d = d_np[start:end + 1]
-        entry = np.flatnonzero(ep_d > 0.0)
-        if len(entry):
-            entry_indices.append(start + int(entry[0]))
-        start = end + 1
-
-    hold_flags = np.asarray([run >= hold_n_steps for run in ep_max_runs], dtype=bool)
-    final_idx = torch.as_tensor(end_indices, device=d.device, dtype=torch.long)
-    entry_idx = torch.as_tensor(entry_indices, device=d.device, dtype=torch.long)
-    active_pen = penetration[success_mask]
-
-    def mean_at(x, idx):
-        return float(x[idx].mean()) if idx.numel() else float("nan")
-
-    def max_at(x, idx):
-        return float(x[idx].max()) if idx.numel() else float("nan")
-
-    return {
-        "geom_step_rate": float(success_mask.float().mean()),
-        "geom_hold_rate": float(hold_flags.mean()) if len(hold_flags) else 0.0,
-        "geom_max_run_mean": float(np.mean(ep_max_runs)) if ep_max_runs else 0.0,
-        "geom_ep_success_rate_mean": _nanmean(ep_success_rates),
-        "geom_final_success_rate": float(np.mean(ep_final_success)) if ep_final_success else 0.0,
-        "geom_prepos_step_rate": float(prepos_mask.mean()),
-        "geom_preaxis_step_rate": float(preaxis_mask.mean()),
-        "geom_insert_step_rate": float(insert_mask.mean()),
-        "geom_d_target_mean": float(d_target.mean()),
-        "geom_d_err_mean": float(d_err.mean()),
-        "geom_d_err_min": _nanmin_tensor(d_err),
-        "geom_radial_tip_mean": float(radial_tip.mean()),
-        "geom_radial_tip_min": _nanmin_tensor(radial_tip),
-        "geom_radial_max_mean": float(radial_max.mean()),
-        "geom_radial_max_min": _nanmin_tensor(radial_max),
-        "geom_axis_err_mean": float(axis_err.mean()),
-        "geom_axis_err_min": _nanmin_tensor(axis_err),
-        "geom_n_ep_with_entry": len(entry_indices),
-        "geom_entry_d_mean": mean_at(d, entry_idx),
-        "geom_entry_d_err_mean": mean_at(d_err, entry_idx),
-        "geom_entry_radial_max_mean": mean_at(radial_max, entry_idx),
-        "geom_entry_radial_max_max": max_at(radial_max, entry_idx),
-        "geom_entry_axis_err_mean": mean_at(axis_err, entry_idx),
-        "geom_entry_axis_err_max": max_at(axis_err, entry_idx),
-        "geom_entry_penetration_mean": mean_at(penetration, entry_idx),
-        "geom_entry_penetration_max": max_at(penetration, entry_idx),
-        "geom_final_d_mean": mean_at(d, final_idx),
-        "geom_final_d_err_mean": mean_at(d_err, final_idx),
-        "geom_final_radial_max_mean": mean_at(radial_max, final_idx),
-        "geom_final_radial_max_max": max_at(radial_max, final_idx),
-        "geom_final_axis_err_mean": mean_at(axis_err, final_idx),
-        "geom_final_axis_err_max": max_at(axis_err, final_idx),
-        "geom_final_penetration_mean": mean_at(penetration, final_idx),
-        "geom_final_penetration_max": max_at(penetration, final_idx),
-        "geom_pen_max_mean": float(penetration.mean()),
-        "geom_pen_max_max": float(penetration.max()),
-        "geom_clean_step_rate": float((penetration < mdp._geom_pen_th).float().mean()),
-        "geom_pen_in_active_mean": float(active_pen.mean()) if active_pen.numel() else float("nan"),
-        "geom_pen_in_active_max": float(active_pen.max()) if active_pen.numel() else float("nan"),
-    }
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 
 INITIAL_REPLAY_SIZE = 10_000
@@ -458,11 +341,11 @@ def parse_args():
                    help="评估 episode 数. 默认自动取 num_envs, 并要求能被 num_envs 整除")
 
     # ---- Lagrangian 专属 ----------------------------------------------------
-    p.add_argument("--cost_limit", type=float, required=True,
-                   help="cost 预算. per-step 模式下是 mean(cost); "
-                        "episode_rate/rollout_episode_rate 下是每集平均 cost sum. "
-                        "collision 为 0/1 rate 或次数; penetration 为米制连续量. "
-                        "标定方法见文件头.")
+    p.add_argument("--cost_limit_per_ep", type=float, required=True,
+                   help="每集平均 cost sum 预算 (rollout_episode_rate 模式). "
+                        "collision 模式: ≈ 每集碰撞次数 (e.g., 0.10 = 0.1 次碰/集). "
+                        "penetration 模式: episode 内 penetration_max 累积量 (米·步). "
+                        "建议用 SAC baseline eval 实测 eval_ep_cost 后取 0.5× 标定.")
     p.add_argument("--lr_lambda", type=float, default=1e-3,
                    help="Lagrange 乘子学习率. 1e-3~1e-4, 通常比 lr_actor 低.")
     p.add_argument("--lambda_max", type=float, default=100.0,
@@ -474,21 +357,18 @@ def parse_args():
                    help="log_λ 初值, 默认 0 → λ_init=1.")
     p.add_argument("--gamma_cost", type=float, default=None,
                    help="cost MDP 折扣. 默认 = env γ. 设 1.0 = average-cost "
-                        "(注意此时 cost_limit 直接是 Q_C 量纲, 不是 per-step).")
-    p.add_argument("--lambda_update_mode", type=str, default="max_recent_replay",
-                   choices=("max_recent_replay", "batch_cost_rate",
-                            "recent_cost_rate", "discounted_q",
-                            "episode_rate", "rollout_episode_rate"),
+                        "(注意此时 cost_limit_per_ep 直接是 Q_C 量纲).")
+    p.add_argument("--lambda_update_mode", type=str, default="rollout_episode_rate",
+                   choices=("recent_cost_rate", "episode_rate", "rollout_episode_rate"),
                    help="λ 更新信号来源. "
-                        "rollout_episode_rate (推荐): cost_limit = 每集平均 cost sum; "
+                        "rollout_episode_rate (推荐): cost_limit_per_ep = 每集平均 cost sum; "
                         "使用当前 policy rollout 中完成的真实 episode cost 统计, "
                         "在 core.learn() 结束后 drain EpisodeCostTracker 更新 λ; "
                         "不读 replay/eval, 不依赖 Mushroom flattened last. "
-                        "episode_rate (eval-based, 有滞后): cost_limit = 每集平均 cost sum; "
-                        "λ 只在 eval 后用 compute_cost_metrics()[cost_episode_sum_mean] 更新. "
-                        "max_recent_replay: fit() 中用最新采样块与 replay batch 的较大 "
-                        "per-step mean(cost). batch_cost_rate: 仅用 replay batch. "
-                        "recent_cost_rate: 仅用最新采样块. discounted_q: Q_C×(1-gamma_cost).")
+                        "episode_rate (eval-based, 有滞后): cost_limit_per_ep = 每集平均 cost sum; "
+                        "λ 只在 eval 后用 eval_ep_cost 更新. "
+                        "recent_cost_rate: fit() 中仅用当前 rollout 采样块的 "
+                        "per-step mean(cost), 保留作消融; 不读 replay.")
     p.add_argument("--min_lambda_update_episodes", type=int, default=None,
                    help="rollout_episode_rate 模式: 触发 λ 更新所需的最少 episode 数. "
                         "默认自动取 num_envs (一个完整 env 轮次). 若一个 epoch 内完成的 "
@@ -592,8 +472,9 @@ def parse_args():
     p.add_argument("--geom_gate_radial_sigma", type=float, default=None)
     p.add_argument("--geom_gate_axis_sigma", type=float, default=None)
     p.add_argument("--rew_geom_penetration", type=float, default=None,
-                   help="SAC soft penetration penalty. Lagrangian reward 会清零该组件, "
-                        "建议保持 0/None, 用 cost_signal=penetration 约束.")
+                   help="soft penetration penalty -w·penetration_max. "
+                        "cost_signal=collision 时保留在 reward 里; "
+                        "cost_signal=penetration 时 CMDP reward 会清零该组件, 避免双重施压.")
     p.add_argument("--geom_gate_penetration_sigma", type=float, default=None)
     p.add_argument("--cost_signal", type=str, default=None,
                    choices=("collision", "penetration"),
@@ -606,6 +487,9 @@ def parse_args():
     p.add_argument("--geom_bad_entry_radial_safe", type=float, default=None)
     p.add_argument("--geom_bad_entry_axis_safe", type=float, default=None)
     p.add_argument("--geom_bad_entry_pen_safe", type=float, default=None)
+    p.add_argument("--terminal_hold_bonus", type=float, default=0.0,
+                   help="兼容配置参数. Lagrangian 路径固定不启用 hold-N cliff, "
+                        "该值应保持 0.0.")
 
     # wandb
     p.add_argument("--wandb_project", type=str, default="bimanual_peghole")
@@ -652,10 +536,10 @@ def main():
             f"--critic_warmup_transitions ({args.critic_warmup_transitions}) 必须 >= "
             f"INITIAL_REPLAY_SIZE ({INITIAL_REPLAY_SIZE})"
         )
-    if args.cost_limit < 0.0:
-        raise ValueError(f"--cost_limit ({args.cost_limit}) 必须 >= 0")
-    if args.cost_limit == 0.0:
-        print("[WARN] --cost_limit=0 会让 λ 一上来就爆, 一般先用 baseline eval 标定后取保守预算.")
+    if args.cost_limit_per_ep < 0.0:
+        raise ValueError(f"--cost_limit_per_ep ({args.cost_limit_per_ep}) 必须 >= 0")
+    if args.cost_limit_per_ep == 0.0:
+        print("[WARN] --cost_limit_per_ep=0 会让 λ 一上来就爆, 一般先用 baseline eval 标定后取保守预算.")
     # Default: one full generation of parallel envs (each env completes ≥1 episode).
     if args.min_lambda_update_episodes is None:
         args.min_lambda_update_episodes = args.num_envs
@@ -750,7 +634,7 @@ def main():
             lr_alpha=args.lr_alpha,
             use_log_alpha_loss=True,
             target_entropy=target_entropy,
-            cost_limit=args.cost_limit,
+            cost_limit=args.cost_limit_per_ep,
             lr_lambda=args.lr_lambda,
             lambda_max=args.lambda_max,
             lambda_min=args.lambda_min,
@@ -891,7 +775,9 @@ def main():
             f"w_progress={mdp._w_geom_progress:.2f}  "
             f"w_advance={mdp._w_geom_advance:.2f}  "
             f"w_bad_entry={mdp._w_geom_bad_entry:.2f}  "
-            "r_geom_penetration=0 in CMDP reward"
+            f"w_penetration={mdp._w_geom_penetration:.2f}  "
+            "r_geom_penetration="
+            + ("0 (cost_signal=penetration)" if mdp._cost_signal == "penetration" else "kept")
         )
         logger.info(
             f"geom thresholds: d_th={mdp._geom_d_th:.3f}  "
@@ -910,7 +796,7 @@ def main():
     gamma_cost_resolved = (args.gamma_cost if args.gamma_cost is not None
                            else mdp.info.gamma)
     grad_clip_str = f"{args.actor_grad_clip:.2f}" if args.actor_grad_clip else "off"
-    logger.info(f"[Lagrangian] cost_limit={args.cost_limit:.4f}  "
+    logger.info(f"[Lagrangian] cost_limit_per_ep={args.cost_limit_per_ep:.4f}  "
                 f"cost_signal={mdp._cost_signal}  "
                 f"lr_lambda={args.lr_lambda:.1e}  "
                 f"lambda_max={args.lambda_max:.1f}  lambda_min={args.lambda_min:.4f}  "
@@ -1004,9 +890,9 @@ def main():
                         f"pos_err_mean={m0['pos_err_mean']:.4f}m  "
                         f"axis_err_mean={m0['axis_err_mean']:.4f}  "
                         f"hold_success_rate={m0['hold_success_rate']:.3f}")
-        logger.info(f"  cost_rate={c0['cost_rate']:.4f}  "
-                    f"cost_episode_sum_mean={c0['cost_episode_sum_mean']:.3f}  "
-                    f"cost_limit={args.cost_limit:.4f}")
+        logger.info(f"  eval_step_cost={c0['cost_rate']:.4f}  "
+                    f"eval_ep_cost={c0['cost_episode_sum_mean']:.3f}  "
+                    f"cost_limit_per_ep={args.cost_limit_per_ep:.4f}")
         logger.info("=" * 60)
         if wandb_run is not None:
             wandb_run.log({
@@ -1015,8 +901,8 @@ def main():
                 "warmstart_pos_err_mean": m0["pos_err_mean"],
                 "warmstart_axis_err_mean": m0["axis_err_mean"],
                 "warmstart_hold_success_rate": m0["hold_success_rate"],
-                "warmstart_cost_rate": c0["cost_rate"],
-                "warmstart_cost_episode_sum_mean": c0["cost_episode_sum_mean"],
+                "warmstart_eval_step_cost": c0["cost_rate"],
+                "warmstart_eval_ep_cost": c0["cost_episode_sum_mean"],
                 **({
                     "warmstart_geom_hold_rate": mg0["geom_hold_rate"],
                     "warmstart_geom_step_rate": mg0["geom_step_rate"],
@@ -1177,36 +1063,19 @@ def main():
         absorb_prev, absorb_physx_prev, absorb_sphere_prev = _cmdp_absorb_counts()
 
         lambda_val = float(agent._log_lambda.exp().item())
-        lambda_qc_mean = float(getattr(agent, "_lambda_qc_mean", float("nan")))
-        lambda_batch_cost_rate = float(
-            getattr(agent, "_lambda_batch_cost_rate", float("nan"))
-        )
-        lambda_recent_cost_rate = float(
-            getattr(agent, "_lambda_recent_cost_rate", float("nan"))
-        )
-        lambda_selected_cost_rate = float(
-            getattr(agent, "_lambda_selected_cost_rate", float("nan"))
-        )
-        lambda_internal_violation = float(
-            getattr(agent, "_lambda_internal_violation", float("nan"))
-        )
-        lambda_update_source = getattr(agent, "_lambda_update_source", "unknown")
-        # episode_rate / rollout_episode_rate: cost_limit is per-episode cost
-        # sum; compare against the eval episode-sum metric. Per-step modes use
-        # mean(cost), whose units follow cost_signal.
-        if lambda_update_mode in ("episode_rate", "rollout_episode_rate"):
-            cost_violation = c['cost_episode_sum_mean'] - args.cost_limit
-        else:
-            cost_violation = c['cost_rate'] - args.cost_limit
+        rollout_ep_cost = float(getattr(agent, "_rollout_ep_cost", float("nan")))
+        rollout_ep_violation = float(getattr(agent, "_rollout_ep_violation", float("nan")))
+        # eval-side violation: deterministic policy, one epoch behind rollout signal.
+        eval_ep_violation = c['cost_episode_sum_mean'] - args.cost_limit_per_ep
 
         logger.epoch_info(
             epoch + 1, J=J, R=R, best_J=best_J,
             **{("best_geom" if mg is not None else "best_hold"):
                best_hold_rate if best_hold_rate >= 0 else 0.0},
             best_score=best_score,
-            cost_rate=c['cost_rate'],
+            eval_step_cost=c['cost_rate'],
             lam=lambda_val,
-            absorb_epoch=absorb_epoch,
+            epoch_absorb=absorb_epoch,
         )
         if mg is not None:
             logger.info(
@@ -1267,21 +1136,15 @@ def main():
                             f"axis_err_min={m['axis_err_in_pos_thresh_min']:.4f}")
             else:
                 logger.info("  ↳ pos_in_thresh diagnostics: count=0  axis_err=n/a")
-        logger.info(f"  ↳ cost_mean={c['cost_rate']:.4f}  "
-                    f"cost_ep_sum={c['cost_episode_sum_mean']:.3f}  "
-                    f"eval_violation={cost_violation:+.4f}  "
-                    f"lambda_internal_violation={lambda_internal_violation:+.4f}  "
-                    f"lambda_selected_cost_rate={lambda_selected_cost_rate:.4f}  "
-                    f"lambda_recent_cost_rate={lambda_recent_cost_rate:.4f}  "
-                    f"lambda_batch_cost_rate={lambda_batch_cost_rate:.4f}  "
-                    f"lambda_qc_mean={lambda_qc_mean:.4f}  "
-                    f"rollout_ep_cost={_rollout_ep_mean:.3f}  "
-                    f"rollout_n_ep={_rollout_n_ep}  "
-                    f"lambda_update_mode={lambda_update_mode}  "
-                    f"lambda_update_source={lambda_update_source}  "
+        logger.info(f"  ↳ eval_step_cost={c['cost_rate']:.4f}  "
+                    f"eval_ep_cost={c['cost_episode_sum_mean']:.3f}  "
+                    f"eval_ep_violation={eval_ep_violation:+.4f}  "
+                    f"rollout_ep_cost={rollout_ep_cost:.3f}  "
+                    f"rollout_ep_violation={rollout_ep_violation:+.4f}  "
+                    f"rollout_ep_n={_rollout_n_ep}  "
                     f"λ={lambda_val:.3f}  "
-                    f"absorb_sphere={absorb_sphere_epoch}  "
-                    f"absorb_physx={absorb_physx_epoch}")
+                    f"epoch_absorb_sphere={absorb_sphere_epoch}  "
+                    f"epoch_absorb_physx={absorb_physx_epoch}")
 
         if wandb_run is not None:
             _legacy = (lambda k: f"legacy_{k}") if mg is not None else (lambda k: k)
@@ -1362,28 +1225,22 @@ def main():
                     "geom_pen_in_active_max": mg["geom_pen_in_active_max"],
                 } if mg is not None else {}),
                 "alpha": agent._alpha.item(),
-                # Lagrangian 专属
+                # Lagrangian safety
                 "lambda": lambda_val,
                 "log_lambda": float(agent._log_lambda.item()),
-                "lambda_qc_mean": lambda_qc_mean,
-                "lambda_batch_cost_rate": lambda_batch_cost_rate,
-                "lambda_recent_cost_rate": lambda_recent_cost_rate,
-                "lambda_selected_cost_rate": lambda_selected_cost_rate,
-                "lambda_internal_violation": lambda_internal_violation,
-                "lambda_update_mode": lambda_update_mode,
-                "lambda_update_source": lambda_update_source,
-                # rollout_episode_rate data stream: on-policy episode cost statistics
-                # used to drive λ. NaN in non-rollout_episode_rate modes.
-                "rollout_ep_cost_mean": _rollout_ep_mean,
-                "rollout_n_episodes": _rollout_n_ep,
-                "cost_rate": c["cost_rate"],
-                "cost_episode_sum_mean": c["cost_episode_sum_mean"],
-                "cost_violation": cost_violation,
-                "cost_limit": args.cost_limit,
-                # absorb 计数
-                "absorb_per_epoch": absorb_epoch,
-                "absorb_physx_per_epoch": absorb_physx_epoch,
-                "absorb_sphere_per_epoch": absorb_sphere_epoch,
+                # rollout signal (on-policy, stochastic): drives λ update
+                "rollout_ep_cost": rollout_ep_cost,
+                "rollout_ep_violation": rollout_ep_violation,
+                "rollout_ep_n": _rollout_n_ep,
+                # eval signal (deterministic policy, one epoch lag)
+                "eval_step_cost": c["cost_rate"],
+                "eval_ep_cost": c["cost_episode_sum_mean"],
+                "eval_ep_violation": eval_ep_violation,
+                "cost_limit_per_ep": args.cost_limit_per_ep,
+                # absorb 计数 (epoch 级别)
+                "epoch_absorb": absorb_epoch,
+                "epoch_absorb_physx": absorb_physx_epoch,
+                "epoch_absorb_sphere": absorb_sphere_epoch,
             }, step=epoch + 1)
 
     agent.save(str(final_path))
@@ -1401,7 +1258,7 @@ def main():
     )
     logger.info(f"checkpoint 写入: {ckpt_dir}/ 下的 "
                 f"{best_J_path.name} / {best_hold_path.name} / {final_path.name}. "
-                "**eval 时三个都跑一遍**, 注意 best_J 不一定满足 cost_limit, "
+                "**eval 时三个都跑一遍**, 注意 best_J 不一定满足 cost_limit_per_ep, "
                 "需手动看 wandb cost_rate 选 safe 子集.")
 
     if wandb_run is not None:

@@ -81,16 +81,18 @@ class DualArmPegHoleCostEnv(DualArmPegHoleEnv):
         }
 
     # ------------------------------------------------------------------
-    # CMDP reward: reuse the SAC task reward but leave hard safety penalties to
-    # cost()/lambda. In geom mode, penetration is also treated as a constraint
-    # signal, so its reward component is dropped to avoid double pressure.
+    # CMDP reward: reuse the SAC task reward but leave the selected hard safety
+    # signal to cost()/lambda. If penetration is the CMDP cost, drop the reward
+    # penetration component to avoid double pressure; if collision is the cost,
+    # keep penetration shaping in reward.
     # ------------------------------------------------------------------
     def reward(self, obs, action, next_obs, absorbing):
         if self._geom_stage is not None:
             components = self._compute_geom_reward_components(next_obs)
-            components["r_geom_penetration"] = torch.zeros_like(
-                components["r_geom_penetration"]
-            )
+            if self._cost_signal == "penetration":
+                components["r_geom_penetration"] = torch.zeros_like(
+                    components["r_geom_penetration"]
+                )
             r = sum(components.values())
         else:
             r = self._compute_normal_reward(next_obs)
