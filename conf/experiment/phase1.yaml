@@ -1,48 +1,64 @@
 train_script: scripts/train_sac.py
 
-# Stage 1: 34-dim pos-only baseline (use_axis_resid_obs=True).
-# Axis reward is disabled and success ignores axis, so success is
-# pos_err < preinsert_success_pos_threshold.
+# SAC Stage 1: preinsert position only.
+#
+# Matches DualArmPegHoleEnv normal reward path (geom_stage=None):
+#   full_success = pos_err < preinsert_success_pos_threshold
+#   axis reward   = off
+#   axis success  = ignored by success_axis_threshold=inf
+#
+# Keep use_axis_resid_obs=true even though Stage 1 does not reward axis. This
+# gives a 34D checkpoint that can warm-start Stage 2 without changing obs_dim.
+
+# Runtime / env count.
 num_envs: 16
+horizon: null              # env default: 150
 render: false
 seed: 42
 use_axis_resid_obs: true
+
+# SAC collection / update cadence.
 n_epochs: 50
 n_steps_per_epoch: 1024
-n_steps_per_fit: null
-utd: null
+n_steps_per_fit: 16        # one vector-step per fit at num_envs=16
+utd: null                  # defaults to n_steps_per_fit -> true UTD ~= 1
+critic_warmup_transitions: null
+n_eval_episodes: 16
 
+# Optimizer / entropy settings verified for the 14-DoF Stage 1 task.
 lr_actor: 1e-4
 lr_critic: 3e-4
 lr_alpha: 3e-4
 alpha_max: 0.05
 target_entropy: -7
-n_eval_episodes: 16
 
-initial_joint_noise: null
+# DualArmPegHoleEnv task settings.
+initial_joint_noise: 0.1
+preinsert_offset: 0.05
 preinsert_success_pos_threshold: 0.10
-preinsert_offset: null
-rew_action: null
-rew_home: 0.0005
+
 rew_axis: 0.0
 success_axis_threshold: .inf
-# hold-N absorbing 关闭 (terminal_hold_bonus=0 即关). episode 只走 horizon, 让
-# -w_pos*pos_err 的连续梯度跑满, 避免 milestone cliff 让精度提前停在阈值边.
-# hold_success_steps 仍保留, 仅作 eval 指标 (compute_hold_metrics 用).
+axis_gate_radius: .inf
+
+rew_success: 2.0
+rew_pos_success: 0.0
+rew_action: 0.005
+rew_home: 0.0005
+home_weights: null         # env default: 14 weights all 1.0
+
+# Hold-N is an eval metric only. terminal_hold_bonus=0 keeps training episodes
+# running to horizon so dense pos_err gradients do not stop at the threshold.
 terminal_hold_bonus: 0.0
 hold_success_steps: 10
 
-# Sphere-proxy 自碰撞兜底 (PhysX 1-5cm 失明区补丁, 全 stage 通用):
-#   clearance_hard=0.0 = 球壳一接触即触发 hard absorbing (与 PhysX 力检测 OR).
-#   proxy_arm_radius: iiwa link 段球半径 0.06m (link 直径 ~6-10cm, 带 margin).
-#   proxy_ee_radius:  coupler + hande_link 段球半径 0.04m (更紧凑但也更宽).
-# 关闭请设 clearance_hard: -.inf (注意负数会走 --clearance_hard=-.inf 形式).
+# Sphere-proxy self-collision fallback, OR'ed with PhysX contact force.
 clearance_hard: 0.0
 proxy_arm_radius: 0.06
 proxy_ee_radius: 0.04
 
 wandb_project: bimanual_peghole
 wandb_entity: safe_rl_2026_lund
-wandb_run_name: SAC_phase1_seed42_new
+wandb_run_name: SAC_phase1_pos_only_seed42
 wandb_group: phase1_seed_sweep
 no_wandb: false
