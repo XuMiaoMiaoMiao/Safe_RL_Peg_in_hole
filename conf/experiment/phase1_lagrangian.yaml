@@ -2,8 +2,12 @@ train_script: scripts/train_sac_lagrangian.py
 
 # Stage 1 Lagrangian SAC — position-only cold-start config.
 #
-# reward = -w_pos×pos_err + w_success×1[pos_ok] - w_action×a² - w_home×dev²
-# cost   = collision indicator → Lagrangian λ·Q_C 约束
+# 设计原则（见 envs/dual_arm_peg_hole_cost_env.py）:
+#   - reward 复用 DualArmPegHoleEnv 的非 geom 任务 reward
+#     (_compute_normal_reward), 但不使用父类 reward() 里的 collision hard
+#     negative absorbing penalty.
+#   - cost = collision indicator，由 Lagrangian λ·Q_C 约束处理.
+#   - collision 仍由父类 is_absorbing() 终止 episode，只是不再直接写进 reward.
 #
 # 位置-only 语义:
 #   - rew_axis=0.0
@@ -22,7 +26,7 @@ use_axis_resid_obs: true   # 34 维 obs (axis_resid 替换 axis_dot)
 # 训练节奏
 # --------------------------------------------------------------------------
 n_epochs: 100
-n_steps_per_epoch: 2400
+n_steps_per_epoch: 1024
 n_steps_per_fit: null      # 默认 = num_envs (每 vector-step fit 一次)
 utd: null                  # 默认 = n_steps_per_fit → true_UTD ≈ 1
 n_eval_episodes: 16
@@ -51,6 +55,7 @@ rew_axis: 0.0
 rew_success: 2.0
 rew_action: 0.005
 rew_home: 0.0005
+# rew_joint_limit 当前由父类默认值 0.02 生效；train_sac_lagrangian.py 暂未暴露该 CLI.
 
 success_axis_threshold: inf
 

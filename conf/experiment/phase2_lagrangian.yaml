@@ -3,14 +3,16 @@ train_script: scripts/train_sac_lagrangian.py
 # Stage 2 Lagrangian SAC — 冷启动配置
 #
 # 设计原则（见 envs/dual_arm_peg_hole_cost_env.py）:
-#   reward = -w_pos×pos_err - w_axis×axis_err + w_axis_progress×progress
-#            + w_success×1[ok] - w_action×a² - w_home×dev²
-#   cost   = collision indicator → Lagrangian λ·Q_C 约束
+#   - reward 复用 DualArmPegHoleEnv 的非 geom 任务 reward
+#     (_compute_normal_reward), 但不使用父类 reward() 里的 collision hard
+#     negative absorbing penalty.
+#   - cost = collision indicator，由 Lagrangian λ·Q_C 约束处理.
+#   - collision 仍由父类 is_absorbing() 终止 episode，只是不再直接写进 reward.
 #
-# 移除的遗留补丁 (与 warm-start 时代的 phase2 配置相比):
-#   - rew_pos_success  : Stage 1→2 暖启动桥接信号
-#   - axis_gate_radius : 暖启动补丁，防 axis 项干扰已收敛位置
-#   - home_weights     : 非对称手腕权重 (1,1,1,1,0.75,0.5,0.5)
+# 当前 cold-start 配置未启用这些 warm-start 补丁:
+#   - rew_pos_success  : 父类默认 0.0
+#   - axis_gate_radius : 父类默认 inf (不门控)
+#   - home_weights     : 父类默认均匀权重
 #   - terminal_hold_bonus / hold-N absorbing
 #   - critic_warmup_transitions 50000 (≈39 epoch 冻结 actor → 解冻时梯度爆炸)
 
@@ -53,21 +55,20 @@ initial_joint_noise: null  # 默认 0.1 rad (父类)
 preinsert_success_pos_threshold: 0.10
 preinsert_offset: null     # 默认 0.05 m (父类)
 
-# Stage 2 干净 reward 权重
+# Stage 2 任务 reward 权重
 # 量纲平衡 @ home: pos_err≈0.5m → 贡献-0.5; axis_err≈2.0 → 贡献-1.0; 两项相近
-# axis_progress=clamp(1-axis_err/2,0,1): 同向≈0, 完美反向对齐=1.
-# rew_axis_progress=0.5 时, 轴项从 far 的 -1.0 渐进到 perfect 的 +0.5.
+# 注意: 当前 DualArmPegHoleCostEnv.reward() 复用父类 _compute_normal_reward;
+# rew_axis_progress 是旧 Stage-2 Lagrangian 独立 reward 的字段，当前不再使用。
 rew_pos: 1.0
 rew_axis: 0.5
-rew_axis_progress: 0.5
 rew_success: 2.0
 rew_action: 0.005
 rew_home: 0.001
+# rew_joint_limit 当前由父类默认值 0.02 生效；train_sac_lagrangian.py 暂未暴露该 CLI.
 
-# success 定义: pos_err<0.10m AND axis_err<0.30 (1+dot<0.30 → 偏离理想±46°)
-# 0.50 (±60°) 过松: bonus 在轴仍严重偏斜时触发, 策略不需要真正对齐.
-# 0.30 是冷启动合理起点: 比 home(axis_err≈2.0) 严格 6×, 但仍可合理触发.
-# eval 阶段如需更严格验收, 另行传 --success_axis_threshold 0.20 覆盖.
+# success 定义: pos_err<0.10m AND axis_err<0.50 (1+dot<0.50 → 偏离理想±60°)
+# 0.50 是训练期 bootstrap 阈值；严格 eval 可另行传
+# --success_axis_threshold 0.30 或 0.20 覆盖.
 success_axis_threshold: 0.50
 
 # hold_success_steps: 仅影响 eval 指标 (compute_hold_metrics), 不影响训练 reward
@@ -92,7 +93,7 @@ lambda_max: 100.0
 lambda_min: 0.05           # 防止 cost=0 时 λ 指数衰减为零、安全信号消失
 
 # init_log_lambda=0 → λ_init=1. 冷启动无遗留 λ 状态，从 1 开始合理.
-init_log_lambda: 2
+init_log_lambda: 1
 gamma_cost: null
 
 # actor_grad_clip: 防止 actor 首次更新梯度爆炸 (冷启动 critic 早期噪声大)
@@ -110,6 +111,6 @@ keep_replay: false
 # --------------------------------------------------------------------------
 wandb_project: bimanual_peghole
 wandb_entity: safe_rl_2026_lund
-wandb_run_name: lag_stage2_coldstart_axis_claude
+wandb_run_name: lag_stage2_coldstart_axis_claude_fix
 wandb_group: null
 no_wandb: false

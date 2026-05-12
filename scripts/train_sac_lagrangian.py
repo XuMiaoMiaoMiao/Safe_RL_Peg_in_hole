@@ -14,14 +14,13 @@ Warmstart 注意:
 - 从 SACLagrangian checkpoint warm-start: 可全量 (默认) 或 actor-only.
 
 Cost signal 调标:
-- env 的 cost = sphere proxy collision indicator (0/1). PhysX 在当前 USD 上
-  不触发 (见 dual_arm_peg_hole_env.py is_absorbing).
-- per-step λ 模式: 设 --cost_limit 之前先用 SAC baseline 跑一次 64-ep eval, 记录
-  absorb_sphere_per_epoch / n_steps_per_epoch (per-step 触发率), 取其 0.5 倍
-  做起步预算. 设 cost_limit=0 会让 λ 一上来就爆.
-- episode_rate λ 模式: cost_limit 是每集平均 cost sum; λ 只在完整 eval
-  episodes 后用 compute_cost_metrics()["cost_episode_sum_mean"] 更新, 不读取
-  replay random batch 或 Mushroom flattened dataset.last.
+- env 的 cost 由 DualArmPegHoleCostEnv.cost() 选择:
+    cost_signal="collision"    → PhysX OR sphere-proxy collision indicator (0/1)
+    cost_signal="penetration"  → geom penetration_max 连续值 [0, 4mm]
+- per-step λ 模式: cost_limit 与 mean(cost) 同量纲；collision 是 rate,
+  penetration 是平均穿模米数.
+- episode_rate / rollout_episode_rate: cost_limit 是每集平均 cost sum.
+  collision 近似每集碰撞次数；penetration 是 episode 内 penetration 累积量.
 
 整体架构：
   envs/dual_arm_peg_hole_cost_env.py   ← cost 信号来源 (DualArmPegHoleCostEnv)
@@ -52,6 +51,7 @@ from scripts._eval_utils import (
     compute_cost_metrics,
     compute_hold_metrics,
     deterministic_policy,
+    parse_home_weights,
     resolve_eval_episode_count,
 )
 
@@ -160,15 +160,28 @@ class EpisodeCostTracker:
         self._num_envs = num_envs
         self._min_episodes = min_episodes
         # Per-env running total for the current episode.
+        # Initialised lazily on the env's native device (GPU) on first call.
         # Persists across fit chunks within an epoch; cleared by reset_accum().
-        self._accum = torch.zeros(num_envs, dtype=torch.float32)
+        self._accum: torch.Tensor | None = None
+        self._device = None
         # Completed episode cost sums for the current epoch window.
         self._completed: deque = deque(maxlen=maxlen)
         # Flip to False during eval so eval episodes don't pollute the buffer.
         self.active: bool = True
 
+    def _init_accum(self, device):
+        """Lazy-init _accum on the env's device (GPU in IsaacSim)."""
+        self._device = device
+        self._accum = torch.zeros(self._num_envs, dtype=torch.float32, device=device)
+
     def __call__(self, samples):
-        """VectorCore callback_step interface — called after each vector-step."""
+        """VectorCore callback_step interface — called after each vector-step.
+
+        Performance: accumulation stays on the tensor's native device (GPU) so
+        there are no per-step CPU syncs. A CPU transfer happens only when at
+        least one episode ends in this step (infrequent), using a single
+        .nonzero().tolist() call instead of three whole-tensor .cpu() copies.
+        """
         if not self.active:
             return
         if self._bridge.cost is None or self._bridge.mask is None:
@@ -176,20 +189,31 @@ class EpisodeCostTracker:
 
         _, _, _, _, _absorbing, last, _, _ = samples
 
-        cost = torch.as_tensor(self._bridge.cost, dtype=torch.float32).cpu()
-        mask = torch.as_tensor(self._bridge.mask, dtype=torch.bool).cpu()
-        last = torch.as_tensor(last, dtype=torch.bool).cpu()
+        # Keep on native device — no .cpu() that would flush the CUDA stream.
+        cost = torch.as_tensor(self._bridge.cost, dtype=torch.float32)
+        mask = torch.as_tensor(self._bridge.mask, dtype=torch.bool)
+        last_t = torch.as_tensor(last, dtype=torch.bool)
 
-        for i in range(self._num_envs):
-            if not mask[i]:
-                # Env was inactive this step (already done, waiting to reset).
-                continue
-            self._accum[i] += cost[i]
-            if last[i]:
-                # True episode end: absorbing termination OR horizon timeout.
-                # Push the episode's cumulative cost and reset the slot.
-                self._completed.append(float(self._accum[i]))
-                self._accum[i] = 0.0
+        if self._accum is None:
+            self._init_accum(cost.device)
+        cost = cost.to(self._device)
+        mask = mask.to(self._device)
+        last_t = last_t.to(self._device)
+
+        # Vectorized accumulation: one GPU in-place op, no Python loop.
+        self._accum.add_(cost * mask.float())
+
+        # Only pay the CPU sync cost when at least one episode actually ended.
+        ended = mask & last_t
+        if not ended.any():
+            return
+
+        # .nonzero().tolist() is a single sync; we then loop over the small
+        # set of envs that ended (typically 0–num_envs per step).
+        for i in ended.nonzero(as_tuple=True)[0].tolist():
+            # True episode end: absorbing termination OR horizon timeout.
+            self._completed.append(float(self._accum[i]))
+            self._accum[i] = 0.0
 
     def reset_accum(self):
         """Discard partial episode costs, preparing for a fresh epoch rollout.
@@ -198,7 +222,8 @@ class EpisodeCostTracker:
         Without this, the tail of the previous epoch's unfinished episodes
         would bleed into the first completed episode of the new epoch.
         """
-        self._accum.zero_()
+        if self._accum is not None:
+            self._accum.zero_()
 
     def ready(self) -> bool:
         """True if enough episodes have completed to justify a λ update."""
@@ -220,6 +245,175 @@ class EpisodeCostTracker:
         return len(self._completed)
 
 
+def _nanmean(values):
+    return float(np.mean(values)) if len(values) else float("nan")
+
+
+def _nanmin_tensor(x):
+    return float(x.min()) if x.numel() else float("nan")
+
+
+def _actor_net(approximator):
+    return approximator.model.network
+
+
+def _copy_actor_net_with_optional_partial(dst_net, src_net, *, allow_partial):
+    """Copy ActorNetwork weights, optionally partial-copying h1 input columns."""
+    src_in = src_net._h1.weight.shape[1]
+    dst_in = dst_net._h1.weight.shape[1]
+    if src_in != dst_in and not allow_partial:
+        raise ValueError(
+            "actor obs 维度不匹配: "
+            f"checkpoint obs={src_in}D, env obs={dst_in}D. "
+            "geom_stage 默认不允许 34D→41D partial warm-start; "
+            "请先训练同 obs 维度 checkpoint，或显式传 --allow_partial_geom_warmstart 做 ablation."
+        )
+    with torch.no_grad():
+        if src_in == dst_in:
+            dst_net._h1.weight.copy_(src_net._h1.weight.to(dst_net._h1.weight.device))
+        else:
+            n = min(src_in, dst_in)
+            dst_net._h1.weight[:, :n].copy_(
+                src_net._h1.weight[:, :n].to(dst_net._h1.weight.device)
+            )
+        dst_net._h1.bias.copy_(src_net._h1.bias.to(dst_net._h1.bias.device))
+        for name in ("_h2", "_out"):
+            dst_layer = getattr(dst_net, name)
+            src_layer = getattr(src_net, name)
+            if dst_layer.weight.shape != src_layer.weight.shape:
+                raise ValueError(
+                    f"actor layer {name}.weight shape mismatch: "
+                    f"{tuple(src_layer.weight.shape)} -> {tuple(dst_layer.weight.shape)}"
+                )
+            dst_layer.weight.copy_(src_layer.weight.to(dst_layer.weight.device))
+            dst_layer.bias.copy_(src_layer.bias.to(dst_layer.bias.device))
+    return "exact" if src_in == dst_in else f"partial_h1_{src_in}D_to_{dst_in}D"
+
+
+def warmstart_actor_with_optional_partial(agent, old_agent, *, allow_partial):
+    mu_mode = _copy_actor_net_with_optional_partial(
+        _actor_net(agent.policy._mu_approximator),
+        _actor_net(old_agent.policy._mu_approximator),
+        allow_partial=allow_partial,
+    )
+    sigma_mode = _copy_actor_net_with_optional_partial(
+        _actor_net(agent.policy._sigma_approximator),
+        _actor_net(old_agent.policy._sigma_approximator),
+        allow_partial=allow_partial,
+    )
+    return mu_mode if mu_mode == sigma_mode else f"mu={mu_mode}, sigma={sigma_mode}"
+
+
+def compute_geom_metrics(dataset, mdp, hold_n_steps):
+    """Compute geom-stage metrics from env info tensors in an eval dataset."""
+    info = dataset.info.data
+    required = (
+        "geom_d", "geom_d_target", "geom_radial_tip", "geom_radial_max",
+        "geom_axis_err", "geom_penetration_max", "geom_prepos_mask",
+        "geom_preaxis_mask", "geom_insert_mask", "geom_success_mask",
+    )
+    missing = [k for k in required if k not in info]
+    if missing:
+        raise KeyError(
+            "geom metrics requested but dataset.info.data is missing keys: "
+            f"{missing}. 确认 env 使用 geom_stage 并且 _create_info_dictionary 保留父类 geom info."
+        )
+
+    def t(key):
+        value = info[key]
+        return value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+
+    d = t("geom_d").float()
+    d_target = t("geom_d_target").float()
+    d_err = torch.abs(d - d_target)
+    radial_tip = t("geom_radial_tip").float()
+    radial_max = t("geom_radial_max").float()
+    axis_err = t("geom_axis_err").float()
+    penetration = t("geom_penetration_max").float()
+    prepos_mask = t("geom_prepos_mask").float()
+    preaxis_mask = t("geom_preaxis_mask").float()
+    insert_mask = t("geom_insert_mask").float()
+    success_mask = t("geom_success_mask").float() > 0.5
+
+    _, _, _, _, _, last = dataset.parse(to="torch")
+    last_np = last.cpu().numpy().astype(bool)
+    success_np = success_mask.cpu().numpy().astype(bool)
+    d_np = d.cpu().numpy()
+
+    end_indices = np.flatnonzero(last_np)
+    ep_max_runs, ep_success_rates, ep_final_success = [], [], []
+    entry_indices = []
+    start = 0
+    for end in end_indices:
+        ep_success = success_np[start:end + 1]
+        max_run, cur = 0, 0
+        for flag in ep_success:
+            cur = cur + 1 if flag else 0
+            max_run = max(max_run, cur)
+        ep_max_runs.append(max_run)
+        ep_success_rates.append(float(ep_success.mean()) if len(ep_success) else 0.0)
+        ep_final_success.append(bool(ep_success[-1]) if len(ep_success) else False)
+
+        ep_d = d_np[start:end + 1]
+        entry = np.flatnonzero(ep_d > 0.0)
+        if len(entry):
+            entry_indices.append(start + int(entry[0]))
+        start = end + 1
+
+    hold_flags = np.asarray([run >= hold_n_steps for run in ep_max_runs], dtype=bool)
+    final_idx = torch.as_tensor(end_indices, device=d.device, dtype=torch.long)
+    entry_idx = torch.as_tensor(entry_indices, device=d.device, dtype=torch.long)
+    active_pen = penetration[success_mask]
+
+    def mean_at(x, idx):
+        return float(x[idx].mean()) if idx.numel() else float("nan")
+
+    def max_at(x, idx):
+        return float(x[idx].max()) if idx.numel() else float("nan")
+
+    return {
+        "geom_step_rate": float(success_mask.float().mean()),
+        "geom_hold_rate": float(hold_flags.mean()) if len(hold_flags) else 0.0,
+        "geom_max_run_mean": float(np.mean(ep_max_runs)) if ep_max_runs else 0.0,
+        "geom_ep_success_rate_mean": _nanmean(ep_success_rates),
+        "geom_final_success_rate": float(np.mean(ep_final_success)) if ep_final_success else 0.0,
+        "geom_prepos_step_rate": float(prepos_mask.mean()),
+        "geom_preaxis_step_rate": float(preaxis_mask.mean()),
+        "geom_insert_step_rate": float(insert_mask.mean()),
+        "geom_d_target_mean": float(d_target.mean()),
+        "geom_d_err_mean": float(d_err.mean()),
+        "geom_d_err_min": _nanmin_tensor(d_err),
+        "geom_radial_tip_mean": float(radial_tip.mean()),
+        "geom_radial_tip_min": _nanmin_tensor(radial_tip),
+        "geom_radial_max_mean": float(radial_max.mean()),
+        "geom_radial_max_min": _nanmin_tensor(radial_max),
+        "geom_axis_err_mean": float(axis_err.mean()),
+        "geom_axis_err_min": _nanmin_tensor(axis_err),
+        "geom_n_ep_with_entry": len(entry_indices),
+        "geom_entry_d_mean": mean_at(d, entry_idx),
+        "geom_entry_d_err_mean": mean_at(d_err, entry_idx),
+        "geom_entry_radial_max_mean": mean_at(radial_max, entry_idx),
+        "geom_entry_radial_max_max": max_at(radial_max, entry_idx),
+        "geom_entry_axis_err_mean": mean_at(axis_err, entry_idx),
+        "geom_entry_axis_err_max": max_at(axis_err, entry_idx),
+        "geom_entry_penetration_mean": mean_at(penetration, entry_idx),
+        "geom_entry_penetration_max": max_at(penetration, entry_idx),
+        "geom_final_d_mean": mean_at(d, final_idx),
+        "geom_final_d_err_mean": mean_at(d_err, final_idx),
+        "geom_final_radial_max_mean": mean_at(radial_max, final_idx),
+        "geom_final_radial_max_max": max_at(radial_max, final_idx),
+        "geom_final_axis_err_mean": mean_at(axis_err, final_idx),
+        "geom_final_axis_err_max": max_at(axis_err, final_idx),
+        "geom_final_penetration_mean": mean_at(penetration, final_idx),
+        "geom_final_penetration_max": max_at(penetration, final_idx),
+        "geom_pen_max_mean": float(penetration.mean()),
+        "geom_pen_max_max": float(penetration.max()),
+        "geom_clean_step_rate": float((penetration < mdp._geom_pen_th).float().mean()),
+        "geom_pen_in_active_mean": float(active_pen.mean()) if active_pen.numel() else float("nan"),
+        "geom_pen_in_active_max": float(active_pen.max()) if active_pen.numel() else float("nan"),
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 INITIAL_REPLAY_SIZE = 10_000
@@ -230,6 +424,9 @@ BATCH_SIZE = 256
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--num_envs", type=int, default=16)
+    p.add_argument("--horizon", type=int, default=None,
+                   help="episode horizon (env-steps). 默认走 env 默认值. "
+                        "geom insert 通常建议 200.")
     p.add_argument("--render", action="store_true", help="打开 IsaacSim 窗口")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--n_epochs", type=int, default=400)
@@ -262,9 +459,10 @@ def parse_args():
 
     # ---- Lagrangian 专属 ----------------------------------------------------
     p.add_argument("--cost_limit", type=float, required=True,
-                   help="cost 预算. per-step 模式下是每步 collision rate "
-                        "(e.g. 0.01 = 容忍 1% collision rate); "
-                        "episode_rate 下是每集平均碰撞次数. 标定方法见文件头.")
+                   help="cost 预算. per-step 模式下是 mean(cost); "
+                        "episode_rate/rollout_episode_rate 下是每集平均 cost sum. "
+                        "collision 为 0/1 rate 或次数; penetration 为米制连续量. "
+                        "标定方法见文件头.")
     p.add_argument("--lr_lambda", type=float, default=1e-3,
                    help="Lagrange 乘子学习率. 1e-3~1e-4, 通常比 lr_actor 低.")
     p.add_argument("--lambda_max", type=float, default=100.0,
@@ -282,11 +480,11 @@ def parse_args():
                             "recent_cost_rate", "discounted_q",
                             "episode_rate", "rollout_episode_rate"),
                    help="λ 更新信号来源. "
-                        "rollout_episode_rate (推荐): cost_limit = 每集平均碰撞次数; "
+                        "rollout_episode_rate (推荐): cost_limit = 每集平均 cost sum; "
                         "使用当前 policy rollout 中完成的真实 episode cost 统计, "
                         "在 core.learn() 结束后 drain EpisodeCostTracker 更新 λ; "
                         "不读 replay/eval, 不依赖 Mushroom flattened last. "
-                        "episode_rate (eval-based, 有滞后): cost_limit = 每集平均碰撞次数; "
+                        "episode_rate (eval-based, 有滞后): cost_limit = 每集平均 cost sum; "
                         "λ 只在 eval 后用 compute_cost_metrics()[cost_episode_sum_mean] 更新. "
                         "max_recent_replay: fit() 中用最新采样块与 replay batch 的较大 "
                         "per-step mean(cost). batch_cost_rate: 仅用 replay batch. "
@@ -301,25 +499,36 @@ def parse_args():
     # ------------------------------------------------------------------------
 
     # ---- env 参数 -----------------------------------------------------------
-    # Stage 2 reward（冷启动干净设计，无遗留补丁）
+    # Reward weights are passed through to DualArmPegHoleEnv; the CMDP adapter
+    # reuses the parent task reward and only moves safety pressure into cost().
     p.add_argument("--rew_pos", type=float, default=None,
                    help="pos_err 惩罚系数. 默认 1.0.")
     p.add_argument("--rew_axis", type=float, default=None,
                    help="axis_err 惩罚系数. 默认 0.5 (axis_err∈[0,2], 折合满量程≈pos项).")
     p.add_argument("--rew_axis_progress", type=float, default=None,
-                   help="轴对齐渐进正奖励系数. axis_progress=clamp(1-axis_err/2,0,1), "
-                        "越接近反向对齐越接近 1. 默认由 env/config 决定.")
+                   help="LEGACY ignored: old standalone Lagrangian Stage-2 reward field. "
+                        "当前 reward 复用父类 env, 不使用该项.")
     p.add_argument("--rew_success", type=float, default=None,
                    help="成功 per-step bonus. 默认 2.0.")
+    p.add_argument("--rew_pos_success", type=float, default=None,
+                   help="pos-only success bonus. 默认父类 0.0; Stage-2 warm-start 可设 1.0.")
+    p.add_argument("--rew_joint_limit", type=float, default=None,
+                   help="父类 joint-limit soft penalty 权重. 默认 0.02.")
     p.add_argument("--rew_action", type=float, default=None,
                    help="动作 L2 正则系数. 默认 0.005.")
     p.add_argument("--rew_home", type=float, default=None,
                    help="Home 偏差正则系数 (均匀权重). 默认 0.001.")
+    p.add_argument("--home_weights", type=parse_home_weights, default=None,
+                   help="home regularizer 逐关节权重. 接受 7 维单臂或 14 维完整权重.")
     # env 几何 / 物理
     p.add_argument("--initial_joint_noise", type=float, default=None)
     p.add_argument("--preinsert_success_pos_threshold", type=float, default=None)
     p.add_argument("--preinsert_offset", type=float, default=None)
     p.add_argument("--success_axis_threshold", type=float, default=None)
+    p.add_argument("--axis_gate_radius", type=float, default=None,
+                   help="axis 惩罚距离门控半径. 默认 inf = 不门控.")
+    p.add_argument("--joint_limit_margin_frac", type=float, default=None,
+                   help="joint-limit penalty 起算 margin fraction. 默认 0.8.")
     p.add_argument("--clearance_hard", type=float, default=None)
     p.add_argument("--hold_success_steps", type=int, default=10,
                    help="eval 指标: 连续 N 步在阈内算 hold success. 不影响训练 reward.")
@@ -333,6 +542,9 @@ def parse_args():
                    help="仅继承 actor (mu/sigma) 权重. SACLagrangian 从 SAC checkpoint "
                         "warmstart 必开此项. SACLagrangian → SACLagrangian 也建议开 "
                         "(reward 函数 / cost 信号若变, 旧 critic 语义错).")
+    p.add_argument("--allow_partial_geom_warmstart", action="store_true",
+                   help="允许 actor 第一层从旧 32/34D obs checkpoint partial-copy 到 41D geom obs. "
+                        "默认禁止, 避免旧球形 reward manifold 污染 geom 路径; 仅 ablation 使用.")
     p.add_argument("--proxy_arm_radius", type=float, default=None)
     p.add_argument("--proxy_ee_radius", type=float, default=None)
     p.add_argument("--exclude_ee_from_physx_self_collision", action="store_true",
@@ -348,6 +560,52 @@ def parse_args():
                         "全程光滑无奇异, 且 axis_err = ||resid||²/2 = 1+dot 与 reward 同语义, "
                         "success_axis_threshold 仍然用旧的 1+dot 量纲 (0.2 ≈ ±37° 锥). "
                         "**注意**: obs 维度变, 32 维 checkpoint 不能 warm-start 到 34 维.")
+
+    # ──────────────── Geometric preinsert (Stage 1g/2g/3g) ────────────────
+    p.add_argument("--geom_stage", type=str, default=None,
+                   choices=("prepos", "preaxis", "insert"),
+                   help="启用几何同源 reward + 41D obs. "
+                        "prepos=Stage1g, preaxis=Stage2g, insert=Stage3g.")
+    p.add_argument("--geom_d_target_neg", type=float, default=None)
+    p.add_argument("--geom_d_target_pos", type=float, default=None)
+    p.add_argument("--geom_d_target_ramp_start", type=int, default=None)
+    p.add_argument("--geom_d_target_ramp_end", type=int, default=None)
+    p.add_argument("--rew_geom_d", type=float, default=None)
+    p.add_argument("--rew_geom_radial_tip", type=float, default=None)
+    p.add_argument("--rew_geom_radial_max", type=float, default=None)
+    p.add_argument("--rew_geom_axis", type=float, default=None)
+    p.add_argument("--geom_d_sat", type=float, default=None)
+    p.add_argument("--geom_radial_sat", type=float, default=None)
+    p.add_argument("--rew_geom_soft_success", type=float, default=None)
+    p.add_argument("--geom_soft_d_sigma", type=float, default=None)
+    p.add_argument("--geom_soft_radial_sigma", type=float, default=None)
+    p.add_argument("--geom_soft_axis_sigma", type=float, default=None)
+    p.add_argument("--geom_soft_penetration_sigma", type=float, default=None)
+    p.add_argument("--geom_d_th", type=float, default=None)
+    p.add_argument("--geom_r_tip_th", type=float, default=None)
+    p.add_argument("--geom_r_max_th", type=float, default=None)
+    p.add_argument("--geom_axis_th", type=float, default=None)
+    p.add_argument("--geom_insert_d_ins", type=float, default=None)
+    p.add_argument("--geom_insert_r_max_th", type=float, default=None)
+    p.add_argument("--geom_pen_th", type=float, default=None)
+    p.add_argument("--rew_geom_progress", type=float, default=None)
+    p.add_argument("--geom_gate_radial_sigma", type=float, default=None)
+    p.add_argument("--geom_gate_axis_sigma", type=float, default=None)
+    p.add_argument("--rew_geom_penetration", type=float, default=None,
+                   help="SAC soft penetration penalty. Lagrangian reward 会清零该组件, "
+                        "建议保持 0/None, 用 cost_signal=penetration 约束.")
+    p.add_argument("--geom_gate_penetration_sigma", type=float, default=None)
+    p.add_argument("--cost_signal", type=str, default=None,
+                   choices=("collision", "penetration"),
+                   help="CMDP cost 信号: collision=0/1; penetration=连续 penetration_max.")
+    p.add_argument("--geom_progress_floor", type=float, default=None)
+    p.add_argument("--rew_geom_advance", type=float, default=None)
+    p.add_argument("--geom_d_gate_mode", type=str, default=None,
+                   choices=("off", "alignment"))
+    p.add_argument("--rew_geom_bad_entry", type=float, default=None)
+    p.add_argument("--geom_bad_entry_radial_safe", type=float, default=None)
+    p.add_argument("--geom_bad_entry_axis_safe", type=float, default=None)
+    p.add_argument("--geom_bad_entry_pen_safe", type=float, default=None)
 
     # wandb
     p.add_argument("--wandb_project", type=str, default="bimanual_peghole")
@@ -397,7 +655,7 @@ def main():
     if args.cost_limit < 0.0:
         raise ValueError(f"--cost_limit ({args.cost_limit}) 必须 >= 0")
     if args.cost_limit == 0.0:
-        print("[WARN] --cost_limit=0 会让 λ 一上来就爆, 一般取 0.5×baseline collision rate.")
+        print("[WARN] --cost_limit=0 会让 λ 一上来就爆, 一般先用 baseline eval 标定后取保守预算.")
     # Default: one full generation of parallel envs (each env completes ≥1 episode).
     if args.min_lambda_update_episodes is None:
         args.min_lambda_update_episodes = args.num_envs
@@ -407,18 +665,46 @@ def main():
 
     from envs import DualArmPegHoleCostEnv
     env_kwargs = dict(num_envs=args.num_envs, headless=not args.render)
+    if args.horizon is not None:
+        env_kwargs["horizon"] = args.horizon
     for key in (
-        # Stage 2 reward
-        "rew_pos", "rew_axis", "rew_axis_progress",
-        "rew_success", "rew_action", "rew_home",
+        # Parent task reward:
+        "rew_pos", "rew_axis", "rew_success", "rew_pos_success",
+        "rew_joint_limit", "rew_action", "rew_home", "home_weights",
+        "axis_gate_radius", "joint_limit_margin_frac",
         # 几何 / 物理
         "initial_joint_noise", "preinsert_success_pos_threshold",
         "preinsert_offset", "success_axis_threshold",
         "clearance_hard", "proxy_arm_radius", "proxy_ee_radius",
+        # Geometric preinsert kwargs:
+        "geom_stage", "geom_d_target_neg", "geom_d_target_pos",
+        "geom_d_target_ramp_start", "geom_d_target_ramp_end",
+        "rew_geom_d", "rew_geom_radial_tip", "rew_geom_radial_max",
+        "rew_geom_axis", "geom_d_sat", "geom_radial_sat",
+        "rew_geom_soft_success", "geom_soft_d_sigma",
+        "geom_soft_radial_sigma", "geom_soft_axis_sigma",
+        "geom_soft_penetration_sigma",
+        "geom_d_th", "geom_r_tip_th", "geom_r_max_th", "geom_axis_th",
+        "geom_insert_d_ins", "geom_insert_r_max_th", "geom_pen_th",
+        "rew_geom_progress", "geom_gate_radial_sigma", "geom_gate_axis_sigma",
+        "rew_geom_penetration", "geom_gate_penetration_sigma", "cost_signal",
+        "geom_progress_floor", "rew_geom_advance",
+        "geom_d_gate_mode", "rew_geom_bad_entry",
+        "geom_bad_entry_radial_safe", "geom_bad_entry_axis_safe",
+        "geom_bad_entry_pen_safe",
     ):
         value = getattr(args, key, None)
         if value is not None:
             env_kwargs[key] = value
+    # Keep 41D geom obs pos_vec target aligned with the depth target unless the
+    # user explicitly overrides preinsert_offset.
+    if args.geom_stage is not None and args.preinsert_offset is None:
+        d_target_neg = (
+            args.geom_d_target_neg
+            if args.geom_d_target_neg is not None
+            else -0.08
+        )
+        env_kwargs["preinsert_offset"] = abs(float(d_target_neg))
     if args.use_axis_resid_obs:
         env_kwargs["use_axis_resid_obs"] = True
     if args.exclude_ee_from_physx_self_collision:
@@ -483,14 +769,15 @@ def main():
 
         if args.actor_only_warmstart:
             agent = _cold_create_sac_lag()
-            agent.policy._mu_approximator.set_weights(
-                old_agent.policy._mu_approximator.get_weights()
-            )
-            agent.policy._sigma_approximator.set_weights(
-                old_agent.policy._sigma_approximator.get_weights()
+            mode = warmstart_actor_with_optional_partial(
+                agent,
+                old_agent,
+                allow_partial=(
+                    args.allow_partial_geom_warmstart and mdp._geom_stage is not None
+                ),
             )
             print(f"[WARM-START actor-only] from {old_class} @ {load_path}; "
-                  "critic / cost critic / α / λ / replay 全部冷启动.")
+                  f"actor_copy={mode}; critic / cost critic / α / λ / replay 全部冷启动.")
             if args.keep_replay:
                 print("[WARM-START actor-only] --keep_replay 已忽略.")
             del old_agent
@@ -557,7 +844,11 @@ def main():
     logger = Logger("SACLagrangian", results_dir=str(results_dir))
     logger.strong_line()
     logger.info(f"checkpoint 目录: {ckpt_dir}")
-    obs_mode = "axis_resid" if mdp._use_axis_resid_obs else "base"
+    mdp.set_geom_epoch(0)
+    if mdp._geom_stage is not None:
+        obs_mode = f"geom_{mdp._geom_stage} (axis_resid+hole_geom)"
+    else:
+        obs_mode = "axis_resid" if mdp._use_axis_resid_obs else "base"
     logger.info(f"obs_dim={obs_dim} ({obs_mode})  "
                 f"act_dim={act_dim}  horizon={mdp.info.horizon}")
     logger.info(f"action_scale={mdp._action_scale:.3f}")
@@ -566,12 +857,51 @@ def main():
         + ("arm_links_only" if mdp._exclude_ee_from_physx_self_collision
            else "arm_links_plus_ee")
     )
+    axis_th_str = (
+        "inf" if math.isinf(mdp._success_axis_threshold)
+        else f"{mdp._success_axis_threshold:.3f}"
+    )
+    axis_gate_str = (
+        "inf" if math.isinf(mdp._axis_gate_radius)
+        else f"{mdp._axis_gate_radius:.3f}m"
+    )
     logger.info(f"preinsert_pos_th={mdp._preinsert_success_pos_threshold:.3f}m  "
-                f"axis_th={mdp._success_axis_threshold:.3f}  "
-                f"w_pos={mdp._s2_w_pos:.3f}  w_axis={mdp._s2_w_axis:.3f}  "
-                f"w_axis_progress={mdp._s2_w_axis_progress:.3f}  "
-                f"w_success={mdp._s2_w_success:.3f}  "
-                f"w_action={mdp._s2_w_action:.4f}  w_home={mdp._s2_w_home:.4f}")
+                f"axis_th={axis_th_str}  cost_signal={mdp._cost_signal}")
+    if mdp._geom_stage is None:
+        logger.info(
+            f"task reward (normal): w_pos={mdp._w_pos:.3f}  "
+            f"w_axis={mdp._w_axis:.3f}  axis_gate_radius={axis_gate_str}  "
+            f"w_pos_success={mdp._w_pos_success:.3f}  "
+            f"w_success={mdp._w_success:.3f}  "
+            f"w_joint_limit={mdp._w_joint_limit:.4f}  "
+            f"w_action={mdp._w_action:.4f}  w_home={mdp._w_home:.4f}"
+        )
+    else:
+        logger.info(
+            f"geom_stage={mdp._geom_stage}  "
+            f"d_target_neg={mdp._geom_d_target_neg:+.3f}  "
+            f"d_target_pos={mdp._geom_d_target_pos:+.3f}  "
+            f"d_target_eff={mdp._geom_d_target_eff:+.3f}"
+        )
+        logger.info(
+            f"geom reward: w_d={mdp._w_geom_d:.2f}  "
+            f"w_rad_tip={mdp._w_geom_radial_tip:.2f}  "
+            f"w_rad_max={mdp._w_geom_radial_max:.2f}  "
+            f"w_axis={mdp._w_geom_axis:.2f}  "
+            f"w_progress={mdp._w_geom_progress:.2f}  "
+            f"w_advance={mdp._w_geom_advance:.2f}  "
+            f"w_bad_entry={mdp._w_geom_bad_entry:.2f}  "
+            "r_geom_penetration=0 in CMDP reward"
+        )
+        logger.info(
+            f"geom thresholds: d_th={mdp._geom_d_th:.3f}  "
+            f"r_tip_th={mdp._geom_r_tip_th:.3f}  "
+            f"r_max_th={mdp._geom_r_max_th:.3f}  "
+            f"axis_th={mdp._geom_axis_th:.3f}  "
+            f"insert_d_ins={mdp._geom_insert_d_ins:+.3f}  "
+            f"insert_r_max_th={mdp._geom_insert_r_max_th:.3f}  "
+            f"pen_th={mdp._geom_pen_th*1000:.1f}mm"
+        )
     if args.load_agent is not None:
         logger.info(f"warm-start: {args.load_agent}")
     logger.info(f"target_entropy={target_entropy:.3f}  "
@@ -581,6 +911,7 @@ def main():
                            else mdp.info.gamma)
     grad_clip_str = f"{args.actor_grad_clip:.2f}" if args.actor_grad_clip else "off"
     logger.info(f"[Lagrangian] cost_limit={args.cost_limit:.4f}  "
+                f"cost_signal={mdp._cost_signal}  "
                 f"lr_lambda={args.lr_lambda:.1e}  "
                 f"lambda_max={args.lambda_max:.1f}  lambda_min={args.lambda_min:.4f}  "
                 f"init_log_lambda={args.init_log_lambda:.3f}  "
@@ -594,13 +925,18 @@ def main():
             "λ 在每个 epoch 的 core.learn() 结束后由 drain() 更新; "
             "eval 期间 tracker 暂停 (active=False) 避免 deterministic policy 数据污染."
         )
-    critic_only_steps = args.critic_warmup_transitions - INITIAL_REPLAY_SIZE
+    critic_only_steps = max(0, args.critic_warmup_transitions - INITIAL_REPLAY_SIZE)
+    critic_only_epochs = math.ceil(critic_only_steps / args.n_steps_per_epoch)
     if critic_only_steps > 0:
-        critic_only_epochs = critic_only_steps / args.n_steps_per_epoch
         logger.info(
             f"critic_warmup_transitions={args.critic_warmup_transitions} env-steps "
             f"(replay-fill {INITIAL_REPLAY_SIZE} + critic-only {critic_only_steps} "
             f"≈ {critic_only_epochs:.1f} epoch, actor/α/λ 此期间冻结)"
+        )
+    if mdp._geom_stage == "insert" and critic_only_epochs > 0:
+        logger.info(
+            f"geom insert schedule offset: critic_only_epochs={critic_only_epochs} "
+            f"(actor-relative epoch = max(0, raw_epoch - {critic_only_epochs}))"
         )
     logger.info(f"n_steps_per_epoch={args.n_steps_per_epoch}  "
                 f"n_steps_per_fit={args.n_steps_per_fit}  num_envs={args.num_envs}")
@@ -615,6 +951,13 @@ def main():
                 f"pos_err_max={float(pos_err.max()):.4f}m  "
                 f"axis_err_mean={float(axis_err.mean()):.4f}  "
                 f"axis_err_max={float(axis_err.max()):.4f}")
+    if mdp._geom_stage is not None and mdp._cached_d is not None:
+        logger.info(
+            "geom reset stats: "
+            f"d_mean={float(mdp._cached_d.mean()):+.4f}m  "
+            f"radial_max_mean={float(mdp._cached_radial_max.mean()):.4f}m  "
+            f"penetration_max_mean={float(mdp._cached_penetration_max.mean())*1000:.2f}mm"
+        )
 
     wandb_run = None
     if not args.no_wandb:
@@ -626,6 +969,8 @@ def main():
             config={**vars(args), "algo": "SACLagrangian",
                     "target_entropy_resolved": target_entropy,
                     "gamma_cost_resolved": gamma_cost_resolved,
+                    "cost_signal_resolved": mdp._cost_signal,
+                    "geom_stage_resolved": mdp._geom_stage,
                     "obs_dim": obs_dim, "act_dim": act_dim,
                     "horizon": mdp.info.horizon, "gamma": mdp.info.gamma},
             dir=str(results_dir),
@@ -640,11 +985,25 @@ def main():
         with deterministic_policy(agent):
             ds0 = core.evaluate(n_episodes=args.n_eval_episodes, quiet=True)
         m0 = compute_hold_metrics(ds0, mdp, args.hold_success_steps)
+        mg0 = (
+            compute_geom_metrics(ds0, mdp, args.hold_success_steps)
+            if mdp._geom_stage is not None else None
+        )
         c0 = compute_cost_metrics(ds0, args.n_eval_episodes)
-        logger.info(f"  pos_success_rate={m0['pos_success_rate']:.3f}  "
-                    f"pos_err_mean={m0['pos_err_mean']:.4f}m  "
-                    f"axis_err_mean={m0['axis_err_mean']:.4f}  "
-                    f"hold_success_rate={m0['hold_success_rate']:.3f}")
+        if mg0 is not None:
+            logger.info(
+                f"  geom_hold_rate={mg0['geom_hold_rate']:.3f}  "
+                f"geom_step_rate={mg0['geom_step_rate']:.3f}  "
+                f"d_err_mean={mg0['geom_d_err_mean']:.4f}m  "
+                f"radial_max_mean={mg0['geom_radial_max_mean']:.4f}m  "
+                f"axis_err_mean={mg0['geom_axis_err_mean']:.4f}  "
+                f"pen_mean={mg0['geom_pen_max_mean']*1000:.2f}mm"
+            )
+        else:
+            logger.info(f"  pos_success_rate={m0['pos_success_rate']:.3f}  "
+                        f"pos_err_mean={m0['pos_err_mean']:.4f}m  "
+                        f"axis_err_mean={m0['axis_err_mean']:.4f}  "
+                        f"hold_success_rate={m0['hold_success_rate']:.3f}")
         logger.info(f"  cost_rate={c0['cost_rate']:.4f}  "
                     f"cost_episode_sum_mean={c0['cost_episode_sum_mean']:.3f}  "
                     f"cost_limit={args.cost_limit:.4f}")
@@ -658,6 +1017,13 @@ def main():
                 "warmstart_hold_success_rate": m0["hold_success_rate"],
                 "warmstart_cost_rate": c0["cost_rate"],
                 "warmstart_cost_episode_sum_mean": c0["cost_episode_sum_mean"],
+                **({
+                    "warmstart_geom_hold_rate": mg0["geom_hold_rate"],
+                    "warmstart_geom_step_rate": mg0["geom_step_rate"],
+                    "warmstart_geom_d_err_mean": mg0["geom_d_err_mean"],
+                    "warmstart_geom_radial_max_mean": mg0["geom_radial_max_mean"],
+                    "warmstart_geom_pen_max_mean": mg0["geom_pen_max_mean"],
+                } if mg0 is not None else {}),
             }, step=0)
 
     warmup_vector_steps = math.ceil(INITIAL_REPLAY_SIZE / args.num_envs)
@@ -686,11 +1052,21 @@ def main():
     best_hold_rate = -1.0
     best_hold_score = -1.0
     total_env_steps = INITIAL_REPLAY_SIZE
-    absorb_prev = mdp._absorb_count
-    absorb_physx_prev = mdp._absorb_count_physx
-    absorb_sphere_prev = mdp._absorb_count_sphere
+
+    def _cmdp_absorb_counts():
+        logging_state = mdp.get_logging_state()
+        return (
+            int(logging_state["absorb_count"]),
+            int(logging_state["absorb_count_physx"]),
+            int(logging_state["absorb_count_sphere"]),
+        )
+
+    absorb_prev, absorb_physx_prev, absorb_sphere_prev = _cmdp_absorb_counts()
 
     for epoch in range(args.n_epochs):
+        actor_epoch = max(0, epoch - critic_only_epochs)
+        mdp.set_geom_epoch(actor_epoch)
+
         # Reset per-env cost accumulators so partial episodes from the previous
         # epoch's rollout boundary don't bleed into this epoch's first completed
         # episode. The deque of fully completed episodes is NOT cleared here —
@@ -704,13 +1080,12 @@ def main():
             quiet=True,
         )
         clamp_alpha()
-        for _ in range(fits_per_epoch * (args.utd - 1)):
-            agent.fit(empty_dataset)
-            clamp_alpha()
-        total_env_steps += args.n_steps_per_epoch
 
         # ── Rollout episode λ update (rollout_episode_rate mode) ──────────────
-        # After all fits for this epoch, drain the EpisodeCostTracker.
+        # Immediately after rollout, drain the EpisodeCostTracker and update λ
+        # before replay-only extra UTD fits. This lets the current epoch's safety
+        # feedback influence the bulk of the actor updates instead of waiting
+        # until the next epoch.
         # drain() returns mean(episode_cost_sums) over episodes that completed
         # during core.learn() this epoch — the on-policy, episode-normalized signal.
         # This is the λ-update data stream: completed episode cost → rolling window
@@ -730,9 +1105,15 @@ def main():
                 _rollout_n_ep = _tracker.n_episodes
         # ──────────────────────────────────────────────────────────────────────
 
-        absorb_epoch = mdp._absorb_count - absorb_prev
-        absorb_physx_epoch = mdp._absorb_count_physx - absorb_physx_prev
-        absorb_sphere_epoch = mdp._absorb_count_sphere - absorb_sphere_prev
+        for _ in range(fits_per_epoch * (args.utd - 1)):
+            agent.fit(empty_dataset)
+            clamp_alpha()
+        total_env_steps += args.n_steps_per_epoch
+
+        absorb_now, absorb_physx_now, absorb_sphere_now = _cmdp_absorb_counts()
+        absorb_epoch = absorb_now - absorb_prev
+        absorb_physx_epoch = absorb_physx_now - absorb_physx_prev
+        absorb_sphere_epoch = absorb_sphere_now - absorb_sphere_prev
 
         # Disable tracker during eval: eval runs the deterministic policy, and
         # those episode costs must NOT enter the rollout buffer (different policy,
@@ -749,6 +1130,10 @@ def main():
         R = torch.mean(dataset.undiscounted_return).item()
         ep_len = len(dataset) / args.n_eval_episodes
         m = compute_hold_metrics(dataset, mdp, args.hold_success_steps)
+        mg = (
+            compute_geom_metrics(dataset, mdp, args.hold_success_steps)
+            if mdp._geom_stage is not None else None
+        )
         c = compute_cost_metrics(dataset, args.n_eval_episodes)
         lambda_update_mode = getattr(agent, "_lambda_update_mode", args.lambda_update_mode)
         # episode_rate: update λ from eval episodes (deterministic policy, one epoch lag).
@@ -765,13 +1150,20 @@ def main():
             best_J = J
             agent.save(str(best_J_path))
             agent.save(str(best_J_path_flat))
-        score = m['hold_success_rate'] * m['max_hold_mean']
-        improved_score = m['hold_success_rate'] > 0 and score > best_score
+        if mg is not None:
+            track_rate = mg["geom_hold_rate"]
+            track_score = mg["geom_max_run_mean"]
+        else:
+            track_rate = m["hold_success_rate"]
+            track_score = m["max_hold_mean"]
+
+        score = track_rate * track_score
+        improved_score = track_rate > 0 and score > best_score
         if improved_score:
             best_score = score
 
-        hold_rate = m['hold_success_rate']
-        max_hold = m['max_hold_mean']
+        hold_rate = track_rate
+        max_hold = track_score
         improved_hold = (
             hold_rate > best_hold_rate
             or (hold_rate == best_hold_rate and max_hold > best_hold_score)
@@ -782,9 +1174,7 @@ def main():
             agent.save(str(best_hold_path))
             agent.save(str(best_hold_path_flat))
 
-        absorb_prev = mdp._absorb_count
-        absorb_physx_prev = mdp._absorb_count_physx
-        absorb_sphere_prev = mdp._absorb_count_sphere
+        absorb_prev, absorb_physx_prev, absorb_sphere_prev = _cmdp_absorb_counts()
 
         lambda_val = float(agent._log_lambda.exp().item())
         lambda_qc_mean = float(getattr(agent, "_lambda_qc_mean", float("nan")))
@@ -801,36 +1191,83 @@ def main():
             getattr(agent, "_lambda_internal_violation", float("nan"))
         )
         lambda_update_source = getattr(agent, "_lambda_update_source", "unknown")
-        # episode_rate / rollout_episode_rate: cost_limit is per-episode
-        # (collisions/episode); compare against the eval episode-sum metric.
-        # Per-step modes: cost_limit is a per-step rate; compare against eval per-step rate.
+        # episode_rate / rollout_episode_rate: cost_limit is per-episode cost
+        # sum; compare against the eval episode-sum metric. Per-step modes use
+        # mean(cost), whose units follow cost_signal.
         if lambda_update_mode in ("episode_rate", "rollout_episode_rate"):
             cost_violation = c['cost_episode_sum_mean'] - args.cost_limit
         else:
             cost_violation = c['cost_rate'] - args.cost_limit
 
-        logger.epoch_info(epoch + 1, J=J, R=R, best_J=best_J,
-                          best_hold=best_hold_rate if best_hold_rate >= 0 else 0.0,
-                          best_score=best_score,
-                          cost_rate=c['cost_rate'],
-                          lam=lambda_val,
-                          absorb_epoch=absorb_epoch)
-        logger.info("eval stats: "
-                    f"hold_success_rate={m['hold_success_rate']:.3f}  "
-                    f"max_hold_mean={m['max_hold_mean']:.1f}  "
-                    f"eval_ep_len={ep_len:.1f}  "
-                    f"in_thresh_rate={m['in_thresh_rate']:.3f}  "
-                    f"pos_success_rate={m['pos_success_rate']:.3f}  "
-                    f"pos_err_mean={m['pos_err_mean']:.4f}m  "
-                    f"axis_err_mean={m['axis_err_mean']:.4f}")
-        if m["pos_in_thresh_count"] > 0:
-            logger.info("  ↳ pos_in_thresh diagnostics: "
-                        f"count={m['pos_in_thresh_count']}  "
-                        f"axis_err_mean={m['axis_err_in_pos_thresh_mean']:.4f}  "
-                        f"axis_err_min={m['axis_err_in_pos_thresh_min']:.4f}")
+        logger.epoch_info(
+            epoch + 1, J=J, R=R, best_J=best_J,
+            **{("best_geom" if mg is not None else "best_hold"):
+               best_hold_rate if best_hold_rate >= 0 else 0.0},
+            best_score=best_score,
+            cost_rate=c['cost_rate'],
+            lam=lambda_val,
+            absorb_epoch=absorb_epoch,
+        )
+        if mg is not None:
+            logger.info(
+                f"geom schedule @ raw_epoch={epoch} actor_epoch={actor_epoch}: "
+                f"d_target_eff={mdp._geom_d_target_eff:+.4f}m  "
+                f"stage={mdp._geom_stage}"
+            )
+            logger.info(
+                f"geom eval ({mdp._geom_stage} active mask): "
+                f"geom_step_rate={mg['geom_step_rate']:.3f}  "
+                f"geom_hold_rate={mg['geom_hold_rate']:.3f} "
+                f"(>= {args.hold_success_steps} consec steps)  "
+                f"geom_max_run_mean={mg['geom_max_run_mean']:.1f}  "
+                f"final_success_rate={mg['geom_final_success_rate']:.3f}  "
+                f"d_err_mean={mg['geom_d_err_mean']:.4f}m  "
+                f"d_err_min={mg['geom_d_err_min']:.4f}m  "
+                f"radial_max_min={mg['geom_radial_max_min']:.4f}m  "
+                f"axis_err_min={mg['geom_axis_err_min']:.3f}"
+            )
+            logger.info(
+                f"geom masks: prepos_step_rate={mg['geom_prepos_step_rate']:.3f}  "
+                f"preaxis_step_rate={mg['geom_preaxis_step_rate']:.3f}  "
+                f"insert_step_rate={mg['geom_insert_step_rate']:.3f}"
+            )
+            logger.info(
+                f"geom entry (n_ep={mg['geom_n_ep_with_entry']}): "
+                f"d={mg['geom_entry_d_mean']:+.4f}m  "
+                f"d_err={mg['geom_entry_d_err_mean']:.4f}m  "
+                f"rm_mean={mg['geom_entry_radial_max_mean']:.4f}m "
+                f"(max {mg['geom_entry_radial_max_max']:.4f}m)  "
+                f"ax_mean={mg['geom_entry_axis_err_mean']:.4f} "
+                f"(max {mg['geom_entry_axis_err_max']:.4f})  "
+                f"pen_mean={mg['geom_entry_penetration_mean']*1000:.2f}mm "
+                f"(max {mg['geom_entry_penetration_max']*1000:.2f}mm)"
+            )
+            logger.info(
+                f"geom penetration: "
+                f"max_mean={mg['geom_pen_max_mean']*1000:.2f}mm "
+                f"max_max={mg['geom_pen_max_max']*1000:.2f}mm "
+                f"clean_step_rate={mg['geom_clean_step_rate']:.3f} "
+                f"(in active mask: mean={mg['geom_pen_in_active_mean']*1000:.2f}mm "
+                f"max={mg['geom_pen_in_active_max']*1000:.2f}mm)"
+            )
+            logger.info("eval stats: [legacy 球形 pos/axis 指标 skipped — geom 模式 ckpt 选择走 geom_*]")
         else:
-            logger.info("  ↳ pos_in_thresh diagnostics: count=0  axis_err=n/a")
-        logger.info(f"  ↳ cost_rate={c['cost_rate']:.4f}  "
+            logger.info("eval stats: "
+                        f"hold_success_rate={m['hold_success_rate']:.3f}  "
+                        f"max_hold_mean={m['max_hold_mean']:.1f}  "
+                        f"eval_ep_len={ep_len:.1f}  "
+                        f"in_thresh_rate={m['in_thresh_rate']:.3f}  "
+                        f"pos_success_rate={m['pos_success_rate']:.3f}  "
+                        f"pos_err_mean={m['pos_err_mean']:.4f}m  "
+                        f"axis_err_mean={m['axis_err_mean']:.4f}")
+            if m["pos_in_thresh_count"] > 0:
+                logger.info("  ↳ pos_in_thresh diagnostics: "
+                            f"count={m['pos_in_thresh_count']}  "
+                            f"axis_err_mean={m['axis_err_in_pos_thresh_mean']:.4f}  "
+                            f"axis_err_min={m['axis_err_in_pos_thresh_min']:.4f}")
+            else:
+                logger.info("  ↳ pos_in_thresh diagnostics: count=0  axis_err=n/a")
+        logger.info(f"  ↳ cost_mean={c['cost_rate']:.4f}  "
                     f"cost_ep_sum={c['cost_episode_sum_mean']:.3f}  "
                     f"eval_violation={cost_violation:+.4f}  "
                     f"lambda_internal_violation={lambda_internal_violation:+.4f}  "
@@ -847,22 +1284,83 @@ def main():
                     f"absorb_physx={absorb_physx_epoch}")
 
         if wandb_run is not None:
+            _legacy = (lambda k: f"legacy_{k}") if mg is not None else (lambda k: k)
+            best_rate_value = best_hold_rate if best_hold_rate >= 0 else 0.0
+            best_run_value = best_hold_score if best_hold_score >= 0 else 0.0
+            best_metric_fields = (
+                {
+                    "best_metric_rate": best_rate_value,
+                    "best_metric_max_run_mean": best_run_value,
+                    "best_geom_rate": best_rate_value,
+                    "best_geom_max_run_mean": best_run_value,
+                }
+                if mg is not None else
+                {
+                    "best_metric_rate": best_rate_value,
+                    "best_metric_max_run_mean": best_run_value,
+                    "best_hold_rate": best_rate_value,
+                    "best_hold_max_hold_mean": best_run_value,
+                }
+            )
             wandb_run.log({
                 "epoch": epoch + 1, "env_steps": total_env_steps,
                 "J": J, "R": R, "best_J": best_J, "best_score": best_score,
-                "best_hold_rate": best_hold_rate if best_hold_rate >= 0 else 0.0,
-                "best_hold_max_hold_mean": best_hold_score if best_hold_score >= 0 else 0.0,
+                **best_metric_fields,
                 "eval_ep_len": ep_len,
-                "eval_success_rate": m["hold_success_rate"],
-                "eval_max_hold_mean": m["max_hold_mean"],
-                "eval_in_thresh_rate": m["in_thresh_rate"],
-                "eval_final_in_thresh_rate": m["final_in_thresh_rate"],
-                "eval_pos_success_rate": m["pos_success_rate"],
-                "eval_pos_err_mean": m["pos_err_mean"],
-                "eval_axis_err_mean": m["axis_err_mean"],
-                "eval_pos_in_thresh_count": m["pos_in_thresh_count"],
-                "eval_axis_err_in_pos_thresh_mean": m["axis_err_in_pos_thresh_mean"],
-                "eval_axis_err_in_pos_thresh_min": m["axis_err_in_pos_thresh_min"],
+                _legacy("eval_success_rate"): m["hold_success_rate"],
+                _legacy("eval_max_hold_mean"): m["max_hold_mean"],
+                _legacy("eval_in_thresh_rate"): m["in_thresh_rate"],
+                _legacy("eval_final_in_thresh_rate"): m["final_in_thresh_rate"],
+                _legacy("eval_pos_success_rate"): m["pos_success_rate"],
+                _legacy("eval_pos_err_mean"): m["pos_err_mean"],
+                _legacy("eval_axis_err_mean"): m["axis_err_mean"],
+                _legacy("eval_pos_in_thresh_count"): m["pos_in_thresh_count"],
+                _legacy("eval_axis_err_in_pos_thresh_mean"): m["axis_err_in_pos_thresh_mean"],
+                _legacy("eval_axis_err_in_pos_thresh_min"): m["axis_err_in_pos_thresh_min"],
+                **({
+                    "geom_raw_epoch": epoch,
+                    "geom_actor_epoch": actor_epoch,
+                    "geom_d_target_eff": mdp._geom_d_target_eff,
+                    "geom_step_rate": mg["geom_step_rate"],
+                    "geom_hold_rate": mg["geom_hold_rate"],
+                    "geom_max_run_mean": mg["geom_max_run_mean"],
+                    "geom_ep_success_rate_mean": mg["geom_ep_success_rate_mean"],
+                    "geom_final_success_rate": mg["geom_final_success_rate"],
+                    "geom_prepos_step_rate": mg["geom_prepos_step_rate"],
+                    "geom_preaxis_step_rate": mg["geom_preaxis_step_rate"],
+                    "geom_insert_step_rate": mg["geom_insert_step_rate"],
+                    "geom_d_target_mean": mg["geom_d_target_mean"],
+                    "geom_d_err_mean": mg["geom_d_err_mean"],
+                    "geom_d_err_min": mg["geom_d_err_min"],
+                    "geom_radial_tip_mean": mg["geom_radial_tip_mean"],
+                    "geom_radial_tip_min": mg["geom_radial_tip_min"],
+                    "geom_radial_max_mean": mg["geom_radial_max_mean"],
+                    "geom_radial_max_min": mg["geom_radial_max_min"],
+                    "geom_axis_err_mean": mg["geom_axis_err_mean"],
+                    "geom_axis_err_min": mg["geom_axis_err_min"],
+                    "geom_n_ep_with_entry": mg["geom_n_ep_with_entry"],
+                    "geom_entry_d_mean": mg["geom_entry_d_mean"],
+                    "geom_entry_d_err_mean": mg["geom_entry_d_err_mean"],
+                    "geom_entry_radial_max_mean": mg["geom_entry_radial_max_mean"],
+                    "geom_entry_radial_max_max": mg["geom_entry_radial_max_max"],
+                    "geom_entry_axis_err_mean": mg["geom_entry_axis_err_mean"],
+                    "geom_entry_axis_err_max": mg["geom_entry_axis_err_max"],
+                    "geom_entry_penetration_mean": mg["geom_entry_penetration_mean"],
+                    "geom_entry_penetration_max": mg["geom_entry_penetration_max"],
+                    "geom_final_d_mean": mg["geom_final_d_mean"],
+                    "geom_final_d_err_mean": mg["geom_final_d_err_mean"],
+                    "geom_final_radial_max_mean": mg["geom_final_radial_max_mean"],
+                    "geom_final_radial_max_max": mg["geom_final_radial_max_max"],
+                    "geom_final_axis_err_mean": mg["geom_final_axis_err_mean"],
+                    "geom_final_axis_err_max": mg["geom_final_axis_err_max"],
+                    "geom_final_penetration_mean": mg["geom_final_penetration_mean"],
+                    "geom_final_penetration_max": mg["geom_final_penetration_max"],
+                    "geom_pen_max_mean": mg["geom_pen_max_mean"],
+                    "geom_pen_max_max": mg["geom_pen_max_max"],
+                    "geom_clean_step_rate": mg["geom_clean_step_rate"],
+                    "geom_pen_in_active_mean": mg["geom_pen_in_active_mean"],
+                    "geom_pen_in_active_max": mg["geom_pen_in_active_max"],
+                } if mg is not None else {}),
                 "alpha": agent._alpha.item(),
                 # Lagrangian 专属
                 "lambda": lambda_val,
@@ -895,9 +1393,10 @@ def main():
         best_hold_display = "n/a"
     else:
         best_hold_display = f"{best_hold_rate:.3f} (max_hold_mean={best_hold_score:.1f})"
+    best_metric_name = "best_geom_rate" if mdp._geom_stage is not None else "best_hold_rate"
     logger.info(
         f"训练完成. best J = {best_J:.3f}  "
-        f"best_hold_rate = {best_hold_display}  "
+        f"{best_metric_name} = {best_hold_display}  "
         f"final λ = {float(agent._log_lambda.exp().item()):.3f}"
     )
     logger.info(f"checkpoint 写入: {ckpt_dir}/ 下的 "
@@ -906,11 +1405,18 @@ def main():
                 "需手动看 wandb cost_rate 选 safe 子集.")
 
     if wandb_run is not None:
+        best_rate_value = best_hold_rate if best_hold_rate >= 0 else 0.0
+        best_run_value = best_hold_score if best_hold_score >= 0 else 0.0
         wandb_run.summary["best_J"] = best_J
         wandb_run.summary["best_score"] = best_score
-        wandb_run.summary["best_hold_rate"] = (
-            best_hold_rate if best_hold_rate >= 0 else 0.0
-        )
+        wandb_run.summary["best_metric_rate"] = best_rate_value
+        wandb_run.summary["best_metric_max_run_mean"] = best_run_value
+        if mdp._geom_stage is not None:
+            wandb_run.summary["best_geom_rate"] = best_rate_value
+            wandb_run.summary["best_geom_max_run_mean"] = best_run_value
+        else:
+            wandb_run.summary["best_hold_rate"] = best_rate_value
+            wandb_run.summary["best_hold_max_hold_mean"] = best_run_value
         wandb_run.summary["final_lambda"] = float(agent._log_lambda.exp().item())
         wandb_run.finish()
     mdp.stop()

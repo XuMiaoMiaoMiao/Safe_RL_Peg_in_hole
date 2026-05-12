@@ -1,42 +1,22 @@
-"""DualArmPegHoleCostEnv — Lagrangian SAC Stage 2 专用子类.
+"""CMDP/Lagrangian adapter for :class:`DualArmPegHoleEnv`.
 
-Stage 2 冷启动 reward 设计（参照 Stage 1 骨架，零补丁）:
+`dual_arm_peg_hole_env.py` is the single source of truth for environment
+mechanics: observation construction, analytic peg/hole frames, reset/setup,
+collision checks, geom-stage caches, penetration metrics, success masks, and
+diagnostic info. This subclass only owns the CMDP layer:
 
-    r = - w_pos     × pos_err                    # 位置主梯度
-        - w_axis    × axis_err                   # 轴向主梯度（无门控，冷启动两项同时开）
-        + w_axis_prog × clamp(1-axis_err/2,0,1)  # 轴对齐渐进正奖励
-        + w_success × 1[pos_ok AND axis_ok]      # 成功 per-step bonus（不终止）
-        - w_action  × ‖a_raw‖²                   # 动作平滑
-        - w_home    × Σ ((q−q_home)/range)²      # 均匀 home 正则（tie-breaker）
-
-Stage 1 相比移除的所有遗留补丁:
-    - w_pos_success   : Stage 1→2 暖启动桥接，冷启动无需保护已学行为
-    - axis_gate_radius: 暖启动补丁，防 axis 项干扰已收敛的位置策略
-    - w_joint_limit   : 软关节极限惩罚，安全全权委托给 Lagrangian cost
-    - terminal_hold_bonus / hold-N absorbing: 增加 Q-target 边界复杂度，收益有限
-    - home_weights 非对称: 针对暖启动手腕姿态调出的非均匀权重
-
-量纲平衡（冷启动 home 位置）:
-    pos_err  ≈ 0.4~0.8m  →  w_pos=1.0  → 贡献 −0.4~−0.8
-    axis_err ≈ 2.0        →  w_axis=0.5 → 贡献 −1.0（两项幅度相近，互不压制）
-    axis_prog ∈ [0,1]     →  默认 0.0；需要正向 shaping 时配置打开
-    success  per-step     →  w_success=2.0（清晰可见但不扭曲 Q 估计）
-    action   最大≈14      →  w_action=0.005 → 最大 −0.07（正则量级）
-    home_dev 典型0.5~1.5  →  w_home=0.001  → 最大 −0.002（tie-breaker 量级）
-
-cost 信号（不变）:
-    collision indicator (sphere-proxy OR PhysX)
-    → _create_info_dictionary() → dataset.info.data["cost"]
-    → ConstrainedReplayMemory → SACLagrangian.fit()
+- reward formula
+- cost signal selection
+- logging state needed by the Lagrangian training loop
 """
 
 import torch
 
-from envs.dual_arm_peg_hole_env import DualArmPegHoleEnv, _AGENT_OBS_JOINT_POS
+from envs.dual_arm_peg_hole_env import DualArmPegHoleEnv
 
 
 class DualArmPegHoleCostEnv(DualArmPegHoleEnv):
-    """Stage 2 Lagrangian SAC 环境: 干净 reward + collision cost."""
+    """Thin CMDP adapter: parent env facts + separate reward/cost surface."""
 
     _DEFAULT_W_POS     = 1.0
     _DEFAULT_W_AXIS    = 0.5
@@ -63,57 +43,70 @@ class DualArmPegHoleCostEnv(DualArmPegHoleEnv):
             rew_success: 成功 per-step bonus.    默认 2.0
             rew_action:  动作 L2 正则系数.        默认 0.005
             rew_home:    Home 偏差正则系数.       默认 0.001 (均匀权重, tie-breaker 量级)
-            **parent_kwargs: 透传 DualArmPegHoleEnv (几何/物理/obs/终止参数).
-                terminal_hold_bonus 固定为 0.0 — hold-N absorbing 在 Stage 2 关闭.
-                parent 的 reward 权重参数若经由 kwargs 传入则无效 (reward() 已覆写).
+            **parent_kwargs: 透传 DualArmPegHoleEnv. 几何、obs、reset、collision、
+                success mask 和 info 诊断全部由父类维护.
         """
+        parent_kwargs.setdefault("rew_pos", rew_pos)
+        parent_kwargs.setdefault("rew_axis", rew_axis)
+        parent_kwargs.setdefault("rew_success", rew_success)
+        parent_kwargs.setdefault("rew_action", rew_action)
+        parent_kwargs.setdefault("rew_home", rew_home)
+
         self._s2_w_pos     = float(rew_pos)
         self._s2_w_axis    = float(rew_axis)
+        # Kept for CLI/logging compatibility with old Stage-2 Lagrangian runs.
+        # The current CMDP reward borrows the parent SAC reward and does not use
+        # this extra axis-progress term.
         self._s2_w_axis_progress = float(rew_axis_progress)
         self._s2_w_success = float(rew_success)
         self._s2_w_action  = float(rew_action)
         self._s2_w_home    = float(rew_home)
-        # hold-N absorbing 强制关闭
+        # CMDP 训练默认不把 hold-N success 做成 terminal cliff. 碰撞 / geom
+        # success / penetration 等环境语义仍完全走父类。
         parent_kwargs.pop("terminal_hold_bonus", None)
         super().__init__(terminal_hold_bonus=0.0, **parent_kwargs)
 
     # ------------------------------------------------------------------
-    # Stage 2 reward（干净公式，不调父类 _compute_normal_reward）
+    # Diagnostics consumed by scripts/train_sac_lagrangian.py.
     # ------------------------------------------------------------------
-    def _compute_stage2_reward(self, next_obs):
-        pos_err      = self._last_pos_err
-        axis_err     = self._last_axis_err
-        axis_progress = (1.0 - 0.5 * axis_err).clamp(0.0, 1.0)
-        full_success = self._last_success_mask.to(pos_err.dtype)
+    def get_logging_state(self):
+        """Return CMDP diagnostics consumed by training/logging code."""
+        return {
+            "absorb_count": self._absorb_count,
+            "absorb_count_physx": self._absorb_count_physx,
+            "absorb_count_sphere": self._absorb_count_sphere,
+            "last_min_clearance": self._last_min_clearance,
+            "last_collision_mask": self._last_collision_mask,
+            "last_success_mask": self._last_success_mask,
+        }
 
-        joint_pos = next_obs[..., _AGENT_OBS_JOINT_POS]
-        action_sq = (self._last_raw_action ** 2).sum(dim=-1)
-
-        joint_range = self._joint_upper - self._joint_lower
-        home_dev    = (
-            (joint_pos - self._default_joint_pos.unsqueeze(0)) / joint_range.unsqueeze(0)
-        )
-        home_norm = (home_dev ** 2).sum(dim=-1)
-
-        return (
-            - self._s2_w_pos     * pos_err
-            - self._s2_w_axis    * axis_err
-            + self._s2_w_axis_progress * axis_progress
-            + self._s2_w_success * full_success
-            - self._s2_w_action  * action_sq
-            - self._s2_w_home    * home_norm
-        )
-
+    # ------------------------------------------------------------------
+    # CMDP reward: reuse the SAC task reward but leave hard safety penalties to
+    # cost()/lambda. In geom mode, penetration is also treated as a constraint
+    # signal, so its reward component is dropped to avoid double pressure.
+    # ------------------------------------------------------------------
     def reward(self, obs, action, next_obs, absorbing):
-        return self._reward_scale * self._compute_stage2_reward(next_obs)
+        if self._geom_stage is not None:
+            components = self._compute_geom_reward_components(next_obs)
+            components["r_geom_penetration"] = torch.zeros_like(
+                components["r_geom_penetration"]
+            )
+            r = sum(components.values())
+        else:
+            r = self._compute_normal_reward(next_obs)
+        return self._reward_scale * r
 
     # ------------------------------------------------------------------
-    # Cost signal
+    # CMDP cost signal.
     # ------------------------------------------------------------------
     def cost(self):
+        if self._cost_signal == "penetration" and self._cached_penetration_max is not None:
+            return self._cached_penetration_max.to(torch.float32)
         if self._last_collision_mask is None:
             return torch.zeros(self._n_envs, dtype=torch.float32, device=self._device)
-        return self._last_collision_mask.float()
+        return self._last_collision_mask.to(torch.float32)
 
     def _create_info_dictionary(self, obs):
-        return {"cost": self.cost()}
+        info = super()._create_info_dictionary(obs)
+        info["cost"] = self.cost()
+        return info
