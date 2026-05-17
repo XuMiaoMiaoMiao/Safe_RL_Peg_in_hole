@@ -128,7 +128,11 @@ def parse_args():
     p.add_argument("--rew_geom_penetration", type=float, default=None)
     p.add_argument("--geom_gate_penetration_sigma", type=float, default=None)
     p.add_argument("--cost_signal", type=str, default=None,
-                   choices=["collision", "penetration"])
+                   choices=["collision", "penetration", "clearance"])
+    p.add_argument("--clearance_cost_margin", type=float, default=None)
+    p.add_argument("--cost_scale", type=float, default=None,
+                   help="Multiplicative gain on info['cost']. Pass the same value used "
+                        "at training time so visual diagnostics match wandb logs.")
     p.add_argument("--geom_progress_floor", type=float, default=None)
     p.add_argument("--rew_geom_advance", type=float, default=None)
     p.add_argument("--geom_d_gate_mode", type=str, default=None,
@@ -188,7 +192,8 @@ def main():
                 "geom_pen_th", "geom_soft_penetration_sigma",
                 "rew_geom_progress", "geom_gate_radial_sigma",
                 "geom_gate_axis_sigma",
-                "rew_geom_penetration", "geom_gate_penetration_sigma", "cost_signal",
+                "rew_geom_penetration", "geom_gate_penetration_sigma",
+                "cost_signal", "clearance_cost_margin", "cost_scale",
                 "geom_progress_floor", "rew_geom_advance",
                 "geom_d_gate_mode", "rew_geom_bad_entry",
                 "geom_bad_entry_radial_safe", "geom_bad_entry_axis_safe",

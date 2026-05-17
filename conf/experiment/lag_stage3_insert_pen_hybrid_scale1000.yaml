@@ -1,0 +1,124 @@
+train_script: scripts/train_sac_lagrangian.py
+
+# Lagrangian SAC Stage 3g (insert) -- HYBRID PENETRATION-COST ABLATION
+#
+# Follow-up to lag_stage3_insert_pen_clean_scale1000.yaml.
+# The clean run on 2026-05-17 finished without best_hold_lag.msh:
+#   - geom_step_rate / geom_hold_rate stayed 0 for all 80 epochs
+#   - rollout_ep_cost repeatedly exceeded the limit
+#   - lambda hit lambda_max=50 several times
+#
+# Diagnosis:
+#   The penetration cost path worked, but dual ascent was too aggressive and
+#   removing bad_entry left task ordering too weak. This hybrid run keeps
+#   penetration as the CMDP cost while restoring bad_entry shaping and slowing
+#   lambda updates.
+
+num_envs: 16
+horizon: 200
+render: false
+seed: 1
+use_axis_resid_obs: true
+exclude_ee_from_physx_self_collision: true
+
+n_epochs: 80
+n_steps_per_epoch: 3200
+n_steps_per_fit: 16
+utd: null
+critic_warmup_transitions: 30000
+n_eval_episodes: 16
+
+lr_actor: 1e-5
+lr_critic: 3e-4
+lr_alpha: 3e-4
+alpha_max: 0.015
+target_entropy: -7
+actor_grad_clip: 1.0
+
+initial_joint_noise: 0.1
+preinsert_success_pos_threshold: 0.10
+preinsert_offset: null
+
+geom_stage: insert
+geom_d_target_neg: -0.08
+geom_d_target_pos: 0.03
+geom_d_target_ramp_start: 0
+geom_d_target_ramp_end: 20
+geom_progress_floor: 0.0
+
+geom_d_sat: 0.30
+geom_radial_sat: 1.0
+
+geom_d_th: 0.020
+geom_r_tip_th: 0.015
+geom_r_max_th: 0.025
+geom_axis_th: 0.300
+geom_insert_d_ins: 0.025
+geom_insert_r_max_th: 0.025
+geom_pen_th: 0.001
+
+rew_geom_d: 1.0
+rew_geom_radial_tip: 0.0
+rew_geom_radial_max: 5.0
+rew_geom_axis: 1.0
+rew_geom_progress: 0.0
+rew_geom_advance: 25.0
+
+geom_gate_radial_sigma: 0.025
+geom_gate_axis_sigma: 0.30
+geom_gate_penetration_sigma: 0.005
+geom_d_gate_mode: "off"
+
+# Penetration stays out of reward and goes through Q_C / lambda.
+rew_geom_penetration: 20.0
+drop_penetration_reward_for_cost: true
+
+rew_geom_soft_success: 1.25
+geom_soft_d_sigma: 0.018
+geom_soft_radial_sigma: 0.009
+geom_soft_axis_sigma: 0.15
+geom_soft_penetration_sigma: 0.0025
+
+# Hybrid recovery: restore SAC v8 task-ordering shaping so the actor still has
+# a dense "enter only when aligned" signal while penetration is constrained.
+rew_geom_bad_entry: 0.30
+geom_bad_entry_radial_safe: 0.014
+geom_bad_entry_axis_safe: 0.10
+geom_bad_entry_pen_safe: 0.00075
+
+cost_signal: penetration
+cost_scale: 1000
+keep_collision_reward_penalty: false
+
+# SAC v8 eval with penetration cost gave cost_episode_sum_mean=67.2898.
+# Keep the same 0.5x budget used in the clean run.
+cost_limit_per_ep: 33.6449
+lambda_update_mode: rollout_episode_rate
+damp_scale: 0.0
+min_lambda_update_episodes: 16
+lr_lambda: 0.001
+lambda_max: 10.0
+lambda_min: 0.001
+init_log_lambda: -2.3
+gamma_cost: 0.99
+
+rew_action: 0.005
+rew_home: 0.001
+home_weights: "1,1,1,1,0.75,0.5,0.5"
+
+terminal_hold_bonus: 0.0
+hold_success_steps: 10
+
+clearance_hard: 0.0
+proxy_arm_radius: 0.06
+proxy_ee_radius: 0.04
+
+load_agent: results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00/best_hold.msh
+actor_only_warmstart: true
+keep_replay: false
+
+wandb_project: bimanual_peghole
+wandb_entity: miaoxu010522-lund
+wandb_run_name: lag_S3g_pen_hybrid_scale1000_seed1
+wandb_group: lag_pen_hybrid_compare
+no_wandb: false

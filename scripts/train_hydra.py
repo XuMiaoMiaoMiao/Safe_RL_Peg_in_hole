@@ -37,6 +37,20 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RESERVED_TRAIN_KEYS = {"train_script", "extra_args"}
 
+# argparse args declared with action=argparse.BooleanOptionalAction in the
+# downstream train scripts. For those args, yaml `key: false` must emit
+# `--no-{key}` instead of silently dropping the flag (which leaves the
+# default=True in effect — the silent bug fixed 2026-05-17).
+#
+# All other bool args use action="store_true" (default=False), where `false`
+# is a no-op and `--no-{key}` would crash argparse. Keep this whitelist tight.
+#
+# Source of truth: grep "BooleanOptionalAction" in scripts/train_*.py.
+BOOLEAN_OPTIONAL_ARGS: set[str] = {
+    "keep_collision_reward_penalty",
+    "drop_penetration_reward_for_cost",
+}
+
 
 def _as_list(value) -> list[str]:
     if value is None:
@@ -68,9 +82,14 @@ def _append_vector_arg(cmd: list[str], flag: str, value) -> None:
     cmd.extend(items)
 
 
-def _append_bool_arg(cmd: list[str], flag: str, enabled: bool) -> None:
+def _append_bool_arg(cmd: list[str], flag: str, enabled: bool, key: str) -> None:
     if enabled:
         cmd.append(flag)
+    elif key in BOOLEAN_OPTIONAL_ARGS:
+        # BooleanOptionalAction default is typically True; explicit `false`
+        # in yaml must translate to `--no-{key}` to actually disable the flag.
+        cmd.append(f"--no-{key}")
+    # else: store_true arg with `false` value is a no-op (default=False).
 
 
 def _append_train_arg(cmd: list[str], key: str, value) -> None:
@@ -79,7 +98,7 @@ def _append_train_arg(cmd: list[str], key: str, value) -> None:
     if value is None:
         return
     if isinstance(value, bool):
-        _append_bool_arg(cmd, flag, value)
+        _append_bool_arg(cmd, flag, value, key)
         return
     if isinstance(value, DictConfig):
         raise TypeError(

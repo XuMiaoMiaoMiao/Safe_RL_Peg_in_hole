@@ -333,15 +333,30 @@ class DualArmPegHoleEnv(IsaacSim):
         # penetration_max 已经在 env 里算 (per-step physical 穿模量, [0, 4mm]).
         # 这里加 reward 接入 + cost signal switch:
         # - rew_geom_penetration: 软 penalty -w_pen·penetration_max. 默认 0=关.
-        #   推荐 SAC: 10-20. Lagrangian SAC: 0 (用 cost 信号代替).
+        #   推荐 SAC / robot-collision LagSAC: 10-20. 只有把 peg-hole 穿模显式
+        #   建成约束时, 才应改用 cost_signal='penetration' 并考虑清掉该 reward.
         # - geom_gate_penetration_sigma: gate 里 penetration 项的 σ. 设 finite 值
         #   (e.g. 0.002 = 2mm) 把 penetration 纳入 alignment_gate 乘子, 让 progress
         #   reward 在穿模时趋 0. 默认 None=不纳入 gate.
-        # - cost_signal: 'collision' (老的 0/1 indicator) 或 'penetration'
-        #   (= penetration_max 连续 [0, 4mm]). Lagrangian SAC 配 'penetration'.
+        # - cost_signal:
+        #   'collision'   robot collision 0/1 indicator (arm_L vs arm_R PhysX
+        #                 OR 双臂 sphere-proxy); 不含 peg-hole penetration
+        #   'penetration' penetration_max 连续 [0, 4mm]
+        #   'clearance'   双臂 proxy clearance 连续 margin cost
         rew_geom_penetration=None,
         geom_gate_penetration_sigma=None,
         cost_signal="collision",
+        clearance_cost_margin=0.02,
+        # ─── cost_scale (2026-05-17): multiplicative gain applied to the cost
+        # tensor written to info["cost"]. Pure unit conversion / scale, does NOT
+        # change semantics. Motivation: penetration cost is in meters and lives
+        # in [0, 0.004]; Q_C learned by the cost critic ends up so small that
+        # the actor-loss term λ·Q_C is ~5 orders of magnitude below Q_R and the
+        # Lagrangian gradient cannot move the policy. Pass cost_scale=1000 to
+        # convert penetration to mm, or cost_scale=1/geom_pen_th for a
+        # dimensionless "pen_th-units" cost. Default 1.0 preserves old behaviour
+        # for clearance / collision runs.
+        cost_scale=1.0,
         # progress floor (codex 2026-05-11 v2): progress reward 起点.
         # 默认 0.0 = 只奖励 peg 真正越过 hole 入口 (d > 0). 旧行为 (奖励
         # "从 preinsert 接近 entrance") 用 -0.08 (= d_target_neg).
@@ -532,11 +547,24 @@ class DualArmPegHoleEnv(IsaacSim):
             raise ValueError(
                 f"rew_geom_penetration must be finite and >= 0, got {self._w_geom_penetration}"
             )
-        if cost_signal not in ("collision", "penetration"):
+        if cost_signal not in ("collision", "penetration", "clearance"):
             raise ValueError(
-                f"cost_signal 必须 'collision' 或 'penetration', got {cost_signal!r}"
+                "cost_signal 必须 'collision', 'penetration' 或 'clearance', "
+                f"got {cost_signal!r}"
             )
         self._cost_signal = cost_signal
+        self._clearance_cost_margin = float(clearance_cost_margin)
+        if not (math.isfinite(self._clearance_cost_margin)
+                and self._clearance_cost_margin > 0.0):
+            raise ValueError(
+                "clearance_cost_margin must be finite and > 0, "
+                f"got {self._clearance_cost_margin}"
+            )
+        self._cost_scale = float(cost_scale)
+        if not (math.isfinite(self._cost_scale) and self._cost_scale > 0.0):
+            raise ValueError(
+                f"cost_scale must be finite and > 0, got {self._cost_scale}"
+            )
         # d_target 必须先赋值, 因为下面 progress_floor 校验依赖它.
         self._geom_d_target_neg = float(geom_d_target_neg)
         self._geom_d_target_pos = float(geom_d_target_pos)
@@ -1120,16 +1148,29 @@ class DualArmPegHoleEnv(IsaacSim):
 
     def _create_info_dictionary(self, obs):
         # cost = constraint cost signal for Lagrangian SAC.
-        # cost_signal='collision' (default, 老语义): 0/1 indicator from PhysX OR
-        #   sphere-proxy. is_absorbing 已 cache _last_collision_mask.
+        # cost_signal='collision' (default): robot collision 0/1 indicator from
+        #   arm_L vs arm_R PhysX OR sphere-proxy. is_absorbing 已 cache
+        #   _last_collision_mask. Peg-hole penetration 不属于这个 cost.
         # cost_signal='penetration': 连续 [0, 4mm] = peg 表面相对 hole 内壁的
-        #   physical overlap. 几何信号, 不依赖 PhysX contact. 适合 Lagrangian SAC.
+        #   physical overlap. 几何信号, 不依赖 PhysX contact.
+        # cost_signal='clearance': 双臂 sphere-proxy clearance margin cost.
+        #   cost=max((margin-min_clearance)/margin, 0), clamp 到 [0, 1].
+        #   比 binary collision 更适合 cost critic 学 "接近危险" 的梯度.
         if self._cost_signal == "penetration" and self._cached_penetration_max is not None:
             cost = self._cached_penetration_max.to(torch.float32)
+        elif self._cost_signal == "clearance" and self._last_min_clearance is not None:
+            cost = torch.clamp(
+                (self._clearance_cost_margin - self._last_min_clearance)
+                / self._clearance_cost_margin,
+                min=0.0,
+                max=1.0,
+            ).to(torch.float32)
         elif self._last_collision_mask is None:
             cost = torch.zeros(self._n_envs, dtype=torch.float32, device=self._device)
         else:
             cost = self._last_collision_mask.to(torch.float32)
+        if self._cost_scale != 1.0:
+            cost = cost * self._cost_scale
         info = {"cost": cost}
         if self._geom_stage is not None and self._cached_d is not None:
             geom_prepos, geom_preaxis, geom_insert, geom_success = (
@@ -1351,8 +1392,8 @@ class DualArmPegHoleEnv(IsaacSim):
         # 此处直接复用. 旧版有重复计算, 现去重.
         r_geom_progress = self._w_geom_progress * progress * alignment_gate
         # 可选 soft penalty (默认 0=关). 跟 gate 互补 — gate 让"穿模时拿不到 reward",
-        # penalty 让"穿模时被扣 reward". 推荐 SAC: gate + 小 penalty (10-20).
-        # Lagrangian SAC: gate + 0 penalty (用 cost 信号代替).
+        # penalty 让"穿模时被扣 reward". 推荐 SAC / robot-collision LagSAC:
+        # gate + penalty (10-20). 只有 cost_signal='penetration' 时才考虑清零.
         r_geom_penetration = -self._w_geom_penetration * penetration_max
         # Delta-progress (PBRS, codex 2026-05-11 v3):
         # phi(s) = clean_gate(s) × clamp((d - d_neg) / (d_pos - d_neg), 0, 1).

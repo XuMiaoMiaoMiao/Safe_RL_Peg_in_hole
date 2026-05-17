@@ -33,6 +33,8 @@ class DualArmPegHoleCostEnv(DualArmPegHoleEnv):
         rew_success=_DEFAULT_W_SUCCESS,
         rew_action=_DEFAULT_W_ACTION,
         rew_home=_DEFAULT_W_HOME,
+        keep_collision_reward_penalty=True,
+        drop_penetration_reward_for_cost=True,
         **parent_kwargs,
     ):
         """
@@ -43,6 +45,11 @@ class DualArmPegHoleCostEnv(DualArmPegHoleEnv):
             rew_success: 成功 per-step bonus.    默认 2.0
             rew_action:  动作 L2 正则系数.        默认 0.005
             rew_home:    Home 偏差正则系数.       默认 0.001 (均匀权重, tie-breaker 量级)
+            keep_collision_reward_penalty: cost_signal 为 collision / clearance 时,
+                在 CMDP reward 里仍保留 parent SAC 的 collision absorbing hard
+                penalty. 这让 λ≈0 的 LagSAC 退化成普通 SAC, 便于逐步加入约束.
+            drop_penetration_reward_for_cost: cost_signal=penetration 时是否清零
+                reward 中的 penetration soft penalty. 默认 True 保持旧行为.
             **parent_kwargs: 透传 DualArmPegHoleEnv. 几何、obs、reset、collision、
                 success mask 和 info 诊断全部由父类维护.
         """
@@ -61,6 +68,8 @@ class DualArmPegHoleCostEnv(DualArmPegHoleEnv):
         self._s2_w_success = float(rew_success)
         self._s2_w_action  = float(rew_action)
         self._s2_w_home    = float(rew_home)
+        self._keep_collision_reward_penalty = bool(keep_collision_reward_penalty)
+        self._drop_penetration_reward_for_cost = bool(drop_penetration_reward_for_cost)
         # CMDP 训练默认不把 hold-N success 做成 terminal cliff. 碰撞 / geom
         # success / penetration 等环境语义仍完全走父类。
         parent_kwargs.pop("terminal_hold_bonus", None)
@@ -81,21 +90,33 @@ class DualArmPegHoleCostEnv(DualArmPegHoleEnv):
         }
 
     # ------------------------------------------------------------------
-    # CMDP reward: reuse the SAC task reward but leave the selected hard safety
-    # signal to cost()/lambda. If penetration is the CMDP cost, drop the reward
-    # penetration component to avoid double pressure; if collision is the cost,
-    # keep penetration shaping in reward.
+    # CMDP reward: reuse the SAC task reward. If penetration is the CMDP cost,
+    # drop the reward penetration component to avoid double pressure. For
+    # collision/clearance cost, keep the parent SAC collision hard penalty by
+    # default, so λ≈0 is a true SAC sanity check instead of "SAC with no collision
+    # penalty but collision early-stop".
     # ------------------------------------------------------------------
     def reward(self, obs, action, next_obs, absorbing):
         if self._geom_stage is not None:
             components = self._compute_geom_reward_components(next_obs)
-            if self._cost_signal == "penetration":
+            if self._cost_signal == "penetration" and self._drop_penetration_reward_for_cost:
                 components["r_geom_penetration"] = torch.zeros_like(
                     components["r_geom_penetration"]
                 )
             r = sum(components.values())
         else:
             r = self._compute_normal_reward(next_obs)
+        if (
+            self._keep_collision_reward_penalty
+            and self._cost_signal in ("collision", "clearance")
+            and self._last_collision_mask is not None
+        ):
+            absorbing_r = self._r_min / (1.0 - self.info.gamma)
+            r = torch.where(
+                self._last_collision_mask,
+                torch.full_like(r, absorbing_r),
+                r,
+            )
         return self._reward_scale * r
 
     # ------------------------------------------------------------------
@@ -103,10 +124,24 @@ class DualArmPegHoleCostEnv(DualArmPegHoleEnv):
     # ------------------------------------------------------------------
     def cost(self):
         if self._cost_signal == "penetration" and self._cached_penetration_max is not None:
-            return self._cached_penetration_max.to(torch.float32)
-        if self._last_collision_mask is None:
-            return torch.zeros(self._n_envs, dtype=torch.float32, device=self._device)
-        return self._last_collision_mask.to(torch.float32)
+            c = self._cached_penetration_max.to(torch.float32)
+        elif self._cost_signal == "clearance" and self._last_min_clearance is not None:
+            c = torch.clamp(
+                (self._clearance_cost_margin - self._last_min_clearance)
+                / self._clearance_cost_margin,
+                min=0.0,
+                max=1.0,
+            ).to(torch.float32)
+        elif self._last_collision_mask is None:
+            c = torch.zeros(self._n_envs, dtype=torch.float32, device=self._device)
+        else:
+            c = self._last_collision_mask.to(torch.float32)
+        # cost_scale: multiplicative gain inherited from parent env. Applied
+        # here so the Lagrangian StepCostBridge sees the same scaled signal as
+        # info["cost"]. See parent env __init__ docstring.
+        if self._cost_scale != 1.0:
+            c = c * self._cost_scale
+        return c
 
     def _create_info_dictionary(self, obs):
         info = super()._create_info_dictionary(obs)

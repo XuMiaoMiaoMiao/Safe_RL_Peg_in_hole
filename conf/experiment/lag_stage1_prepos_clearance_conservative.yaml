@@ -1,0 +1,143 @@
+train_script: scripts/train_sac_lagrangian.py
+
+# Lagrangian SAC Stage 1g (prepos) — CLEARANCE-CONSTRAINT, CONSERVATIVE λ, clean CMDP
+#
+# 2026-05-17 教授反馈修正: 把 LagSAC cost 从 peg-hole penetration 改回双臂
+# clearance (真正的 safety constraint), 在 Stage 1 cold-start 做主对比.
+# Stage 1 SAC baseline 前 10 epoch 实测有 absorb_sphere: epoch 2=45, 8=11, 9=3,
+# 之后归零 — 正好是 LagSAC 应该展示"λ 推 cost 收敛"的窗口.
+#
+# 基于 lag_stage1_prepos_active_clearance05_lam1_hybrid.yaml, 改 6 行 (B: clean CMDP):
+#   keep_collision_reward_penalty: true  → false   (clean CMDP, collision 只走 cost)
+#   cost_limit_per_ep:              0.5  → 1.0     (有依据的标定, 见下方)
+#   lr_lambda:                      0.05 → 0.001   (防 clean Stage 3 见到的 λ 振荡)
+#   lambda_max:                    100.0 → 5.0     (低 ceiling 配合慢 lr)
+#   init_log_lambda:                1.0  → -2.3    (λ_init=0.10, 不是 2.7)
+#   gamma_cost:                     0.7  → 0.99    (与 env γ 对齐, 不要短视)
+#
+# cost_limit_per_ep=1.0 的标定依据:
+#   SAC Stage 1 前 10 epoch 共 59 sphere absorbs (epoch 2,8,9),
+#   absorb_rate = 59 / (10 × 16 envs × 100 horizon) ≈ 0.0037 per step.
+#   clearance margin=2cm 的 cost 比 absorb 频繁(更宽 buffer zone), 估约 0.005-0.015 per step.
+#   per-episode (200 step in horizon=100) cost ≈ 1-3.
+#   取 1.0 作 budget: 允许少量违例, 但远低于 SAC 早期峰值 → constraint 真的会激活但不立即压死 task.
+#
+# 任务 reward 完全沿用 SAC Stage 1 baseline (S1g_prepos_h100_full_ep_balanced_seed0):
+#   rew_geom_d=8.0, rew_geom_radial_tip=8.0, 其他 geom reward = 0.
+#   这是 fair comparison: task reward 同 SAC, 只在 LagSAC 里多一个 cost critic + λ.
+
+# Runtime / env count.
+num_envs: 16
+horizon: 100
+render: false
+seed: 0
+use_axis_resid_obs: true
+exclude_ee_from_physx_self_collision: false
+
+# Collection / update cadence.
+n_epochs: 120
+n_steps_per_epoch: 1600          # = horizon × num_envs = 100 × 16
+n_steps_per_fit: 16
+utd: null
+critic_warmup_transitions: null
+n_eval_episodes: 16
+
+# Optimizer / entropy (与 SAC Stage 1 baseline 一致).
+lr_actor: 7e-5
+lr_critic: 3e-4
+lr_alpha: 3e-4
+alpha_max: 0.15
+target_entropy: -7
+actor_grad_clip: null
+
+# Base env.
+initial_joint_noise: 0.1
+preinsert_success_pos_threshold: 0.10
+preinsert_offset: null
+
+# Geom Stage 1g (prepos) targets.
+geom_stage: prepos
+geom_d_target_neg: -0.08
+geom_d_target_pos: 0.03
+geom_d_target_ramp_start: 0
+geom_d_target_ramp_end: 20
+
+geom_d_sat: 0.30
+geom_radial_sat: 1.5
+
+geom_d_th: 0.030
+geom_r_tip_th: 0.030
+geom_r_max_th: 0.030
+geom_axis_th: 0.400
+geom_insert_d_ins: 0.025
+geom_insert_r_max_th: 0.025
+geom_pen_th: 0.001
+
+# ── Task reward (= SAC Stage 1 baseline) ─────────────────────────────────────
+rew_geom_d: 8.0
+rew_geom_radial_tip: 8.0
+rew_geom_radial_max: 0.0
+rew_geom_axis: 0.0
+rew_geom_progress: 0.0
+rew_geom_advance: 0.0
+
+geom_gate_radial_sigma: 0.025
+geom_gate_axis_sigma: 0.30
+geom_gate_penetration_sigma: null
+geom_d_gate_mode: "off"
+
+rew_geom_penetration: 0.0
+rew_geom_soft_success: 0.0
+geom_soft_d_sigma: 0.020
+geom_soft_radial_sigma: 0.015
+geom_soft_axis_sigma: 0.30
+geom_soft_penetration_sigma: null
+
+rew_geom_bad_entry: 0.0
+geom_bad_entry_radial_safe: 0.014
+geom_bad_entry_axis_safe: 0.10
+geom_bad_entry_pen_safe: 0.00075
+
+# ── CMDP cost (clean version B: collision/clearance 只通过 cost critic) ──────
+# clearance cost = clamp((margin - min_clearance) / margin, 0, 1), per step in [0, 1].
+# margin=2cm: 双臂 sphere-proxy 表面距离 < 2cm 就给 cost.
+cost_signal: clearance
+clearance_cost_margin: 0.02
+cost_scale: 1.0
+# ★ 关键差异 vs hybrid: collision 不再作为 reward cliff, 只走 cost constraint.
+keep_collision_reward_penalty: false
+
+# ── Lagrangian controller (CONSERVATIVE, 防振荡) ──────────────────────────────
+cost_limit_per_ep: 1.0
+lambda_update_mode: rollout_episode_rate
+min_lambda_update_episodes: 16
+lr_lambda: 0.001                 # ★ 慢 (hybrid 旧版 0.05 在 Stage 3 振荡)
+lambda_max: 5.0                  # ★ 低 ceiling (旧版 100)
+lambda_min: 0.0
+init_log_lambda: -2.3            # ★ λ_init = e^-2.3 ≈ 0.10 (旧版 2.7 太高)
+damp_scale: 0.0
+gamma_cost: 0.99                 # ★ 与 env γ 对齐 (旧版 0.7 太短视)
+
+# Regularization.
+rew_action: 0.005
+rew_home: 0.00075
+home_weights: "1,1,1,1,0.75,0.5,0.5"
+
+terminal_hold_bonus: 0.0
+hold_success_steps: 10
+
+# Sphere-proxy 双臂自碰撞 (hard absorbing guard, 独立于 cost signal).
+clearance_hard: 0.0
+proxy_arm_radius: 0.06
+proxy_ee_radius: 0.04
+
+# Cold-start (no warm-start, 同 SAC Stage 1 baseline).
+load_agent: null
+actor_only_warmstart: false
+keep_replay: false
+
+wandb_project: bimanual_peghole
+wandb_entity: safe_rl_2026_lund
+wandb_run_name: lag_S1g_prepos_clearance_conservative_seed0
+wandb_group: lag_s1_clearance_conservative_vs_sac_baseline
+no_wandb: false

@@ -21,6 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts._eval_utils import (
+    compute_cost_metrics,
     compute_geom_metrics,
     compute_hold_metrics,
     deterministic_policy,
@@ -123,7 +124,11 @@ def parse_args():
     p.add_argument("--rew_geom_penetration", type=float, default=None)
     p.add_argument("--geom_gate_penetration_sigma", type=float, default=None)
     p.add_argument("--cost_signal", type=str, default=None,
-                   choices=["collision", "penetration"])
+                   choices=["collision", "penetration", "clearance"])
+    p.add_argument("--clearance_cost_margin", type=float, default=None)
+    p.add_argument("--cost_scale", type=float, default=None,
+                   help="Multiplicative gain on info['cost']. Pass the same value used "
+                        "at training time so eval_ep_cost is comparable to wandb logs.")
     p.add_argument("--geom_progress_floor", type=float, default=None)
     p.add_argument("--rew_geom_advance", type=float, default=None)
     p.add_argument("--geom_d_gate_mode", type=str, default=None,
@@ -162,7 +167,8 @@ def main():
                 "geom_pen_th", "geom_soft_penetration_sigma",
                 "rew_geom_progress", "geom_gate_radial_sigma",
                 "geom_gate_axis_sigma",
-                "rew_geom_penetration", "geom_gate_penetration_sigma", "cost_signal",
+                "rew_geom_penetration", "geom_gate_penetration_sigma",
+                "cost_signal", "clearance_cost_margin", "cost_scale",
                 "geom_progress_floor", "rew_geom_advance",
                 "geom_d_gate_mode", "rew_geom_bad_entry",
                 "geom_bad_entry_radial_safe", "geom_bad_entry_axis_safe",
@@ -312,6 +318,17 @@ def main():
             f"clean_step_rate={mg['geom_clean_step_rate']:.3f}  "
             f"(在 active mask 内: mean={mg['geom_pen_in_active_mean']*1000:.2f}mm  "
             f"max={mg['geom_pen_in_active_max']*1000:.2f}mm)"
+        )
+
+    # CMDP cost diagnostics. Always print when info["cost"] is present (parent
+    # env writes it whenever cost_signal is set), so eval_sac can standalone-
+    # calibrate --cost_limit_per_ep for the Lagrangian training runs.
+    if "cost" in dataset.info.data:
+        cm = compute_cost_metrics(dataset, args.n_episodes)
+        print(
+            f"[cost] signal={mdp._cost_signal}  cost_scale={mdp._cost_scale:g}  "
+            f"cost_rate={cm['cost_rate']:.6f} (per step, post-scale)  "
+            f"cost_episode_sum_mean={cm['cost_episode_sum_mean']:.4f} (per episode, post-scale)"
         )
 
     mdp.stop()

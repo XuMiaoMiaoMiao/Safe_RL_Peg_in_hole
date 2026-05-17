@@ -1,0 +1,112 @@
+train_script: scripts/train_sac_lagrangian.py
+
+# Local tuned Lagrangian SAC Stage 3g (insert).
+#
+# This config should be run immediately after lag_stage2_preaxis_local_tuned.yaml
+# in the same local runner. It keeps the SAC v8 task recipe and uses LagSAC only
+# for robot collision safety; peg-hole penetration remains task reward.
+
+num_envs: 16
+horizon: 200
+render: false
+seed: 1
+use_axis_resid_obs: true
+exclude_ee_from_physx_self_collision: true
+
+n_epochs: 80
+n_steps_per_epoch: 3200          # = horizon x num_envs = 200 x 16
+n_steps_per_fit: 16
+utd: null
+critic_warmup_transitions: 30000
+n_eval_episodes: 16
+
+lr_actor: 1e-5
+lr_critic: 3e-4
+lr_alpha: 3e-4
+alpha_max: 0.015
+target_entropy: -7
+actor_grad_clip: 1.0
+
+initial_joint_noise: 0.1
+preinsert_success_pos_threshold: 0.10
+preinsert_offset: null
+
+geom_stage: insert
+geom_d_target_neg: -0.08
+geom_d_target_pos: 0.03
+geom_d_target_ramp_start: 0
+geom_d_target_ramp_end: 20
+geom_progress_floor: 0.0
+
+geom_d_sat: 0.30
+geom_radial_sat: 1.0
+
+geom_d_th: 0.020
+geom_r_tip_th: 0.015
+geom_r_max_th: 0.025
+geom_axis_th: 0.300
+geom_insert_d_ins: 0.025
+geom_insert_r_max_th: 0.025
+geom_pen_th: 0.001
+
+rew_geom_d: 1.0
+rew_geom_radial_tip: 0.0
+rew_geom_radial_max: 5.0
+rew_geom_axis: 1.0
+rew_geom_progress: 0.0
+rew_geom_advance: 25.0
+
+geom_gate_radial_sigma: 0.025
+geom_gate_axis_sigma: 0.30
+geom_gate_penetration_sigma: 0.005
+geom_d_gate_mode: "off"
+
+rew_geom_penetration: 20.0
+drop_penetration_reward_for_cost: false
+
+rew_geom_soft_success: 1.25
+geom_soft_d_sigma: 0.018
+geom_soft_radial_sigma: 0.009
+geom_soft_axis_sigma: 0.15
+geom_soft_penetration_sigma: 0.0025
+
+rew_geom_bad_entry: 0.30
+geom_bad_entry_radial_safe: 0.014
+geom_bad_entry_axis_safe: 0.10
+geom_bad_entry_pen_safe: 0.00075
+
+cost_signal: collision
+
+# Collision is a 0/1 robot-safety event cost; keep the Stage 2g q_cost scale.
+cost_limit_per_ep: 0.75
+lambda_update_mode: q_cost
+damp_scale: 1.0
+min_lambda_update_episodes: 16
+lr_lambda: 5e-3
+lambda_max: 20.0
+lambda_min: 0.0
+init_log_lambda: -2.3             # lambda_init ~= 0.10
+gamma_cost: 0.7
+
+rew_action: 0.005
+rew_home: 0.001
+home_weights: "1,1,1,1,0.75,0.5,0.5"
+
+terminal_hold_bonus: 0.0
+hold_success_steps: 10
+
+clearance_hard: 0.0
+proxy_arm_radius: 0.06
+proxy_ee_radius: 0.04
+
+# Fixed to the known-good Stage 2g checkpoint so a stage3-only rerun cannot
+# accidentally warm-start from the previous stage3 flat result.
+load_agent: results/checkpoints/saved/LagSAC_stage2g_preaxis_lag_qcost_keepcoll_s2_wandb_20260513/best_hold_lag.msh
+actor_only_warmstart: true
+keep_replay: false
+
+wandb_project: bimanual_peghole
+wandb_entity: miaoxu010522-lund
+wandb_run_name: lag_S3g_insert_robotcost_from_stage2_seed1
+wandb_group: lag_geom_stage3_insert_robotcost_local
+no_wandb: false

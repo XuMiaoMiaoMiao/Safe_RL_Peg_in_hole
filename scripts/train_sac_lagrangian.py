@@ -359,7 +359,7 @@ def parse_args():
                    help="cost MDP 折扣. 默认 = env γ. 设 1.0 = average-cost "
                         "(注意此时 cost_limit_per_ep 直接是 Q_C 量纲).")
     p.add_argument("--lambda_update_mode", type=str, default="rollout_episode_rate",
-                   choices=("recent_cost_rate", "episode_rate", "rollout_episode_rate"),
+                   choices=("recent_cost_rate", "episode_rate", "rollout_episode_rate", "q_cost"),
                    help="λ 更新信号来源. "
                         "rollout_episode_rate (推荐): cost_limit_per_ep = 每集平均 cost sum; "
                         "使用当前 policy rollout 中完成的真实 episode cost 统计, "
@@ -368,7 +368,11 @@ def parse_args():
                         "episode_rate (eval-based, 有滞后): cost_limit_per_ep = 每集平均 cost sum; "
                         "λ 只在 eval 后用 eval_ep_cost 更新. "
                         "recent_cost_rate: fit() 中仅用当前 rollout 采样块的 "
-                        "per-step mean(cost), 保留作消融; 不读 replay.")
+                        "per-step mean(cost), 保留作消融; 不读 replay. "
+                        "q_cost: 用 replay batch 的 Q_C(s,a) 更新 λ, cost_limit_per_ep "
+                        "会按 horizon/gamma_cost 换算到 Q_C 量纲.")
+    p.add_argument("--damp_scale", type=float, default=0.0,
+                   help="q_cost 模式的 λ 阻尼强度. 0=关闭.")
     p.add_argument("--min_lambda_update_episodes", type=int, default=None,
                    help="rollout_episode_rate 模式: 触发 λ 更新所需的最少 episode 数. "
                         "默认自动取 num_envs (一个完整 env 轮次). 若一个 epoch 内完成的 "
@@ -474,11 +478,24 @@ def parse_args():
     p.add_argument("--rew_geom_penetration", type=float, default=None,
                    help="soft penetration penalty -w·penetration_max. "
                         "cost_signal=collision 时保留在 reward 里; "
-                        "cost_signal=penetration 时 CMDP reward 会清零该组件, 避免双重施压.")
+                        "cost_signal=penetration 时可用 "
+                        "--drop_penetration_reward_for_cost 清零该组件.")
     p.add_argument("--geom_gate_penetration_sigma", type=float, default=None)
     p.add_argument("--cost_signal", type=str, default=None,
-                   choices=("collision", "penetration"),
-                   help="CMDP cost 信号: collision=0/1; penetration=连续 penetration_max.")
+                   choices=("collision", "penetration", "clearance"),
+                   help="CMDP cost 信号: collision=机器人碰撞0/1; penetration=连续 penetration_max; "
+                        "clearance=双臂 proxy clearance margin cost.")
+    p.add_argument("--clearance_cost_margin", type=float, default=None)
+    p.add_argument("--cost_scale", type=float, default=None,
+                   help="Multiplicative gain on info['cost'] / env.cost(). "
+                        "Default None = env default (1.0). For cost_signal=penetration "
+                        "use 1000 (m→mm) or 1/geom_pen_th to make cost dimensionless, "
+                        "otherwise λ·Q_C is 5 orders of magnitude below Q_R and the "
+                        "Lagrangian gradient cannot move the policy.")
+    p.add_argument("--keep_collision_reward_penalty",
+                   action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--drop_penetration_reward_for_cost",
+                   action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--geom_progress_floor", type=float, default=None)
     p.add_argument("--rew_geom_advance", type=float, default=None)
     p.add_argument("--geom_d_gate_mode", type=str, default=None,
@@ -560,6 +577,8 @@ def main():
         "initial_joint_noise", "preinsert_success_pos_threshold",
         "preinsert_offset", "success_axis_threshold",
         "clearance_hard", "proxy_arm_radius", "proxy_ee_radius",
+        "clearance_cost_margin", "cost_scale", "keep_collision_reward_penalty",
+        "drop_penetration_reward_for_cost",
         # Geometric preinsert kwargs:
         "geom_stage", "geom_d_target_neg", "geom_d_target_pos",
         "geom_d_target_ramp_start", "geom_d_target_ramp_end",
@@ -642,6 +661,7 @@ def main():
             gamma_cost=args.gamma_cost,
             lambda_update_mode=args.lambda_update_mode,
             actor_grad_clip=args.actor_grad_clip,
+            damp_scale=args.damp_scale,
         )
 
     if args.load_agent is not None:
@@ -725,6 +745,8 @@ def main():
     best_J_path_flat = results_dir / "best_agent_lag.msh"
     best_hold_path_flat = results_dir / "best_hold_lag.msh"
     final_path_flat = results_dir / "final_agent_lag.msh"
+    if best_hold_path_flat.is_file():
+        best_hold_path_flat.unlink()
     logger = Logger("SACLagrangian", results_dir=str(results_dir))
     logger.strong_line()
     logger.info(f"checkpoint 目录: {ckpt_dir}")
@@ -777,7 +799,14 @@ def main():
             f"w_bad_entry={mdp._w_geom_bad_entry:.2f}  "
             f"w_penetration={mdp._w_geom_penetration:.2f}  "
             "r_geom_penetration="
-            + ("0 (cost_signal=penetration)" if mdp._cost_signal == "penetration" else "kept")
+            + (
+                "0"
+                if (
+                    mdp._cost_signal == "penetration"
+                    and getattr(mdp, "_drop_penetration_reward_for_cost", False)
+                )
+                else "kept"
+            )
         )
         logger.info(
             f"geom thresholds: d_th={mdp._geom_d_th:.3f}  "
@@ -798,12 +827,17 @@ def main():
     grad_clip_str = f"{args.actor_grad_clip:.2f}" if args.actor_grad_clip else "off"
     logger.info(f"[Lagrangian] cost_limit_per_ep={args.cost_limit_per_ep:.4f}  "
                 f"cost_signal={mdp._cost_signal}  "
+                f"cost_scale={mdp._cost_scale:g}  "
                 f"lr_lambda={args.lr_lambda:.1e}  "
                 f"lambda_max={args.lambda_max:.1f}  lambda_min={args.lambda_min:.4f}  "
                 f"init_log_lambda={args.init_log_lambda:.3f}  "
                 f"gamma_cost={gamma_cost_resolved:.3f}  "
                 f"lambda_update_mode={args.lambda_update_mode}  "
+                f"damp_scale={args.damp_scale:.3f}  "
                 f"actor_grad_clip={grad_clip_str}")
+    if args.lambda_update_mode == "q_cost":
+        logger.info(f"[q_cost] q_cost_limit={agent._q_cost_limit:.6f} "
+                    f"(from cost_limit_per_ep={args.cost_limit_per_ep:.6f})")
     if args.lambda_update_mode == "rollout_episode_rate":
         logger.info(
             f"[rollout_episode_rate] EpisodeCostTracker 已启用  "
@@ -856,12 +890,36 @@ def main():
                     "target_entropy_resolved": target_entropy,
                     "gamma_cost_resolved": gamma_cost_resolved,
                     "cost_signal_resolved": mdp._cost_signal,
+                    "cost_scale_resolved": mdp._cost_scale,
                     "geom_stage_resolved": mdp._geom_stage,
                     "obs_dim": obs_dim, "act_dim": act_dim,
                     "horizon": mdp.info.horizon, "gamma": mdp.info.gamma},
             dir=str(results_dir),
         )
         logger.info(f"wandb run: {wandb_run.url}")
+
+        # Dashboard cleanup: hide noisy/debug metrics by default, set proper
+        # summary aggregation on key paper metrics. Future runs auto-organize.
+        # See WANDB_DASHBOARD.md for recommended workspace setup.
+        wandb.define_metric("epoch")
+        wandb.define_metric("*", step_metric="epoch")
+        for pat in ("legacy_eval_*", "warmstart_*", "geom_raw_epoch",
+                    "geom_actor_epoch", "geom_d_target_eff", "env_steps",
+                    "eval_ep_len", "geom_n_ep_with_entry", "alpha"):
+            wandb.define_metric(pat, hidden=True)
+        # Best/peak metrics: keep MAX summary (track peak across epochs).
+        for m in ("best_J", "best_score", "best_geom_rate",
+                  "best_geom_max_run_mean", "best_hold_rate",
+                  "best_hold_max_hold_mean"):
+            wandb.define_metric(m, summary="max")
+        # Last-value summary on dynamic metrics (the LAST epoch value, not max).
+        for m in ("lambda", "log_lambda", "rollout_ep_cost", "eval_ep_cost",
+                  "rollout_ep_violation", "eval_ep_violation", "rollout_ep_n",
+                  "final_lambda"):
+            wandb.define_metric(m, summary="last")
+        # Last epoch safety counters (lower is better, but final state matters).
+        for m in ("epoch_absorb", "eval_step_cost"):
+            wandb.define_metric(m, summary="last")
 
     empty_dataset = Dataset.generate(mdp.info, agent.info, n_steps=1, n_envs=args.num_envs)
 
@@ -1228,6 +1286,8 @@ def main():
                 # Lagrangian safety
                 "lambda": lambda_val,
                 "log_lambda": float(agent._log_lambda.item()),
+                "lambda_update_source": getattr(
+                    agent, "_lambda_update_source", "unknown"),
                 # rollout signal (on-policy, stochastic): drives λ update
                 "rollout_ep_cost": rollout_ep_cost,
                 "rollout_ep_violation": rollout_ep_violation,

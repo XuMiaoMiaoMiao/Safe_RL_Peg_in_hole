@@ -37,7 +37,7 @@ lr_critic: 3e-4
 lr_alpha: 3e-4
 alpha_max: 0.15
 target_entropy: -7               # ≈ -act_dim/2 for 14-DoF cold start
-actor_grad_clip: 1.0             # Lagrangian SAC actor 梯度裁剪 (λ 大时防爆)
+actor_grad_clip: null            # ★ DIAG: 关掉, 跟 SAC Stage 1 对齐 (cold-start 不能 clip)
 
 # Base env.
 initial_joint_noise: 0.1
@@ -104,14 +104,16 @@ geom_bad_entry_pen_safe: 0.00075
 cost_signal: collision
 
 # Lagrangian safety hyperparameters.
-# cost_limit_per_ep: 每集平均碰撞次数预算. 建议用 SAC baseline eval 实测 eval_ep_cost 后取 0.5× 标定.
+# DIAGNOSTIC RUN (2026-05-15): 冻结 λ 在最小值, 关掉所有 Lagrangian transient 压力.
+# 目的: 验证 LagSAC trainer 在 cost 稀疏时能否 graceful 退化为 SAC.
 cost_limit_per_ep: 0.10
 lambda_update_mode: rollout_episode_rate  # 用完整 rollout episode cost 更新 λ
 min_lambda_update_episodes: 16            # 至少累积一轮并行 episode 再更新
-lr_lambda: 5e-2                           # λ 学习率; 比 lr_actor 高 500× 允许快速收紧
+lr_lambda: 0.0                            # ★ 冻结 λ, 不让冷 cost critic 噪声推动它
 lambda_max: 100.0
-lambda_min: 0.05
-init_log_lambda: 1.6                      # λ_init = exp(1.6) ≈ 5.0
+lambda_min: 0.0                           # ★ 允许 log_λ clamp 到 -10
+init_log_lambda: -10                      # ★ λ_init ≈ 4.5e-5, 等价于关 Lagrangian
+damp_scale: 0.0                           # ★ 关掉 damp (Stage 1 默认 0, 显式写出)
 gamma_cost: 0.7                           # cost critic 折扣; 低值让约束更短视、收紧更快
 
 # Regularization.
@@ -136,6 +138,6 @@ keep_replay: false
 
 wandb_project: bimanual_peghole
 wandb_entity: safe_rl_2026_lund
-wandb_run_name: lag_S1g_prepos_seed0
-wandb_group: lag_geom_stage1_prepos
+wandb_run_name: lag_S1g_prepos_frozen_lambda_diag_20260515_seed0
+wandb_group: lag_geom_diag_frozen_lambda_20260515
 no_wandb: false

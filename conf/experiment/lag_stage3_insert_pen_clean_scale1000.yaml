@@ -1,0 +1,150 @@
+train_script: scripts/train_sac_lagrangian.py
+
+# Lagrangian SAC Stage 3g (insert) — CLEAN PENETRATION-COST ABLATION
+#
+# 这是 2026-05-17 设计的 paper-grade clean ablation, 用于验证教授描述的
+# "LagSAC 碰撞/穿模先 peak 后收敛" dynamics.
+#
+# 区别于 lag_stage3_insert.yaml (frozen-λ 诊断配置) 的关键点:
+#   1. cost_signal: penetration       (不是 collision/clearance — 真实物理违例)
+#   2. cost_scale:   1000             (m → mm, 否则 λ·Q_C 比 Q_R 小 5 个量级, gradient 不够)
+#   3. drop_penetration_reward_for_cost (剥离 reward 里的 -20·pen, 让 cost critic 独占)
+#   4. no-keep_collision_reward_penalty (剥离 reward 里的 collision 大负罚)
+#   5. rew_geom_bad_entry: 0.0        (剥离显式 task-ordering, λ 信号不被 reward 淹没)
+#   6. lambda_update_mode: rollout_episode_rate
+#   7. lr_lambda 真实 (0.05, 不是 0)
+#   8. warm-start: SAC v8 Stage 2g (不是旧 LagSAC ckpt — 起点同源公平对比)
+#
+# Invariants (README): n_steps_per_epoch = horizon × num_envs = 3200,
+#                      exclude_ee_from_physx_self_collision=True, seed=1.
+#
+# 标定流程: 跑 Step 1 (SAC v8 eval with --cost_signal penetration --cost_scale 1000),
+#           读 cost_episode_sum_mean, 取 ×0.5 填入下方 cost_limit_per_ep.
+#           当前占位值 10.0 是基于 SAC v8 中期典型 ~0.1mm × 200 step ≈ 20 mm·step
+#           的 ×0.5 估计, 实测后请覆盖.
+
+# Runtime / env count.
+num_envs: 16
+horizon: 200
+render: false
+seed: 1
+use_axis_resid_obs: true
+exclude_ee_from_physx_self_collision: true
+
+# Collection / update cadence.
+n_epochs: 80
+n_steps_per_epoch: 3200          # = horizon × num_envs = 200 × 16
+n_steps_per_fit: 16
+utd: null
+critic_warmup_transitions: 30000
+n_eval_episodes: 16
+
+# SAC v8 verified insert recipe.
+lr_actor: 1e-5
+lr_critic: 3e-4
+lr_alpha: 3e-4
+alpha_max: 0.015
+target_entropy: -7
+actor_grad_clip: 1.0
+
+# Base env.
+initial_joint_noise: 0.1
+preinsert_success_pos_threshold: 0.10
+preinsert_offset: null           # auto = abs(geom_d_target_neg) = 0.08
+
+# Geom Stage 3g.
+geom_stage: insert
+geom_d_target_neg: -0.08
+geom_d_target_pos: 0.03
+geom_d_target_ramp_start: 0
+geom_d_target_ramp_end: 20
+geom_progress_floor: 0.0
+
+geom_d_sat: 0.30
+geom_radial_sat: 1.0
+
+# 成功判断阈值.
+geom_d_th: 0.020
+geom_r_tip_th: 0.015
+geom_r_max_th: 0.025
+geom_axis_th: 0.300
+geom_insert_d_ins: 0.025
+geom_insert_r_max_th: 0.025
+geom_pen_th: 0.001               # 1mm — 同时作为 insert_mask 项 + cost reference
+
+# Reward weights — Stage 3g insert (SAC v8 reward MINUS penetration / bad_entry).
+rew_geom_d: 1.0
+rew_geom_radial_tip: 0.0
+rew_geom_radial_max: 5.0
+rew_geom_axis: 1.0
+rew_geom_progress: 0.0
+rew_geom_advance: 25.0           # PBRS, 仍是主推进信号
+
+# alignment_gate (含 penetration 子项 — gate 不是罚, 仅截断 advance 在穿模时给奖)
+geom_gate_radial_sigma: 0.025
+geom_gate_axis_sigma: 0.30
+geom_gate_penetration_sigma: 0.005
+geom_d_gate_mode: "off"
+
+# Penetration: 走 cost critic, 不走 reward critic.
+rew_geom_penetration: 20.0       # ★ 配 drop_penetration_reward_for_cost=true → 实际清零
+drop_penetration_reward_for_cost: true
+
+# Soft success dwell well (保留 — 它不是 penetration penalty 的副本).
+rew_geom_soft_success: 1.25
+geom_soft_d_sigma: 0.018
+geom_soft_radial_sigma: 0.009
+geom_soft_axis_sigma: 0.15
+geom_soft_penetration_sigma: 0.0025
+
+# ★ Bad-entry 关闭 — 让 LagSAC cost critic 独占 task-ordering 信号
+rew_geom_bad_entry: 0.0
+geom_bad_entry_radial_safe: 0.014
+geom_bad_entry_axis_safe: 0.10
+geom_bad_entry_pen_safe: 0.00075
+
+# ── CMDP cost configuration ──────────────────────────────────────────────────
+cost_signal: penetration         # ★ 真实物理违例信号
+cost_scale: 1000                 # ★ m → mm, 必要否则 λ·Q_C 太小
+keep_collision_reward_penalty: false   # ★ 关掉 reward 里的 collision 大负罚
+
+# Lagrangian safety hyperparameters.
+cost_limit_per_ep: 33.6449       # = 0.5 × SAC v8 eval cost_episode_sum_mean 67.2898 (mm·step/episode)
+lambda_update_mode: rollout_episode_rate
+damp_scale: 0.0
+min_lambda_update_episodes: 16
+lr_lambda: 0.05
+lambda_max: 50.0
+lambda_min: 0.001                # 防 λ 衰减到 0 让机制完全休眠
+init_log_lambda: -2.3            # λ_init = e^-2.3 ≈ 0.10
+gamma_cost: 0.99                 # ★ 与 env γ 对齐, 不要用 0.7 (太短视)
+
+# Regularization.
+rew_action: 0.005
+rew_home: 0.001
+home_weights: "1,1,1,1,0.75,0.5,0.5"
+
+# Hold-N 仅作 eval; 不 terminate.
+terminal_hold_bonus: 0.0
+hold_success_steps: 10
+
+# Sphere-proxy 双臂自碰撞 (independent safety check, 不参与 cost).
+clearance_hard: 0.0
+proxy_arm_radius: 0.06
+proxy_ee_radius: 0.04
+
+# Warm-start: SAC v8 Stage 2g best_hold (与 SAC v8 同源, 公平对比).
+load_agent: results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00/best_hold.msh
+actor_only_warmstart: true
+keep_replay: false
+
+wandb_project: bimanual_peghole
+wandb_entity: miaoxu010522-lund
+wandb_run_name: lag_S3g_pen_clean_scale1000_seed1
+wandb_group: lag_pen_clean_compare
+no_wandb: false
+
+# Note (2026-05-17): train_hydra.py 此前有 silent bug — BooleanOptionalAction args
+# (keep_collision_reward_penalty, drop_penetration_reward_for_cost) 的 `false` 不会
+# 翻译成 --no-{key}, 默认 True 会 stick. 已修复 (scripts/train_hydra.py
+# BOOLEAN_OPTIONAL_ARGS 白名单), 现在 yaml-native true/false 可以直接生效.

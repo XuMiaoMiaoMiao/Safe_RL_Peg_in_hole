@@ -4,8 +4,7 @@ train_script: scripts/train_sac_lagrangian.py
 #
 # 目标: peg 真正进入 hole (d > geom_insert_d_ins = 2.5cm), radial_max + penetration 达标.
 # reward 与 SAC v8 (5-channel) 一致: advance + dwell + linear radial/axis.
-# 关键差异: rew_geom_penetration=0 (不在 reward 里罚), penetration 改为 CMDP cost.
-# rew_geom_bad_entry=0: bad_entry 的 task ordering 由 λ·Q_C 隐式提供.
+# 约束边界: LagSAC cost 只管机器人安全碰撞; peg-hole penetration 留在 task reward.
 #
 # Invariants (README):
 #   1. n_steps_per_epoch = horizon × num_envs = 200 × 16 = 3200
@@ -34,7 +33,7 @@ lr_critic: 3e-4
 lr_alpha: 3e-4
 alpha_max: 0.015
 target_entropy: -7
-actor_grad_clip: 1.0             # Lagrangian SAC actor 梯度裁剪 (λ 大时防爆)
+actor_grad_clip: null            # ★ DIAG: 关掉, 跟 SAC Stage 3 v8 对齐
 
 # Base env.
 initial_joint_noise: 0.1
@@ -45,7 +44,7 @@ preinsert_offset: null           # auto-synced to abs(geom_d_target_neg) = 0.08
 # 三阶段分工:
 #   Stage 1g prepos  : rew_geom_d + rew_geom_radial_tip
 #   Stage 2g preaxis : + rew_geom_radial_max + rew_geom_axis + soft_success dwell
-#   Stage 3g insert  : + rew_geom_advance (PBRS) + bad_entry; penetration → cost (本配置)
+#   Stage 3g insert  : + rew_geom_advance (PBRS) + penetration + bad_entry
 
 geom_stage: insert
 geom_d_target_neg: -0.08
@@ -80,8 +79,9 @@ geom_gate_axis_sigma: 0.30
 geom_gate_penetration_sigma: 0.005  # penetration 也进 gate, 避免穿模时拿 advance 奖励
 geom_d_gate_mode: "off"
 
-# 穿模软惩罚关闭: penetration 改为 CMDP cost (cost_signal=penetration).
-rew_geom_penetration: 0.0
+# Peg-hole penetration 是插入质量项, 不作为 LagSAC 约束; 与 SAC v8 reward 对齐.
+rew_geom_penetration: 20.0
+drop_penetration_reward_for_cost: false
 
 # Soft success dwell well (4-项 Gaussian, 含 penetration).
 rew_geom_soft_success: 1.25
@@ -90,27 +90,27 @@ geom_soft_radial_sigma: 0.009
 geom_soft_axis_sigma: 0.15
 geom_soft_penetration_sigma: 0.0025  # dwell well 同样要求无穿模
 
-# Bad-entry task-ordering 惩罚关闭: λ·Q_C 隐式提供 ordering.
-rew_geom_bad_entry: 0.0
+# Bad-entry 是 task ordering, 不纯是安全项; 先保留 SAC v8 shaping.
+rew_geom_bad_entry: 0.30
 geom_bad_entry_radial_safe: 0.014
 geom_bad_entry_axis_safe: 0.10
 geom_bad_entry_pen_safe: 0.00075
 
-# Cost signal: penetration 连续量作为 CMDP cost (替代 SAC v8 的 rew_geom_penetration).
-# cost_signal=penetration → info["cost"] = penetration_max (米, clamp 到 4mm).
-cost_signal: penetration
+# Cost signal: robot collision only. Peg-hole penetration stays in reward.
+cost_signal: collision
 
 # Lagrangian safety hyperparameters.
-# cost_limit_per_ep: episode 内 penetration_max 累积量 (米·步).
-# 建议标定: 用 Stage 2g eval 跑 eval_ep_cost 后取 0.5× 作为初始预算.
-cost_limit_per_ep: 0.002
-lambda_update_mode: rollout_episode_rate  # 用完整 rollout episode cost 更新 λ
+# DIAGNOSTIC RUN (2026-05-15): 冻结 λ 在最小值, 关掉所有 Lagrangian transient 压力.
+# 目的: 验证 LagSAC trainer 在 cost 稀疏时能否 graceful 退化为 SAC.
+cost_limit_per_ep: 0.75
+lambda_update_mode: q_cost
+damp_scale: 0.0                           # ★ 关掉 damp 噪声注入 actor
 min_lambda_update_episodes: 16            # 至少累积一轮并行 episode 再更新
-lr_lambda: 5.0                            # penetration cost 量级小, λ 学习率适当偏高
-lambda_max: 300.0                         # penetration cost 单位小, λ 需要更大范围
-lambda_min: 0.05
-init_log_lambda: 1.0                      # λ_init = exp(1) ≈ 2.7
-gamma_cost: null                          # cost critic 复用 env 默认折扣 γ=0.99
+lr_lambda: 0.0                            # ★ 冻结 λ
+lambda_max: 20.0
+lambda_min: 0.0
+init_log_lambda: -10                      # ★ λ_init ≈ 4.5e-5
+gamma_cost: 0.7
 
 # Regularization.
 rew_action: 0.005
@@ -133,6 +133,6 @@ keep_replay: false
 
 wandb_project: bimanual_peghole
 wandb_entity: safe_rl_2026_lund
-wandb_run_name: lag_S3g_insert_from_stage2_seed1
-wandb_group: lag_geom_stage3_insert
+wandb_run_name: lag_S3g_insert_frozen_lambda_diag_20260515_seed1
+wandb_group: lag_geom_diag_frozen_lambda_20260515
 no_wandb: false

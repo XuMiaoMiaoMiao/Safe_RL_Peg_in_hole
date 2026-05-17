@@ -168,7 +168,7 @@ class SACLagrangian(SAC):
                  lambda_max=100.0, lambda_min=0.0, init_log_lambda=0.0,
                  cost_critic_params=None, gamma_cost=None,
                  lambda_update_mode="rollout_episode_rate",
-                 actor_grad_clip=None,
+                 actor_grad_clip=None, damp_scale=0.0,
                  use_log_alpha_loss=False, log_std_min=-20, log_std_max=2,
                  target_entropy=None, critic_fit_params=None):
         """
@@ -195,17 +195,26 @@ class SACLagrangian(SAC):
                     update_lambda_from_episode_statistics(). 使用 deterministic policy
                     的 eval 数据, 与训练 policy 存在一个 epoch 的滞后.
                 "recent_cost_rate": 仅用最新 env batch per-step rate, 在 fit() 中更新.
+                "q_cost": d-atacom 风格; 用 replay batch 的 Q_C(s,a) 更新 λ,
+                    并把 cost_limit 从每集预算换算到 Q_C 量纲.
             actor_grad_clip (float, None): actor 梯度 L2 norm 上限. None = 不裁剪.
                 warmstart 后 critic warmup 结束时第一次 actor 更新容易梯度爆炸, 建议 1.0.
+            damp_scale (float): q_cost 模式下的惩罚阻尼系数. 0 = 关闭.
             其余参数同 SAC.
         """
         valid_lambda_modes = (
-            "recent_cost_rate", "episode_rate", "rollout_episode_rate",
+            "recent_cost_rate", "episode_rate", "rollout_episode_rate", "q_cost",
         )
         if lambda_update_mode not in valid_lambda_modes:
             raise ValueError(
-                "lambda_update_mode 必须是 'recent_cost_rate', 'episode_rate' 或 "
-                f"'rollout_episode_rate', 当前 {lambda_update_mode!r}"
+                "lambda_update_mode 必须是 'recent_cost_rate', 'episode_rate', "
+                f"'rollout_episode_rate' 或 'q_cost', 当前 {lambda_update_mode!r}"
+            )
+        if not (float(lambda_max) > 0.0):
+            raise ValueError(f"lambda_max must be > 0, got {lambda_max}")
+        if float(lambda_min) < 0.0 or float(lambda_min) > float(lambda_max):
+            raise ValueError(
+                f"lambda_min must be in [0, lambda_max], got {lambda_min}"
             )
 
         super().__init__(
@@ -245,10 +254,18 @@ class SACLagrangian(SAC):
             c_params['n_models'] = 2
             c_target_params['n_models'] = 2
 
+        # Save/restore RNG around cost critic init: xavier_uniform_ on 8 networks
+        # would consume ~24 RNG ops, shifting the actor's rsample() sequence vs
+        # pure SAC. Cold-start is sensitive to this offset.
+        _torch_rng = torch.get_rng_state()
+        _cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         self._cost_critic_approximator = Regressor(TorchApproximator, **c_params)
         self._target_cost_critic_approximator = Regressor(TorchApproximator, **c_target_params)
         self._init_target(self._cost_critic_approximator,
                           self._target_cost_critic_approximator)
+        torch.set_rng_state(_torch_rng)
+        if _cuda_rng is not None:
+            torch.cuda.set_rng_state_all(_cuda_rng)
 
         self._log_lambda = torch.tensor(float(init_log_lambda),
                                         dtype=torch.float32, requires_grad=True)
@@ -261,6 +278,7 @@ class SACLagrangian(SAC):
         self._lambda_max = float(lambda_max)
         self._lambda_min = float(lambda_min)
         self._lambda_update_mode = str(lambda_update_mode)
+        self._damp_scale = float(damp_scale)
         self._rollout_ep_cost = float("nan")       # mean(episode_cost_sums) from rollout
         self._rollout_ep_violation = float("nan")  # rollout_ep_cost - cost_limit
         self._lambda_update_source = "none"
@@ -269,6 +287,7 @@ class SACLagrangian(SAC):
             self._gamma_cost = float(mdp_info.gamma)
         else:
             self._gamma_cost = float(gamma_cost)
+        self._q_cost_limit = self._episode_cost_limit_to_q_limit(self._cost_limit)
 
         self._add_save_attr(
             _cost_critic_approximator='mushroom',
@@ -279,6 +298,8 @@ class SACLagrangian(SAC):
             _lambda_max='primitive',
             _lambda_min='primitive',
             _lambda_update_mode='primitive',
+            _damp_scale='primitive',
+            _q_cost_limit='primitive',
             _rollout_ep_cost='primitive',
             _rollout_ep_violation='primitive',
             _lambda_update_source='primitive',
@@ -306,24 +327,35 @@ class SACLagrangian(SAC):
         # episode_rate / rollout_episode_rate are updated externally from
         # complete episode statistics.
         if self._replay_memory.size > self._warmup_transitions():
+            current_qc = None
+            if self._lambda_update_mode == "q_cost":
+                current_qc = self._cost_q(s, a).detach()
             a_new, log_prob = self.policy.compute_action_and_log_prob_t(s)
             loss = self._loss(s, a_new, log_prob)
             self._optimize_actor_parameters(loss)
             self._update_alpha(log_prob.detach())
-            # episode_rate / rollout_episode_rate update λ externally from
-            # complete episodes. recent_cost_rate is the only fit-time λ update
-            # path and uses the current rollout chunk, never replay samples.
             if self._lambda_update_mode == "recent_cost_rate":
                 self._update_lambda_from_recent_batch(recent_cost_rate)
+            elif self._lambda_update_mode == "q_cost":
+                self._update_lambda_from_q_cost(current_qc)
 
-        # reward critic: 同 SAC.
-        q_next = self._next_q(sp, absorb)
+        # Share one next-state policy sample between reward and cost critic Bellman
+        # targets. Same rsample() count as SAC; both targets evaluated on the same
+        # a ~ π(·|s'), which is also mathematically more consistent.
+        a_next, log_prob_next = self.policy.compute_action_and_log_prob(sp)
+
+        # reward critic (含 entropy 项)
+        q_next = self._target_critic_approximator.predict(
+            sp, a_next, prediction='min') - self._alpha * log_prob_next
+        q_next *= 1 - absorb.to(int)
         q_target = r + self.mdp_info.gamma * q_next
         self._critic_approximator.fit(s, a, q_target, **self._critic_fit_params)
         self._update_target(self._critic_approximator, self._target_critic_approximator)
 
-        # cost critic: 普通 Bellman, 不带 entropy 项.
-        qc_next = self._next_qc(sp, absorb)
+        # cost critic (无 entropy, 共享 a_next)
+        qc_next = self._target_cost_critic_approximator.predict(
+            sp, a_next, prediction='max')
+        qc_next *= 1 - absorb.to(int)
         qc_target = c + self._gamma_cost * qc_next
         self._cost_critic_approximator.fit(s, a, qc_target, **self._critic_fit_params)
         self._update_target(self._cost_critic_approximator,
@@ -334,18 +366,34 @@ class SACLagrangian(SAC):
             self._critic_approximator(state, action_new, idx=0),
             self._critic_approximator(state, action_new, idx=1),
         )
-        q_c = torch.max(
-            self._cost_critic_approximator(state, action_new, idx=0),
-            self._cost_critic_approximator(state, action_new, idx=1),
-        )
-        lam = self._log_lambda.exp().detach()
+        # When λ is at its floor and damp is off, skip q_c to keep actor loss
+        # strictly == SAC. Otherwise cold cost critic's gradient through
+        # action_new perturbs the actor even when λ ≈ 0.
+        if self._damp_scale <= 0.0 and self._log_lambda.item() <= -9.9:
+            return (self._alpha * log_prob - q_r).mean()
+        q_c = self._cost_q(state, action_new)
+        lam = self._effective_lambda(q_c).detach()
         return (self._alpha * log_prob - q_r + lam * q_c).mean()
 
-    def _next_qc(self, next_state, absorbing):
-        a, _ = self.policy.compute_action_and_log_prob(next_state)
-        qc = self._target_cost_critic_approximator.predict(next_state, a, prediction='max')
-        qc *= 1 - absorbing.to(int)
-        return qc
+    def _cost_q(self, state, action):
+        return torch.max(
+            self._cost_critic_approximator(state, action, idx=0),
+            self._cost_critic_approximator(state, action, idx=1),
+        )
+
+    def _effective_lambda(self, q_c):
+        lam = self._log_lambda.exp()
+        if self._damp_scale > 0.0:
+            margin = self._q_cost_limit - q_c.detach().mean()
+            lam = torch.clamp(lam - self._damp_scale * margin, min=0.0)
+        return lam
+
+    def _episode_cost_limit_to_q_limit(self, limit):
+        horizon = max(float(getattr(self.mdp_info, "horizon", 1) or 1), 1.0)
+        if abs(self._gamma_cost - 1.0) < 1e-8:
+            return float(limit)
+        factor = (1.0 - self._gamma_cost ** horizon) / (1.0 - self._gamma_cost)
+        return float(limit) * factor / horizon
 
     @staticmethod
     def _scalar_to_float(value):
@@ -391,6 +439,15 @@ class SACLagrangian(SAC):
             selected_cost_rate,
             violation,
             source="recent_rollout_per_step",
+        )
+
+    def _update_lambda_from_q_cost(self, current_qc):
+        selected_cost = current_qc.mean()
+        violation = selected_cost - self._q_cost_limit
+        return self._apply_lambda_violation(
+            selected_cost,
+            violation,
+            source="q_cost",
         )
 
     def update_lambda_from_episode_statistics(
@@ -502,6 +559,12 @@ class SACLagrangian(SAC):
         super()._post_load()
         if not hasattr(self, "_lambda_update_mode"):
             self._lambda_update_mode = "rollout_episode_rate"
+        if not hasattr(self, "_gamma_cost"):
+            self._gamma_cost = float(self.mdp_info.gamma)
+        if not hasattr(self, "_damp_scale"):
+            self._damp_scale = 0.0
+        if not hasattr(self, "_q_cost_limit"):
+            self._q_cost_limit = self._episode_cost_limit_to_q_limit(self._cost_limit)
         # Backward compatibility only: old checkpoints may carry fit-time λ
         # modes that read replay data. Normalize them to the current on-policy
         # episode mode on load; no implementation remains for these modes.
