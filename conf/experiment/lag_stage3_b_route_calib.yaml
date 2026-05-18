@@ -1,0 +1,145 @@
+train_script: scripts/train_sac_lagrangian.py
+
+# LagSAC Stage 3g (insert) — B route calibration (50ep)
+#
+# 目的: 首次测试 B route 架构 (sphere=cost, PhysX=guard, clearance signal) 在
+# Stage 3 insert 任务下是否收敛. 之前所有 Stage 3 LagSAC 尝试都失败 (penetration cost,
+# hybrid keepshape, clean ablation).
+#
+# 设计: 完全 mirror sac_stage3_insert.yaml v8 reward + Stage 1 B route Lagrangian.
+#   - Reward = 5-channel v8 baseline (same as SAC stage 3)
+#   - Cost = D-ATACOM clearance (margin=0.02, no clip), cost_scale=1.0
+#   - cost_limit_per_ep = 100 (proportional scale from Stage 1's 50, horizon 200 vs 100)
+#   - lr_lambda 同 Stage 1 B route v4 verified
+#
+# 校准目标 (50 ep 内观察):
+#   1. λ 不应立即 clip 到 lambda_max (≥30 ep 后才接近) → cost_limit 合理
+#   2. rollout_ep_cost 应 monotone 下降 (但允许前 10ep 上升)
+#   3. best_geom_rate (insert) ≥ 0.1 by ep 50 (sanity: 没完全卡死)
+#
+# Calibration 不是 final run, n_epochs=50; production 应 ≥80.
+
+# Runtime / env count.
+num_envs: 16
+horizon: 200
+render: false
+seed: 1
+use_axis_resid_obs: true
+exclude_ee_from_physx_self_collision: true   # ⚠️ 必须 true (peg 进入 hole)
+
+# SAC collection / update cadence (same as SAC stage 3 baseline).
+n_epochs: 100
+n_steps_per_epoch: 3200          # = horizon × num_envs = 200 × 16
+n_steps_per_fit: 16
+utd: null
+critic_warmup_transitions: 30000
+n_eval_episodes: 16
+
+# Optimizer / entropy (fine-tuning from Stage 2g).
+lr_actor: 1e-5
+lr_critic: 3e-4
+lr_alpha: 3e-4
+alpha_max: 0.015
+target_entropy: -7
+
+# Base env.
+initial_joint_noise: 0.1
+preinsert_success_pos_threshold: 0.10
+preinsert_offset: null
+
+# Geom Stage 3g reward design (= SAC v8 5-channel, identical to sac_stage3_insert.yaml).
+geom_stage: insert
+geom_d_target_neg: -0.08
+geom_d_target_pos: 0.03
+geom_d_target_ramp_start: 0
+geom_d_target_ramp_end: 20
+geom_progress_floor: 0.0
+
+geom_d_sat: 0.30
+geom_radial_sat: 1.0
+
+geom_d_th: 0.020
+geom_r_tip_th: 0.015
+geom_r_max_th: 0.025
+geom_axis_th: 0.300
+geom_insert_d_ins: 0.025
+geom_insert_r_max_th: 0.025
+geom_pen_th: 0.001
+
+# Reward weights — Stage 3g insert v8.
+rew_geom_d: 1.0
+rew_geom_radial_tip: 0.0
+rew_geom_radial_max: 5.0
+rew_geom_axis: 1.0
+rew_geom_progress: 0.0
+rew_geom_advance: 25.0
+
+geom_gate_radial_sigma: 0.025
+geom_gate_axis_sigma: 0.30
+geom_gate_penetration_sigma: 0.005
+geom_d_gate_mode: "off"
+
+rew_geom_penetration: 20.0       # 任务正确性信号 (peg/hole 穿模), 与 cost 分离
+rew_geom_soft_success: 1.25
+geom_soft_d_sigma: 0.018
+geom_soft_radial_sigma: 0.009
+geom_soft_axis_sigma: 0.15
+geom_soft_penetration_sigma: 0.0025
+
+rew_geom_bad_entry: 0.30
+geom_bad_entry_radial_safe: 0.014
+geom_bad_entry_axis_safe: 0.10
+geom_bad_entry_pen_safe: 0.00075
+
+# ── CMDP cost (B route: sphere=cost, PhysX=guard) ────────────────────────────
+cost_signal: clearance
+clearance_cost_margin: 0.02
+clearance_cost_clip_max: null
+cost_scale: 1.0
+
+sphere_collision_terminates: false
+physx_collision_terminates: true
+keep_collision_reward_penalty: true
+enable_physx_arm_collision: true
+enable_table_collision: true
+table_collision_terminates: true
+table_z: 0.0
+table_clearance_hard: 0.0
+table_clearance_cost_margin: 0.03
+
+# Lagrangian controller — proportional scale from Stage 1 B route v4.
+# Stage 1 cost_limit=50 / horizon=100 = 0.5 violation rate per step.
+# Stage 3 horizon=200: scale to cost_limit=100 keeps same per-step tolerance.
+cost_limit_per_ep: 100.0
+lambda_update_mode: rollout_episode_rate
+min_lambda_update_episodes: 16
+lr_lambda: 0.005
+lambda_max: 20.0
+lambda_min: 0.0
+init_log_lambda: 0.0
+damp_scale: 0.0
+gamma_cost: 0.7
+
+# Regularization.
+rew_action: 0.005
+rew_home: 0.001
+home_weights: "1,1,1,1,0.75,0.5,0.5"
+
+terminal_hold_bonus: 0.0
+hold_success_steps: 10
+
+# Sphere-proxy 双臂自碰撞.
+clearance_hard: 0.0
+proxy_arm_radius: 0.06
+proxy_ee_radius: 0.04
+
+# Warm-start: Stage 2g best_hold actor-only (= SAC stage 3 baseline).
+load_agent: results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00/best_hold.msh
+actor_only_warmstart: true
+keep_replay: false
+
+wandb_project: bimanual_peghole
+wandb_entity: miaoxu010522-lund
+wandb_run_name: lag_S3g_b_route_calib_cost100_lr0p005_100ep_seed1
+wandb_group: lag_s3_b_route_calibration
+no_wandb: false

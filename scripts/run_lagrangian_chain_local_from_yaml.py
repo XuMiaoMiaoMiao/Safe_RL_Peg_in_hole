@@ -26,6 +26,11 @@ RESERVED_KEYS = {"train_script", "extra_args"}
 NEGATABLE_BOOL_KEYS = {
     "keep_collision_reward_penalty",
     "drop_penetration_reward_for_cost",
+    "sphere_collision_terminates",
+    "physx_collision_terminates",
+    "enable_physx_arm_collision",
+    "enable_table_collision",
+    "table_collision_terminates",
 }
 DEFAULT_STAGES = (
     ("stage1g_prepos", "conf/experiment/lag_stage1_prepos.yaml"),
@@ -119,11 +124,24 @@ def _copy_if_exists(src: Path, dst_dir: Path) -> None:
 def _snapshot_outputs(
     stage_name: str,
     tag: str,
+    cfg: DictConfig,
     cfg_path: Path,
     command: list[str],
     stage_start_time: float,
 ) -> Path:
-    best_hold = PROJECT_ROOT / "results" / "best_hold_lag.msh"
+    train_script = str(cfg.get("train_script", ""))
+    if train_script.endswith("train_sac.py"):
+        prefix = "SAC"
+        best_hold_name = "best_hold.msh"
+        best_agent_name = "best_agent.msh"
+        final_agent_name = "final_agent.msh"
+    else:
+        prefix = "LagSAC"
+        best_hold_name = "best_hold_lag.msh"
+        best_agent_name = "best_agent_lag.msh"
+        final_agent_name = "final_agent_lag.msh"
+
+    best_hold = PROJECT_ROOT / "results" / best_hold_name
     if not best_hold.is_file():
         raise FileNotFoundError(
             f"{stage_name} finished without {best_hold}. "
@@ -136,11 +154,11 @@ def _snapshot_outputs(
             "did not reach the best-hold criterion. Stop the chain and inspect "
             "the training log instead of warm-starting the next stage from it."
         )
-    out_dir = PROJECT_ROOT / "results" / "checkpoints" / "saved" / f"LagSAC_{stage_name}_{tag}"
+    out_dir = PROJECT_ROOT / "results" / "checkpoints" / "saved" / f"{prefix}_{stage_name}_{tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    _copy_if_exists(PROJECT_ROOT / "results" / "best_hold_lag.msh", out_dir)
-    _copy_if_exists(PROJECT_ROOT / "results" / "best_agent_lag.msh", out_dir)
-    _copy_if_exists(PROJECT_ROOT / "results" / "final_agent_lag.msh", out_dir)
+    _copy_if_exists(PROJECT_ROOT / "results" / best_hold_name, out_dir)
+    _copy_if_exists(PROJECT_ROOT / "results" / best_agent_name, out_dir)
+    _copy_if_exists(PROJECT_ROOT / "results" / final_agent_name, out_dir)
     shutil.copy2(cfg_path, out_dir / cfg_path.name)
     (out_dir / "command.txt").write_text(shlex.join(command) + "\n", encoding="utf-8")
     return out_dir
@@ -209,6 +227,15 @@ def main() -> None:
         action="store_true",
         help="Disable W&B by passing --no_wandb to train_sac_lagrangian.py.",
     )
+    parser.add_argument(
+        "--skip_snapshot",
+        action="store_true",
+        help=(
+            "Run the selected YAML without requiring/copying best_hold*.msh at "
+            "the end. Useful for short calibration runs where W&B/logs are the "
+            "main output."
+        ),
+    )
     parser.add_argument("--dry_run", action="store_true")
     args = parser.parse_args()
 
@@ -239,7 +266,10 @@ def main() -> None:
             continue
         stage_start_time = time.time()
         subprocess.run(cmd, cwd=str(PROJECT_ROOT), check=True)
-        out_dir = _snapshot_outputs(stage_name, args.tag, cfg_path, cmd, stage_start_time)
+        if args.skip_snapshot:
+            print("[local-lag-chain] skip_snapshot=true; not copying checkpoint files")
+            continue
+        out_dir = _snapshot_outputs(stage_name, args.tag, cfg, cfg_path, cmd, stage_start_time)
         print(f"[local-lag-chain] saved checkpoint snapshot: {out_dir}")
 
 

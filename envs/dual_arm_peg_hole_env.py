@@ -100,6 +100,34 @@ HOME_JOINT_POS = (
 )
 assert len(HOME_JOINT_POS) == 14, "HOME_JOINT_POS 必须 14 维 (左 7 + 右 7)"
 
+# 2026-05-18 harder pose variant for SAC vs LagSAC benchmark.
+# Goal: keep the shoulder / upper-arm silhouette close to HOME_JOINT_POS, but
+# make the distal forearms pass near the midline.  Strictly keeping A1-A4 fixed
+# cannot move the forearm enough: A5-A7 mostly change wrist/EE orientation.  This
+# variant therefore keeps A1/A3 close to default and uses the smallest useful
+# A2/A4 change to lower + fold the forearm, with A5/A6 doing the inward turn.
+# It avoids the high chest-arch pose and avoids reset-time contact.
+#
+# URDF FK check (rounded):
+#   link_4 y: left=-0.47, right=+0.48  (still wide; not collapsed at chest)
+#   link_6 y: left=-0.11, right=+0.19
+#   link_7 y: left=-0.09, right=+0.09
+#   EE y:     left=-0.09, right=+0.09
+#   distal z ~= 0.10-0.33m
+#   forearm sphere-proxy clearance ~= +9cm (positive, but still harder)
+HOME_JOINT_POS_HARDER = (
+    # left arm   A1     A2     A3      A4     A5   A6    A7
+    -2.450,  -0.820, -0.150,  1.470, -2.55, -0.90,  0.010,
+    # right arm - mirror (A1, A3, A5, A7 sign-flipped)
+    +2.450,  -0.820, +0.150,  1.470, +2.55, -0.90, -0.010,
+)
+assert len(HOME_JOINT_POS_HARDER) == 14, "HOME_JOINT_POS_HARDER 必须 14 维"
+
+POSE_VARIANTS = {
+    "easy": HOME_JOINT_POS,
+    "harder": HOME_JOINT_POS_HARDER,
+}
+
 LEFT_ARM_LINKS = [f"/left_arm_link_{i}" for i in range(1, 8)]
 RIGHT_ARM_LINKS = [f"/right_arm_link_{i}" for i in range(1, 8)]
 
@@ -261,6 +289,42 @@ class DualArmPegHoleEnv(IsaacSim):
         clearance_hard=0.0,
         proxy_arm_radius=ARM_PROXY_RADIUS,
         proxy_ee_radius=EE_PROXY_RADIUS,
+        # 2026-05-18 default_pose_variant: 'easy' (default, backward compat) or
+        # 'harder' (crossed-forearm reset pose; distal forearm/EE segment
+        # crosses the midline). Used for SAC vs LagSAC difficulty-spectrum
+        # benchmark.
+        default_pose_variant="easy",
+        # ── 2026-05-17 split absorbing / collision sources ──────────────────
+        # Decouple "sphere proxy violation" from "PhysX real contact" as two
+        # independent termination sources. Defaults preserve historical
+        # behaviour: any collision (sphere OR PhysX) terminates episode.
+        #
+        # B route (D-ATACOM style): sphere_collision_terminates=False,
+        # physx_collision_terminates=True. Sphere overlap becomes a continuous
+        # cost signal only; PhysX real contact stays as termination guard.
+        sphere_collision_terminates=True,
+        physx_collision_terminates=True,
+        # 2026-05-17: Apply PhysX CollisionAPI to iiwa arm links at runtime.
+        # The robot USD has no CollisionAPI on arm links, so PhysX arm-arm
+        # contact normally never triggers (epoch_absorb_physx == 0). Enabling
+        # this monkey-patches CollisionHelper.prepare_env to add invisible
+        # capsule colliders sized from the URDF, so arm_L vs arm_R PhysX
+        # collision actually fires. See envs/_arm_collision_setup.py.
+        # Default False = no change to existing trained checkpoints.
+        enable_physx_arm_collision=False,
+        # Debug visualization only: render the runtime capsule proxies used for
+        # PhysX arm-arm contact. Default False keeps training visuals unchanged.
+        debug_show_physx_arm_collision=False,
+        # 2026-05-18 table safety: geometry-plane clearance for arm/EE proxies.
+        # This is intentionally independent of PhysX table contact because the
+        # table prim lives outside the robot articulation and its USD path/contact
+        # API setup is less stable than the arm-arm contact groups. When enabled,
+        # min_table_clearance = proxy_center_z - proxy_radius - table_z.
+        enable_table_collision=False,
+        table_collision_terminates=True,
+        table_z=0.0,
+        table_clearance_hard=0.0,
+        table_clearance_cost_margin=0.03,
         # Stage 3 里 peg/hole 有真实 collider, 且挂在左右 EE link 下。若继续把
         # EE link 放进 PhysX self-collision group, 正常 peg-hole 接触会被 arm_L
         # vs arm_R hard absorbing 误杀。打开此开关后, PhysX self-collision 只看
@@ -347,6 +411,13 @@ class DualArmPegHoleEnv(IsaacSim):
         geom_gate_penetration_sigma=None,
         cost_signal="collision",
         clearance_cost_margin=0.02,
+        # D-ATACOM-style clearance cost:
+        #   g(s) = (margin - min_clearance) / margin
+        #   cost = max(g(s), 0)
+        # Default None keeps the positive constraint violation unbounded, so
+        # deeper interpenetration is more costly than just touching. Set to 1.0
+        # to reproduce the old clipped [0, 1] clearance cost.
+        clearance_cost_clip_max=None,
         # ─── cost_scale (2026-05-17): multiplicative gain applied to the cost
         # tensor written to info["cost"]. Pure unit conversion / scale, does NOT
         # change semantics. Motivation: penetration cost is in meters and lives
@@ -461,6 +532,54 @@ class DualArmPegHoleEnv(IsaacSim):
         self._exclude_ee_from_physx_self_collision = bool(
             exclude_ee_from_physx_self_collision
         )
+        # Split absorbing sources (2026-05-17).
+        self._sphere_collision_terminates = bool(sphere_collision_terminates)
+        self._physx_collision_terminates = bool(physx_collision_terminates)
+        self._enable_physx_arm_collision = bool(enable_physx_arm_collision)
+        self._debug_show_physx_arm_collision = bool(debug_show_physx_arm_collision)
+        self._enable_table_collision = bool(enable_table_collision)
+        self._table_collision_terminates = bool(table_collision_terminates)
+        self._table_z = float(table_z)
+        if not math.isfinite(self._table_z):
+            raise ValueError(f"table_z must be finite, got {table_z}")
+        self._table_clearance_hard = float(table_clearance_hard)
+        if not math.isfinite(self._table_clearance_hard):
+            raise ValueError(
+                f"table_clearance_hard must be finite, got {table_clearance_hard}"
+            )
+        self._table_clearance_cost_margin = float(table_clearance_cost_margin)
+        if not (math.isfinite(self._table_clearance_cost_margin)
+                and self._table_clearance_cost_margin > 0.0):
+            raise ValueError(
+                "table_clearance_cost_margin must be finite and > 0, "
+                f"got {table_clearance_cost_margin}"
+            )
+        # 2026-05-18 default pose variant (easy vs harder for SAC vs LagSAC bench)
+        self._default_pose_variant = str(default_pose_variant)
+        if self._default_pose_variant not in POSE_VARIANTS:
+            raise ValueError(
+                f"default_pose_variant must be one of {list(POSE_VARIANTS)}, "
+                f"got {default_pose_variant!r}"
+            )
+        # When PhysX arm collision is enabled, install monkey-patch BEFORE
+        # super().__init__() so CollisionHelper.prepare_env picks it up during
+        # the first world.reset() inside mushroom IsaacSim init.
+        # We snapshot the apply counter NOW (before install) so the post-init
+        # assertion below can verify a fresh apply happened for THIS env
+        # specifically — not just "some earlier env in this process applied".
+        if self._enable_physx_arm_collision:
+            from envs._arm_collision_setup import install_collision_helper_patch
+            from mushroom_rl.utils.isaac_sim.collision_helper import CollisionHelper
+            # Snapshot "successful patch fire" counter (not capsule count) so
+            # we can detect "patch never fired for THIS env" even when an
+            # earlier env in same process already created the prims.
+            self._physx_arm_fire_count_before = getattr(
+                CollisionHelper, "_dual_arm_collider_fire_count", 0
+            )
+            install_collision_helper_patch(
+                LEFT_ARM_LINKS + RIGHT_ARM_LINKS,
+                visible=self._debug_show_physx_arm_collision,
+            )
         # Geometric preinsert 设置必须先于 obs dim 决定:
         # geom_stage 启用时隐含 use_axis_resid_obs=True, obs = AXIS_RESID 34 + 7 维几何 = 41 维.
         if geom_stage is None or geom_stage == "":
@@ -559,6 +678,18 @@ class DualArmPegHoleEnv(IsaacSim):
             raise ValueError(
                 "clearance_cost_margin must be finite and > 0, "
                 f"got {self._clearance_cost_margin}"
+            )
+        if clearance_cost_clip_max is None:
+            self._clearance_cost_clip_max = None
+        else:
+            clip_max = float(clearance_cost_clip_max)
+            self._clearance_cost_clip_max = None if math.isinf(clip_max) else clip_max
+        if (self._clearance_cost_clip_max is not None
+                and not (math.isfinite(self._clearance_cost_clip_max)
+                         and self._clearance_cost_clip_max > 0.0)):
+            raise ValueError(
+                "clearance_cost_clip_max must be None/inf or finite and > 0, "
+                f"got {clearance_cost_clip_max}"
             )
         self._cost_scale = float(cost_scale)
         if not (math.isfinite(self._cost_scale) and self._cost_scale > 0.0):
@@ -710,6 +841,9 @@ class DualArmPegHoleEnv(IsaacSim):
         # is_absorbing 与 reward 在同一 next_obs 上背靠背调用, 缓存避免重复计算.
         # _create_observation 每步会刷新这些 cache.
         self._last_collision_mask = None
+        self._last_sphere_collision_mask = None
+        self._last_physx_collision_mask = None
+        self._last_table_collision_mask = None
         self._last_pos_err = None
         self._last_axis_err = None
         self._last_success_mask = None
@@ -717,6 +851,7 @@ class DualArmPegHoleEnv(IsaacSim):
         # sphere-proxy clearance: is_absorbing 里每步算并 cache,
         # _last_min_clearance < clearance_hard 即触发 hard absorbing.
         self._last_min_clearance = None
+        self._last_min_table_clearance = None
         # _preprocess_action → reward 链路里缓存 pre-scale 的 raw action,
         # 用于 L2 惩罚. 这样 w_action 和 action_scale 解耦.
         self._last_raw_action = None
@@ -767,13 +902,51 @@ class DualArmPegHoleEnv(IsaacSim):
             camera_target=(5, 0, 0.5),
         )
 
+        # Post super().__init__() assertion: if enable_physx_arm_collision=True,
+        # the patched prepare_env MUST have fired AND applied capsule colliders
+        # specifically during THIS env's construction. We check the per-env
+        # delta against the snapshot taken before install, so a multi-env
+        # process can't get a false-positive from an earlier env's apply.
+        if self._enable_physx_arm_collision:
+            from mushroom_rl.utils.isaac_sim.collision_helper import CollisionHelper
+            after = getattr(CollisionHelper, "_dual_arm_collider_fire_count", 0)
+            before = getattr(self, "_physx_arm_fire_count_before", 0)
+            delta = after - before
+            if delta <= 0:
+                raise RuntimeError(
+                    "[DualArmPegHoleEnv] enable_physx_arm_collision=True but "
+                    f"prepare_env did not fire for this env (fire_count "
+                    f"before={before}, after={after}). Mushroom init order "
+                    "changed? Patch not wired up? Check that "
+                    "install_collision_helper_patch was called BEFORE "
+                    "super().__init__() and that "
+                    "CollisionHelper._dual_arm_collider_active was > 0 when "
+                    "prepare_env fired."
+                )
+            print(
+                f"[DualArmPegHoleEnv] verified PhysX arm collision patch "
+                f"fired {delta} time(s) this env (total fires in process: {after})",
+                flush=True,
+            )
+
         # 关节位限 + 默认位
         limits = self._task.get_joint_pos_limits()
         self._joint_lower, self._joint_upper = limits[0], limits[1]
         # 不用 USD 自带的 zero pose, 改用 HOME_JOINT_POS (胸前 ready), 避免 reset
         # center 落在 zero 全展开姿态, Stage 1 早期探索浪费在无效扇区.
+        #
+        # 2026-05-18: default_pose_variant 选 'easy' (向后兼容, 跟所有现有 ckpt
+        # 一致) 或 'harder' (crossed-forearm reset pose, distal forearm/EE
+        # segment crosses the midline). 'harder' 用于 SAC vs LagSAC 难度对比
+        # benchmark.
+        pose_variant = getattr(self, "_default_pose_variant", "easy")
+        if pose_variant not in POSE_VARIANTS:
+            raise ValueError(
+                f"default_pose_variant must be one of {list(POSE_VARIANTS)}, "
+                f"got {pose_variant!r}"
+            )
         self._default_joint_pos = torch.tensor(
-            HOME_JOINT_POS, device=device, dtype=self._joint_lower.dtype
+            POSE_VARIANTS[pose_variant], device=device, dtype=self._joint_lower.dtype
         )
         self._home_weights = torch.tensor(
             self._home_weights_values, device=device, dtype=self._joint_lower.dtype
@@ -804,14 +977,23 @@ class DualArmPegHoleEnv(IsaacSim):
         self._cj = cj
         self._robots = robots
 
-        # 累计自碰撞终止次数 (train_sac 每 epoch 读取并差分).
-        # _absorb_count       — 总数 (任一信号触发, 反映 episode 终止次数)
-        # _absorb_count_physx — PhysX 力检测触发数
-        # _absorb_count_sphere— sphere-proxy clearance 触发数
-        # PhysX 与 sphere 可同步触发, 所以 physx + sphere ≥ total.
+        # 2026-05-17: collision events vs episode-terminating collisions are
+        # tracked separately so we can use sphere collision as a continuous
+        # cost signal (no termination) while still seeing how often it fires.
+        #
+        # _collision_count_*  — every collision event detected, regardless of
+        #                       whether it caused episode termination.
+        # _absorb_count_*     — collisions that actually terminated the episode
+        #                       (filtered by sphere/physx_collision_terminates).
+        # PhysX / arm-arm sphere / table 可同步触发, 所以 source sums ≥ total.
+        self._collision_count = 0
+        self._collision_count_physx = 0
+        self._collision_count_sphere = 0
+        self._collision_count_table = 0
         self._absorb_count = 0
         self._absorb_count_physx = 0
         self._absorb_count_sphere = 0
+        self._absorb_count_table = 0
 
         # hold-N 计数器 (per env)
         self._consecutive_inthresh = torch.zeros(
@@ -1101,18 +1283,69 @@ class DualArmPegHoleEnv(IsaacSim):
                                                 dt=self._timestep)
         # sphere-proxy 兜底: 双臂 sphere proxy 的最小 clearance 跌破 clearance_hard
         # 也算 collision. clearance_hard=-inf 时此项恒 False, 退化为纯 PhysX.
-        min_clearance, _ = self._compute_min_clearance()
+        min_clearance, clearance_info = self._compute_min_clearance()
         self._last_min_clearance = min_clearance
         if math.isfinite(self._clearance_hard):
             sphere_collision = min_clearance < self._clearance_hard
         else:
             sphere_collision = torch.zeros_like(physx_collision)
-        collision = physx_collision | sphere_collision
-        # 两个 bucket 可同时触发 (一步同时撞), 分别累加便于诊断哪个信号在主导;
-        # _absorb_count 仍按 OR 后的 collision 累加 (= 实际 absorb 次数).
-        self._absorb_count_physx += int(physx_collision.sum().item())
-        self._absorb_count_sphere += int(sphere_collision.sum().item())
-        self._absorb_count += int(collision.sum().item())
+        if self._enable_table_collision:
+            min_table_clearance, _ = self._compute_min_table_clearance_from_proxies(
+                clearance_info["left_proxies"], clearance_info["right_proxies"]
+            )
+            table_collision = min_table_clearance < self._table_clearance_hard
+        else:
+            min_table_clearance = torch.full_like(
+                min_clearance, float("inf"), dtype=torch.float32
+            )
+            table_collision = torch.zeros_like(physx_collision)
+        self._last_min_table_clearance = min_table_clearance
+        collision = physx_collision | sphere_collision | table_collision
+        # Per-source event counters (every collision detected, independent of
+        # whether it terminates the episode). Used for monitoring / paper plots.
+        physx_n = int(physx_collision.sum().item())
+        sphere_n = int(sphere_collision.sum().item())
+        table_n = int(table_collision.sum().item())
+        collision_n = int(collision.sum().item())
+        self._collision_count_physx += physx_n
+        self._collision_count_sphere += sphere_n
+        self._collision_count_table += table_n
+        self._collision_count += collision_n
+        # Per-source termination counters (only events that actually terminated
+        # the episode, filtered by the _collision_terminates flags below).
+        # When sphere_collision_terminates=False these stay at 0 even if
+        # sphere collisions fire frequently.
+        if self._sphere_collision_terminates:
+            self._absorb_count_sphere += sphere_n
+        if self._physx_collision_terminates:
+            self._absorb_count_physx += physx_n
+        if self._enable_table_collision and self._table_collision_terminates:
+            self._absorb_count_table += table_n
+        # _absorb_count = events that triggered absorbing
+        # under current settings — matches what the env will actually return.
+        sphere_term_mask = (
+            sphere_collision if self._sphere_collision_terminates
+            else torch.zeros_like(sphere_collision)
+        )
+        physx_term_mask = (
+            physx_collision if self._physx_collision_terminates
+            else torch.zeros_like(physx_collision)
+        )
+        table_term_mask = (
+            table_collision
+            if (self._enable_table_collision and self._table_collision_terminates)
+            else torch.zeros_like(table_collision)
+        )
+        collision_done = sphere_term_mask | physx_term_mask | table_term_mask
+        self._absorb_count += int(collision_done.sum().item())
+        # Cache both raw masks separately + the legacy combined mask.
+        # Legacy `_last_collision_mask` is preserved for backward compat
+        # (some callers like CostEnv's reward cliff read it). Downstream
+        # code that wants the PhysX-only mask (e.g. cliff only on real
+        # contact) should use `_last_physx_collision_mask`.
+        self._last_sphere_collision_mask = sphere_collision
+        self._last_physx_collision_mask = physx_collision
+        self._last_table_collision_mask = table_collision
         self._last_collision_mask = collision
 
         # _create_observation 已 cache pos_vec / axis_err; 在这里只 compose success.
@@ -1144,7 +1377,32 @@ class DualArmPegHoleEnv(IsaacSim):
             hold_done = torch.zeros_like(collision)
         self._last_hold_done_mask = hold_done
 
-        return collision | hold_done
+        return collision_done | hold_done
+
+    def _compute_clearance_cost_signal(self):
+        """D-ATACOM-style positive clearance constraint violation.
+
+        The base term is arm-arm sphere-proxy clearance.  When table safety is
+        enabled, include arm/EE-vs-table clearance as a second constraint and
+        use the worst normalized violation per step.  This keeps the single
+        CMDP cost scale close to the existing clearance signal while ensuring
+        policies also learn to stay above the table.
+        """
+        cost = torch.clamp(
+            (self._clearance_cost_margin - self._last_min_clearance)
+            / self._clearance_cost_margin,
+            min=0.0,
+        )
+        if self._enable_table_collision and self._last_min_table_clearance is not None:
+            table_cost = torch.clamp(
+                (self._table_clearance_cost_margin - self._last_min_table_clearance)
+                / self._table_clearance_cost_margin,
+                min=0.0,
+            )
+            cost = torch.maximum(cost, table_cost)
+        if self._clearance_cost_clip_max is not None:
+            cost = torch.clamp(cost, max=self._clearance_cost_clip_max)
+        return cost.to(torch.float32)
 
     def _create_info_dictionary(self, obs):
         # cost = constraint cost signal for Lagrangian SAC.
@@ -1153,18 +1411,13 @@ class DualArmPegHoleEnv(IsaacSim):
         #   _last_collision_mask. Peg-hole penetration 不属于这个 cost.
         # cost_signal='penetration': 连续 [0, 4mm] = peg 表面相对 hole 内壁的
         #   physical overlap. 几何信号, 不依赖 PhysX contact.
-        # cost_signal='clearance': 双臂 sphere-proxy clearance margin cost.
-        #   cost=max((margin-min_clearance)/margin, 0), clamp 到 [0, 1].
-        #   比 binary collision 更适合 cost critic 学 "接近危险" 的梯度.
+        # cost_signal='clearance': 双臂 sphere-proxy clearance margin cost;
+        #   if table safety is enabled, also includes the worst normalized
+        #   arm/EE-vs-table clearance violation.
         if self._cost_signal == "penetration" and self._cached_penetration_max is not None:
             cost = self._cached_penetration_max.to(torch.float32)
         elif self._cost_signal == "clearance" and self._last_min_clearance is not None:
-            cost = torch.clamp(
-                (self._clearance_cost_margin - self._last_min_clearance)
-                / self._clearance_cost_margin,
-                min=0.0,
-                max=1.0,
-            ).to(torch.float32)
+            cost = self._compute_clearance_cost_signal()
         elif self._last_collision_mask is None:
             cost = torch.zeros(self._n_envs, dtype=torch.float32, device=self._device)
         else:
@@ -1172,6 +1425,10 @@ class DualArmPegHoleEnv(IsaacSim):
         if self._cost_scale != 1.0:
             cost = cost * self._cost_scale
         info = {"cost": cost}
+        if self._last_min_clearance is not None:
+            info["min_arm_clearance"] = self._last_min_clearance.to(torch.float32)
+        if self._last_min_table_clearance is not None:
+            info["min_table_clearance"] = self._last_min_table_clearance.to(torch.float32)
         if self._geom_stage is not None and self._cached_d is not None:
             geom_prepos, geom_preaxis, geom_insert, geom_success = (
                 self._compute_geom_success_masks()
@@ -1479,9 +1736,27 @@ class DualArmPegHoleEnv(IsaacSim):
             normal = self._compute_normal_reward(next_obs)
         # 三路选择: collision (硬 absorbing) > hold-N (软 absorbing) > normal
         # geom hold-N 默认关 (terminal_hold_bonus=0), 等价 normal 路径.
+        #
+        # 2026-05-17 B route cliff split: 与 DualArmPegHoleCostEnv.reward 同步.
+        # 当 sphere_collision_terminates=False (sphere 是 cost-only 信号, 不 terminate)
+        # 时, cliff 不能对 sphere collision 触发 — 否则 reward 里偷偷塞 sphere
+        # safety penalty, 跟"sphere 只走 cost"的设计矛盾。此时 cliff 只对 PhysX
+        # 真接触 (它仍然 terminate) 触发。
+        # 当 sphere_collision_terminates=True (旧默认) 时, cliff 行为不变 (任何
+        # collision 都触发), 跟所有历史 ckpt 兼容。
+        if (
+            not getattr(self, "_sphere_collision_terminates", True)
+            and getattr(self, "_last_physx_collision_mask", None) is not None
+        ):
+            cliff_mask = self._last_physx_collision_mask
+            table_mask = getattr(self, "_last_table_collision_mask", None)
+            if table_mask is not None:
+                cliff_mask = cliff_mask | table_mask
+        else:
+            cliff_mask = self._last_collision_mask
         absorbing_r = self._r_min / (1.0 - self.info.gamma)
         r = torch.where(
-            self._last_collision_mask,
+            cliff_mask,
             torch.full_like(normal, absorbing_r),
             torch.where(
                 self._last_hold_done_mask,
@@ -1490,6 +1765,38 @@ class DualArmPegHoleEnv(IsaacSim):
             ),
         )
         return self._reward_scale * r
+
+    def _uninstall_arm_collision_patch_once(self):
+        """Decrement the global patch counter at most once per env instance.
+
+        Both stop() (normal script teardown) and cleanup() (atexit) may be
+        called on the same env, so we guard with an instance flag to avoid
+        double-decrement (which would let counter go negative and we'd lose
+        track of how many active envs need the patch).
+        """
+        if not getattr(self, "_enable_physx_arm_collision", False):
+            return
+        if getattr(self, "_arm_collision_uninstalled", False):
+            return
+        try:
+            from envs._arm_collision_setup import uninstall_collision_helper_patch
+            uninstall_collision_helper_patch()
+        except Exception:
+            pass
+        self._arm_collision_uninstalled = True
+
+    def stop(self, soft=True):
+        """Override mushroom's stop to uninstall arm collision patch on the
+        normal script-end path. cleanup() (atexit) also calls uninstall but
+        the guard makes it idempotent.
+        """
+        self._uninstall_arm_collision_patch_once()
+        super().stop(soft=soft)
+
+    def cleanup(self):
+        """atexit-registered cleanup. Same uninstall path as stop()."""
+        self._uninstall_arm_collision_patch_once()
+        super().cleanup()
 
     def setup(self, env_indices, obs):
         n = len(env_indices)
@@ -1745,6 +2052,22 @@ class DualArmPegHoleEnv(IsaacSim):
         mids = 0.5 * (joints[:, :-1, :] + joints[:, 1:, :])  # [n_envs, 7, 3]
         ee = body_pos[:, ee_idx, :]                          # [n_envs, 2, 3]
         return torch.cat([joints, mids, ee], dim=1)          # [n_envs, n_proxy, 3]
+
+    def _compute_min_table_clearance_from_proxies(self, left, right):
+        """Minimum arm/EE proxy clearance above the table plane.
+
+        clearance = center_z - proxy_radius - table_z.  This is a geometry
+        safety proxy for robot-vs-table contact.  It is intentionally a plane
+        test rather than a PhysX table contact view so it remains stable across
+        USD table implementations and works identically for SAC/LagSAC.
+        """
+        proxies = torch.cat([left, right], dim=1)  # [n_envs, 2*n_proxy, 3]
+        radii = torch.cat(
+            [self._proxy_radii_per_side, self._proxy_radii_per_side], dim=0
+        ).view(1, -1)
+        clearance = proxies[..., 2] - radii - self._table_z
+        min_vals, min_idx = clearance.min(dim=1)
+        return min_vals, {"min_table_proxy_idx": min_idx}
 
     def _compute_min_clearance(self):
         """sphere-proxy 双臂 clearance, 跨所有 env vectorized.

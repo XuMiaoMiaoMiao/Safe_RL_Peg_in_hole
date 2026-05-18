@@ -49,6 +49,10 @@ RESERVED_TRAIN_KEYS = {"train_script", "extra_args"}
 BOOLEAN_OPTIONAL_ARGS: set[str] = {
     "keep_collision_reward_penalty",
     "drop_penetration_reward_for_cost",
+    # 2026-05-17 split absorbing sources + PhysX arm collision toggle.
+    "sphere_collision_terminates",
+    "physx_collision_terminates",
+    "enable_physx_arm_collision",
 }
 
 

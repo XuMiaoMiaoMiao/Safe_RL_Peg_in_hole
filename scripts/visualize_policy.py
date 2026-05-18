@@ -41,6 +41,11 @@ def parse_args():
     p.add_argument("--preinsert_success_pos_threshold", type=float, default=0.10,
                    help="跟 train 一致 (env/train/eval 默认 0.10m, Stage 1/Stage 2 curriculum). "
                         "传更紧的值会让 freeze 条件更严, 可能看不到 hold-N 触发.")
+    p.add_argument("--default_pose_variant", type=str, default="easy",
+                   choices=["easy", "harder"],
+                   help="Reset pose: 'easy' = default HOME_JOINT_POS (arms swing "
+                        "wide); 'harder' = crossed-forearm pose (distal forearm/EE "
+                        "segments cross the midline). For benchmark.")
     p.add_argument("--initial_joint_noise", type=float, default=0.1,
                    help="跟 env/train 默认 0.1 一致 (Stage 1 训练时的 reset 噪声).")
     p.add_argument("--preinsert_offset", type=float, default=None,
@@ -86,6 +91,38 @@ def parse_args():
     p.add_argument("--exclude_ee_from_physx_self_collision", action="store_true",
                    help="geom insert 可视化用: PhysX self-collision 分组排除 EE link, "
                         "避免 peg-hole 正常接触被 hard absorbing 截断.")
+    # 2026-05-17: split collision termination + runtime arm collision APIs.
+    # Must match training env for visualization to reflect actual policy behavior.
+    p.add_argument("--sphere_collision_terminates",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="Must match training. False = sphere collision is cost-only.")
+    p.add_argument("--physx_collision_terminates",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="Must match training. True = PhysX real contact terminates episode.")
+    p.add_argument("--enable_physx_arm_collision",
+                   action=argparse.BooleanOptionalAction, default=False,
+                   help="Must match training. True = runtime apply capsule colliders to arm links.")
+    p.add_argument("--enable_table_collision",
+                   action=argparse.BooleanOptionalAction, default=False,
+                   help="Must match training. True = geometry-plane arm/EE-vs-table safety.")
+    p.add_argument("--table_collision_terminates",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="Must match training. True = table clearance collision terminates episode.")
+    p.add_argument("--table_z", type=float, default=None)
+    p.add_argument("--table_clearance_hard", type=float, default=None)
+    p.add_argument("--table_clearance_cost_margin", type=float, default=None)
+    p.add_argument("--debug_show_physx_arm_collision", action="store_true",
+                   help="Visualization only. Show the runtime PhysX arm collision "
+                        "capsule proxies: left arm blue, right arm red.")
+    p.add_argument("--debug_show_sphere_proxy", action="store_true",
+                   help="Visualization only. Show the sphere-proxy clearance "
+                        "boundary used by the env/cost: left arm orange, right arm cyan.")
+    p.add_argument("--keep_collision_reward_penalty",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="CostEnv only. Must match training. Cliff at collision step.")
+    p.add_argument("--drop_penetration_reward_for_cost",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="CostEnv only. Must match training. Drop -w·pen when cost=penetration.")
     p.add_argument("--use_axis_resid_obs", action="store_true",
                    help="34 维 obs (axis_resid 替换 axis_dot). 应与 train 一致.")
     p.add_argument("--horizon", type=int, default=None,
@@ -130,6 +167,9 @@ def parse_args():
     p.add_argument("--cost_signal", type=str, default=None,
                    choices=["collision", "penetration", "clearance"])
     p.add_argument("--clearance_cost_margin", type=float, default=None)
+    p.add_argument("--clearance_cost_clip_max", type=float, default=None,
+                   help="Optional upper clip for clearance cost. Default None = "
+                        "no upper clip, matching D-ATACOM-style positive violation.")
     p.add_argument("--cost_scale", type=float, default=None,
                    help="Multiplicative gain on info['cost']. Pass the same value used "
                         "at training time so visual diagnostics match wandb logs.")
@@ -144,6 +184,67 @@ def parse_args():
     return p.parse_args()
 
 
+def _spawn_sphere_proxy_markers(mdp):
+    """Spawn one env's sphere-proxy markers under /World/viz.
+
+    The proxy geometry is the same one used by mdp._compute_min_clearance():
+    8 joint-link spheres + 7 segment-midpoint spheres + 2 EE spheres per arm.
+    """
+    try:
+        import omni.usd
+        from pxr import UsdGeom, Sdf, Gf, Vt
+    except ImportError:
+        return None
+
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        return None
+
+    radii = mdp._proxy_radii_per_side.detach().cpu().tolist()
+
+    def _make(path, color, opacity, radius):
+        sphere = UsdGeom.Sphere.Define(stage, Sdf.Path(path))
+        sphere.GetRadiusAttr().Set(float(radius))
+        sphere.GetDisplayColorAttr().Set(Vt.Vec3fArray([Gf.Vec3f(*color)]))
+        sphere.GetDisplayOpacityAttr().Set([float(opacity)])
+        xf = UsdGeom.Xformable(sphere.GetPrim())
+        xf.ClearXformOpOrder()
+        t_op = xf.AddTranslateOp()
+        t_op.Set(Gf.Vec3d(0.0, 0.0, 10.0))
+        return t_op
+
+    left = [
+        _make(f"/World/viz/policy_sphere_left_{i:02d}", (1.0, 0.55, 0.20), 0.25, r)
+        for i, r in enumerate(radii)
+    ]
+    right = [
+        _make(f"/World/viz/policy_sphere_right_{i:02d}", (0.20, 0.85, 1.0), 0.25, r)
+        for i, r in enumerate(radii)
+    ]
+    print(
+        f"[VIZ SPHERES] spawned {len(left) + len(right)} sphere proxy markers "
+        f"for one env (left=orange, right=cyan, opacity=0.25)"
+    )
+    return {"left": left, "right": right}
+
+
+def _update_sphere_proxy_markers(mdp, sphere_handles, env_idx):
+    """Update sphere marker translations to the selected env's current proxies."""
+    if sphere_handles is None:
+        return
+    from pxr import Gf
+
+    _, info = mdp._compute_min_clearance()
+    left_p = info["left_proxies"][env_idx].detach().cpu()
+    right_p = info["right_proxies"][env_idx].detach().cpu()
+    for i, t_op in enumerate(sphere_handles["left"]):
+        x, y, z = left_p[i].tolist()
+        t_op.Set(Gf.Vec3d(x, y, z))
+    for i, t_op in enumerate(sphere_handles["right"]):
+        x, y, z = right_p[i].tolist()
+        t_op.Set(Gf.Vec3d(x, y, z))
+
+
 def main():
     args = parse_args()
     if not (0 <= args.viz_env_idx < args.num_envs):
@@ -156,13 +257,15 @@ def main():
         if args.freeze_after_step <= 0:
             raise ValueError("--freeze_after_step 必须 > 0")
 
-    from envs import DualArmPegHoleEnv
+    from envs import DualArmPegHoleEnv, DualArmPegHoleCostEnv
+    EnvClass = DualArmPegHoleCostEnv if args.cost_signal is not None else DualArmPegHoleEnv
 
     env_kwargs = dict(
         num_envs=args.num_envs,
         headless=False,
         preinsert_success_pos_threshold=args.preinsert_success_pos_threshold,
         initial_joint_noise=args.initial_joint_noise,
+        default_pose_variant=args.default_pose_variant,
         success_hold_steps=args.hold_steps,
         terminal_hold_bonus=0.0,
     )
@@ -193,7 +296,9 @@ def main():
                 "rew_geom_progress", "geom_gate_radial_sigma",
                 "geom_gate_axis_sigma",
                 "rew_geom_penetration", "geom_gate_penetration_sigma",
-                "cost_signal", "clearance_cost_margin", "cost_scale",
+                "cost_signal", "clearance_cost_margin", "clearance_cost_clip_max",
+                "cost_scale",
+                "table_z", "table_clearance_hard", "table_clearance_cost_margin",
                 "geom_progress_floor", "rew_geom_advance",
                 "geom_d_gate_mode", "rew_geom_bad_entry",
                 "geom_bad_entry_radial_safe", "geom_bad_entry_axis_safe",
@@ -216,7 +321,20 @@ def main():
         env_kwargs["use_axis_resid_obs"] = True
     if args.exclude_ee_from_physx_self_collision:
         env_kwargs["exclude_ee_from_physx_self_collision"] = True
-    mdp = DualArmPegHoleEnv(**env_kwargs)
+    env_kwargs["sphere_collision_terminates"] = bool(args.sphere_collision_terminates)
+    env_kwargs["physx_collision_terminates"] = bool(args.physx_collision_terminates)
+    env_kwargs["enable_physx_arm_collision"] = bool(args.enable_physx_arm_collision)
+    env_kwargs["enable_table_collision"] = bool(args.enable_table_collision)
+    env_kwargs["table_collision_terminates"] = bool(args.table_collision_terminates)
+    env_kwargs["debug_show_physx_arm_collision"] = bool(args.debug_show_physx_arm_collision)
+    if EnvClass is DualArmPegHoleCostEnv:
+        env_kwargs["keep_collision_reward_penalty"] = bool(
+            args.keep_collision_reward_penalty
+        )
+        env_kwargs["drop_penetration_reward_for_cost"] = bool(
+            args.drop_penetration_reward_for_cost
+        )
+    mdp = EnvClass(**env_kwargs)
     if args.geom_stage is not None:
         if args.geom_eval_epoch is not None:
             geom_eval_epoch = args.geom_eval_epoch
@@ -264,9 +382,14 @@ def main():
     episode_steps = torch.zeros(mdp._n_envs, dtype=torch.int64, device=mdp._device)
     state = {"frozen": False, "step_idx": 0}
     original_is_absorbing = mdp.is_absorbing
+    sphere_handles = None
+    if args.debug_show_sphere_proxy:
+        sphere_handles = _spawn_sphere_proxy_markers(mdp)
+        _update_sphere_proxy_markers(mdp, sphere_handles, args.viz_env_idx)
 
     def freeze_on_success(obs):
         result = original_is_absorbing(obs)
+        _update_sphere_proxy_markers(mdp, sphere_handles, args.viz_env_idx)
         state["step_idx"] += 1
         episode_steps.add_(1)
         if args.geom_stage is not None and mdp._cached_d is not None:

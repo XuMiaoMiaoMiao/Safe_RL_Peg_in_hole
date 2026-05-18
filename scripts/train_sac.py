@@ -1,5 +1,32 @@
 """SAC 训练 — 双臂 peg-in-hole preinsert (stage flag 化, mushroom-rl + VectorCore).
 
+SAC vs LagSAC paper-grade comparison (2026-05-17 B route refactor)
+─────────────────────────────────────────────────────────────────
+This script now supports the B route comparison setup natively, so SAC
+(this script) and LagSAC (train_sac_lagrangian.py) can run on IDENTICAL
+env / reward semantics — making J/R directly comparable in a paper figure.
+
+For clean SAC baseline vs LagSAC, pass:
+    --no-sphere_collision_terminates   (sphere = cost signal only, no cliff)
+    --physx_collision_terminates       (PhysX real contact terminates + cliff)
+    --enable_physx_arm_collision       (apply capsule colliders so PhysX fires)
+
+Parent env's reward (envs/dual_arm_peg_hole_env.py:reward) automatically
+splits cliff target: when sphere_collision_terminates=False, cliff fires
+ONLY on PhysX absorbing — same logic as DualArmPegHoleCostEnv. So:
+
+    SAC via train_sac.py + B route flags
+    LagSAC via train_sac_lagrangian.py + B route flags
+    → identical reward function, identical termination, only diff is
+      cost critic + λ (LagSAC only).
+
+Legacy mode (no B route flags) preserves the historical SAC-cliff baseline
+behavior — cliff on any sphere|physx collision. The existing
+S1g_prepos_h100_full_ep_balanced_seed0 checkpoint was trained in this mode
+and remains reproducible.
+
+────────────────────────────────────────────────────────────────────────────
+
 obs 默认 32 维 base (joint_pos+joint_vel+pos_vec+axis_dot); 推荐用
 --use_axis_resid_obs 切到 34 维 (axis_resid 替换 axis_dot, 当前正式 Stage 1/2
 都是 34 维). 同一个 env / 同一条 reward 骨架, stage 用 reward 权重 +
@@ -34,6 +61,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from networks import ActorNetwork, CriticNetwork
 from scripts._eval_utils import (
+    compute_cost_metrics,
     compute_geom_metrics,
     compute_hold_metrics,
     deterministic_policy,
@@ -86,6 +114,10 @@ def parse_args():
                    help="评估 episode 数. 默认自动取 num_envs, 并要求能被 num_envs 整除")
     p.add_argument("--initial_joint_noise", type=float, default=None,
                    help="覆盖 env 的 reset 关节噪声")
+    p.add_argument("--default_pose_variant", type=str, default=None,
+                   choices=["easy", "harder"],
+                   help="Reset pose variant. 'easy' keeps historical HOME_JOINT_POS; "
+                        "'harder' uses crossed-forearm reset pose.")
     p.add_argument("--preinsert_success_pos_threshold", type=float, default=None,
                    help="覆盖 env 的 preinsert 位置成功阈值 (env 默认 0.10m, 即当前 "
                         "Stage 1/Stage 2 curriculum). 如果显式想跑老 5cm, 传 0.05.")
@@ -160,10 +192,45 @@ def parse_args():
                    help="覆盖 env 的 arm sphere proxy 半径 (默认 0.06m).")
     p.add_argument("--proxy_ee_radius", type=float, default=None,
                    help="覆盖 env 的 EE sphere proxy 半径 (默认 0.04m).")
+    p.add_argument("--enable_table_collision",
+                   action=argparse.BooleanOptionalAction, default=False,
+                   help="Enable geometry-plane arm/EE-vs-table clearance safety. "
+                        "When enabled, table collision can terminate episode and "
+                        "cost_signal=clearance includes table clearance violation.")
+    p.add_argument("--table_collision_terminates",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="If table safety is enabled, terminate episode when "
+                        "table clearance falls below table_clearance_hard.")
+    p.add_argument("--table_z", type=float, default=None,
+                   help="World/env-local table top z for proxy clearance. Default 0.0.")
+    p.add_argument("--table_clearance_hard", type=float, default=None,
+                   help="Hard absorbing threshold for arm/EE table clearance. Default 0.0m.")
+    p.add_argument("--table_clearance_cost_margin", type=float, default=None,
+                   help="Margin for table clearance cost. Default 0.03m.")
     p.add_argument("--exclude_ee_from_physx_self_collision", action="store_true",
                    help="Stage 3 peg/hole 真实 collider 用: PhysX arm_L vs arm_R "
                         "self-collision 分组排除左右 EE link, 避免正常 peg-hole "
                         "接触被 hard absorbing 误杀. EE 区域仍由 sphere-proxy 兜底.")
+    # 2026-05-17 B route flags: lets SAC (this script) and LagSAC
+    # (train_sac_lagrangian.py) operate on identical env semantics so J/R
+    # is directly comparable in a paper figure.
+    p.add_argument("--sphere_collision_terminates",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="True (default) preserves legacy behaviour. "
+                        "Set False for clean comparison vs LagSAC: sphere overlap "
+                        "becomes cost-only (not in reward) and parent env's reward "
+                        "cliff only fires on PhysX real-contact absorbing.")
+    p.add_argument("--physx_collision_terminates",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="True (default) keeps PhysX real-contact as episode terminal. "
+                        "Recommended True even when sphere is cost-only — physics-"
+                        "stability guard against arm-arm geometric overlap in PhysX.")
+    p.add_argument("--enable_physx_arm_collision",
+                   action=argparse.BooleanOptionalAction, default=False,
+                   help="Apply PhysX CollisionAPI to iiwa arm links at runtime via "
+                        "capsule colliders sized from URDF. Without this, the robot "
+                        "USD has no CollisionAPI on arm links and epoch_absorb_physx "
+                        "stays 0 forever. Default False = backward compatible.")
     p.add_argument("--use_axis_resid_obs", action="store_true",
                    help="agent obs 32 → 34 维: axis_dot[1] 替换成 axis_resid[3] = "
                         "peg_axis + hole_axis (world frame). 模长 ∈ [0, 2], "
@@ -225,9 +292,21 @@ def parse_args():
                    help="alignment_gate 包含 penetration 项的 σ (m), 例如 0.002=2mm. "
                         "默认 None=不进 gate. 设了让 gated progress 在穿模时趋 0.")
     p.add_argument("--cost_signal", type=str, default=None,
-                   choices=["collision", "penetration"],
-                   help="info['cost'] 信号: 'collision' (0/1 老语义) 或 'penetration' "
-                        "(连续 [0,4mm], 给 Lagrangian SAC 当 constraint cost)")
+                   choices=["collision", "penetration", "clearance"],
+                   help="info['cost'] 信号: 'collision' (0/1), 'penetration' "
+                        "(连续 [0,4mm]), 或 'clearance' (D-ATACOM 风格双臂 sphere "
+                        "clearance margin violation). SAC 不用 cost, 但记录到 info "
+                        "供 wandb 比较 — paper figure 跟 LagSAC 对齐用."
+                   )
+    p.add_argument("--clearance_cost_margin", type=float, default=None,
+                   help="cost_signal=clearance 时双臂 sphere-proxy 安全 margin (m). "
+                        "默认 0.02m. clearance < margin 给 cost > 0.")
+    p.add_argument("--clearance_cost_clip_max", type=float, default=None,
+                   help="Optional upper clip for clearance cost. Default None = "
+                        "D-ATACOM-style unbounded positive violation.")
+    p.add_argument("--cost_scale", type=float, default=None,
+                   help="Multiplicative gain on info['cost']. Match training "
+                        "settings for J/R comparison vs LagSAC.")
     p.add_argument("--geom_progress_floor", type=float, default=None,
                    help="progress reward 起点 (m). 默认 0.0 = 只奖励 d>0 真插入. "
                         "旧行为 (奖励'接近 entrance') 用 d_target_neg=-0.08")
@@ -306,11 +385,13 @@ def main():
     env_kwargs = dict(num_envs=args.num_envs, headless=not args.render)
     if args.horizon is not None:
         env_kwargs["horizon"] = args.horizon
-    for key in ("initial_joint_noise", "preinsert_success_pos_threshold",
+    for key in ("initial_joint_noise", "default_pose_variant",
+                "preinsert_success_pos_threshold",
                 "preinsert_offset", "rew_action", "rew_success", "rew_pos_success",
                 "rew_axis", "rew_home", "home_weights", "axis_gate_radius",
                 "success_axis_threshold", "terminal_hold_bonus",
                 "clearance_hard", "proxy_arm_radius", "proxy_ee_radius",
+                "table_z", "table_clearance_hard", "table_clearance_cost_margin",
                 # Geometric preinsert kwargs:
                 "geom_stage", "geom_d_target_neg", "geom_d_target_pos",
                 "geom_d_target_ramp_start", "geom_d_target_ramp_end",
@@ -322,7 +403,9 @@ def main():
                 "geom_insert_d_ins", "geom_insert_r_max_th", "geom_pen_th",
                 "geom_soft_penetration_sigma",
                 "rew_geom_progress", "geom_gate_radial_sigma", "geom_gate_axis_sigma",
-                "rew_geom_penetration", "geom_gate_penetration_sigma", "cost_signal",
+                "rew_geom_penetration", "geom_gate_penetration_sigma",
+                "cost_signal", "clearance_cost_margin", "clearance_cost_clip_max",
+                "cost_scale",
                 "geom_progress_floor", "rew_geom_advance",
                 "geom_d_gate_mode", "rew_geom_bad_entry",
                 "geom_bad_entry_radial_safe", "geom_bad_entry_axis_safe",
@@ -346,6 +429,13 @@ def main():
         env_kwargs["use_axis_resid_obs"] = True
     if args.exclude_ee_from_physx_self_collision:
         env_kwargs["exclude_ee_from_physx_self_collision"] = True
+    # B route flags (always transmit — BooleanOptionalAction always has a value;
+    # defaults match env defaults so unchanged behaviour for legacy yaml).
+    env_kwargs["sphere_collision_terminates"] = bool(args.sphere_collision_terminates)
+    env_kwargs["physx_collision_terminates"] = bool(args.physx_collision_terminates)
+    env_kwargs["enable_physx_arm_collision"] = bool(args.enable_physx_arm_collision)
+    env_kwargs["enable_table_collision"] = bool(args.enable_table_collision)
+    env_kwargs["table_collision_terminates"] = bool(args.table_collision_terminates)
     env_kwargs["success_hold_steps"] = args.hold_success_steps
     mdp = DualArmPegHoleEnv(**env_kwargs)
     mdp.seed(args.seed)
@@ -640,6 +730,52 @@ def main():
             dir=str(results_dir),
         )
         logger.info(f"wandb run: {wandb_run.url}")
+        # ── Wandb dashboard organization (2026-05-17 cleanup, mirrors LagSAC) ─
+        # Goal: dashboard shows ONLY paper-grade benchmark metrics by default.
+        # SAC has no λ / no rollout_ep_cost (no cost critic), but eval_ep_cost
+        # is still uploaded as monitor for direct comparison vs LagSAC.
+        wandb.define_metric("epoch")
+        wandb.define_metric("*", step_metric="epoch")
+        for pat in (
+            "legacy_eval_*", "warmstart_*",
+            "geom_raw_epoch", "geom_actor_epoch", "geom_d_target_eff",
+            "env_steps", "eval_ep_len", "geom_n_ep_with_entry", "alpha",
+            "stage2_*",
+            "geom_d_target_mean", "geom_d_err_mean", "geom_d_err_min",
+            "geom_radial_tip_mean", "geom_radial_tip_min",
+            "geom_radial_max_mean", "geom_radial_max_min",
+            "geom_axis_err_mean", "geom_axis_err_min",
+            "geom_prepos_step_rate", "geom_preaxis_step_rate", "geom_insert_step_rate",
+            "geom_ep_success_rate_mean",
+            "geom_entry_d_mean", "geom_entry_d_err_mean",
+            "geom_entry_radial_max_mean", "geom_entry_radial_max_max",
+            "geom_entry_axis_err_mean", "geom_entry_axis_err_max",
+            "geom_entry_penetration_mean", "geom_entry_penetration_max",
+            "geom_final_d_mean", "geom_final_d_err_mean",
+            "geom_final_radial_max_mean", "geom_final_radial_max_max",
+            "geom_final_axis_err_mean", "geom_final_axis_err_max",
+            "geom_final_penetration_mean", "geom_final_penetration_max",
+            "geom_pen_max_mean", "geom_pen_max_max", "geom_clean_step_rate",
+            "geom_pen_in_active_mean", "geom_pen_in_active_max",
+            "eval_step_cost", "epoch_absorb", "epoch_collision",
+            "best_score", "best_hold_rate", "best_hold_max_hold_mean",
+            # best_metric_* are LagSAC-compatible aliases logged for cross-script
+            # query convenience; duplicates of best_geom_*. Hide to avoid clutter.
+            "best_metric_rate", "best_metric_max_run_mean",
+        ):
+            wandb.define_metric(pat, hidden=True)
+        for m in ("best_J", "best_geom_rate", "best_geom_max_run_mean"):
+            wandb.define_metric(m, summary="max")
+        for m in (
+            "J", "R",
+            "geom_hold_rate", "geom_max_run_mean", "geom_step_rate",
+            "geom_final_success_rate",
+            "epoch_absorb_total", "epoch_collision_total",
+            "epoch_absorb_sphere", "epoch_absorb_physx", "epoch_absorb_table",
+            "epoch_collision_sphere", "epoch_collision_physx", "epoch_collision_table",
+            "eval_ep_cost",
+        ):
+            wandb.define_metric(m, summary="last")
 
     empty_dataset = Dataset.generate(mdp.info, agent.info, n_steps=1, n_envs=args.num_envs)
 
@@ -704,6 +840,11 @@ def main():
     absorb_prev = mdp._absorb_count
     absorb_physx_prev = mdp._absorb_count_physx
     absorb_sphere_prev = mdp._absorb_count_sphere
+    absorb_table_prev = getattr(mdp, "_absorb_count_table", 0)
+    coll_prev = getattr(mdp, "_collision_count", 0)
+    coll_physx_prev = getattr(mdp, "_collision_count_physx", 0)
+    coll_sphere_prev = getattr(mdp, "_collision_count_sphere", 0)
+    coll_table_prev = getattr(mdp, "_collision_count_table", 0)
     # Actor-relative epoch offset: critic warmup 期间 SAC 的 actor 不更新,
     # 把这部分 epoch 排除在 schedule 之外, 让 ramp 的边界跟 actor 实际开始
     # 学习的时刻对齐. critic_warmup_transitions == INITIAL_REPLAY_SIZE 时 offset=0.
@@ -740,12 +881,18 @@ def main():
         absorb_epoch = mdp._absorb_count - absorb_prev
         absorb_physx_epoch = mdp._absorb_count_physx - absorb_physx_prev
         absorb_sphere_epoch = mdp._absorb_count_sphere - absorb_sphere_prev
+        absorb_table_epoch = getattr(mdp, "_absorb_count_table", 0) - absorb_table_prev
+        coll_epoch = getattr(mdp, "_collision_count", 0) - coll_prev
+        coll_physx_epoch = getattr(mdp, "_collision_count_physx", 0) - coll_physx_prev
+        coll_sphere_epoch = getattr(mdp, "_collision_count_sphere", 0) - coll_sphere_prev
+        coll_table_epoch = getattr(mdp, "_collision_count_table", 0) - coll_table_prev
 
         with deterministic_policy(agent):
             dataset = core.evaluate(n_episodes=args.n_eval_episodes, quiet=True)
         J = torch.mean(dataset.discounted_return).item()
         R = torch.mean(dataset.undiscounted_return).item()
         ep_len = len(dataset) / args.n_eval_episodes
+        c = compute_cost_metrics(dataset, args.n_eval_episodes)
         m = compute_hold_metrics(dataset, mdp, args.hold_success_steps)
         # Geom metric: geom_step_rate / geom_hold_rate / d_err / radial_max /
         # penetration. 严格判定从 dataset.info.data 读, 与 reward / mask 同源.
@@ -796,6 +943,11 @@ def main():
         absorb_prev = mdp._absorb_count
         absorb_physx_prev = mdp._absorb_count_physx
         absorb_sphere_prev = mdp._absorb_count_sphere
+        absorb_table_prev = getattr(mdp, "_absorb_count_table", 0)
+        coll_prev = getattr(mdp, "_collision_count", 0)
+        coll_physx_prev = getattr(mdp, "_collision_count_physx", 0)
+        coll_sphere_prev = getattr(mdp, "_collision_count_sphere", 0)
+        coll_table_prev = getattr(mdp, "_collision_count_table", 0)
 
         # epoch_info 字段命名按 stage 语义切换:
         # geom 路径: best_geom (active geom success mask hold rate)
@@ -900,18 +1052,45 @@ def main():
             else:
                 cond_str = "axis_err_in_pos_th=n/a (pos_in_thresh_count=0)"
             logger.info(f"  ↳ pos_in_thresh_count={m['pos_in_thresh_count']}  {cond_str}")
+        logger.info(
+            f"cost/collision stats: "
+            f"eval_step_cost={c['cost_rate']:.4f}  "
+            f"eval_ep_cost={c['cost_episode_sum_mean']:.3f}  "
+            f"epoch_absorb_total={absorb_epoch}  "
+            f"epoch_absorb_sphere={absorb_sphere_epoch}  "
+            f"epoch_absorb_physx={absorb_physx_epoch}  "
+            f"epoch_absorb_table={absorb_table_epoch}  "
+            f"epoch_collision_total={coll_epoch}  "
+            f"epoch_collision_sphere={coll_sphere_epoch}  "
+            f"epoch_collision_physx={coll_physx_epoch}  "
+            f"epoch_collision_table={coll_table_epoch}"
+        )
         if wandb_run is not None:
             # geom 模式下 m 是旧球形 pos/axis 指标, 与 geom_* 不可比. wandb key 加
             # legacy_ 前缀, 让 dashboard 上 geom run 没有裸的 eval_success_rate 等
             # 字段, 旧 (非-geom) run 不受影响. _legacy(...) 在 geom 模式下加前缀.
             _legacy = (lambda k: f"legacy_{k}") if mdp._geom_stage is not None else (lambda k: k)
+            best_rate_value = best_hold_rate if best_hold_rate >= 0 else 0.0
+            best_run_value = best_hold_score if best_hold_score >= 0 else 0.0
+            best_metric_fields = (
+                {
+                    "best_metric_rate": best_rate_value,
+                    "best_metric_max_run_mean": best_run_value,
+                    "best_geom_rate": best_rate_value,
+                    "best_geom_max_run_mean": best_run_value,
+                }
+                if mdp._geom_stage is not None else
+                {
+                    "best_metric_rate": best_rate_value,
+                    "best_metric_max_run_mean": best_run_value,
+                    "best_hold_rate": best_rate_value,
+                    "best_hold_max_hold_mean": best_run_value,
+                }
+            )
             wandb_run.log({
                 "epoch": epoch + 1, "env_steps": total_env_steps,
                 "J": J, "R": R, "best_J": best_J, "best_score": best_score,
-                "best_hold_rate":
-                    best_hold_rate if best_hold_rate >= 0 else 0.0,
-                "best_hold_max_hold_mean":
-                    best_hold_score if best_hold_score >= 0 else 0.0,
+                **best_metric_fields,
                 "eval_ep_len": ep_len,
                 _legacy("eval_success_rate"): m["hold_success_rate"],
                 _legacy("eval_max_hold_mean"): m["max_hold_mean"],
@@ -977,9 +1156,21 @@ def main():
                     m["axis_gate_in_pos_thresh_mean"]
                     if m["pos_in_thresh_count"] > 0 else float("nan"),
                 "alpha": agent._alpha.item(),
-                "absorb_per_epoch": absorb_epoch,
-                "absorb_physx_per_epoch": absorb_physx_epoch,
-                "absorb_sphere_per_epoch": absorb_sphere_epoch,
+                # Cost monitor (D-ATACOM-style continuous violation, info["cost"])
+                "eval_ep_cost": c["cost_episode_sum_mean"],
+                # Safety event counters per epoch (split by source)
+                # _collision_* = all events (incl. cost-only sphere)
+                # _absorb_*    = events that actually terminated episode
+                # In B route (sphere_collision_terminates=false), absorb_sphere
+                # is 0 but collision_sphere shows the cost-signal firing rate.
+                "epoch_absorb_total": absorb_epoch,
+                "epoch_absorb_sphere": absorb_sphere_epoch,
+                "epoch_absorb_physx": absorb_physx_epoch,
+                "epoch_absorb_table": absorb_table_epoch,
+                "epoch_collision_total": coll_epoch,
+                "epoch_collision_sphere": coll_sphere_epoch,
+                "epoch_collision_physx": coll_physx_epoch,
+                "epoch_collision_table": coll_table_epoch,
             }, step=epoch + 1)
 
     # 训练结束时无条件保存最后一个 epoch 的 actor — 这是 "稳态终态" 的 ground truth,
@@ -1014,15 +1205,15 @@ def main():
     if wandb_run is not None:
         wandb_run.summary["best_J"] = best_J
         wandb_run.summary["best_score"] = best_score
-        # Stage 1/2 (Lagrangian baseline): best_hold_rate = hold_success_rate
-        # Geom: best_hold_rate = geom_hold_rate (active geom mask)
-        # 同 key 名字, 不同 stage 不同语义; wandb run config.algo + config.geom_stage 区分.
-        wandb_run.summary["best_hold_rate"] = (
-            best_hold_rate if best_hold_rate >= 0 else 0.0
-        )
-        wandb_run.summary["best_hold_max_hold_mean"] = (
-            best_hold_score if best_hold_score >= 0 else 0.0
-        )
+        best_rate_value = best_hold_rate if best_hold_rate >= 0 else 0.0
+        best_run_value = best_hold_score if best_hold_score >= 0 else 0.0
+        # Keep the same visible summary keys as LagSAC for geom benchmark runs.
+        if mdp._geom_stage is not None:
+            wandb_run.summary["best_geom_rate"] = best_rate_value
+            wandb_run.summary["best_geom_max_run_mean"] = best_run_value
+        else:
+            wandb_run.summary["best_hold_rate"] = best_rate_value
+            wandb_run.summary["best_hold_max_hold_mean"] = best_run_value
         wandb_run.finish()
     mdp.stop()
 

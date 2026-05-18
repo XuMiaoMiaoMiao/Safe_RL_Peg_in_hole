@@ -41,6 +41,9 @@ def parse_args():
     p.add_argument("--headless", action="store_true")
     p.add_argument("--initial_joint_noise", type=float, default=None,
                    help="覆盖 env 默认 reset 关节噪声. 应传与 train 相同的值")
+    p.add_argument("--default_pose_variant", type=str, default=None,
+                   choices=["easy", "harder"],
+                   help="Reset pose variant. 应传与 train 相同的值.")
     p.add_argument("--preinsert_success_pos_threshold", type=float, default=None,
                    help="覆盖 env 默认 preinsert 位置成功阈值 (env 默认 0.10m). "
                         "应传与 train 相同的值.")
@@ -79,6 +82,35 @@ def parse_args():
     p.add_argument("--exclude_ee_from_physx_self_collision", action="store_true",
                    help="应与 geom insert train 一致: PhysX self-collision 分组排除 EE link, "
                         "避免 peg-hole 正常接触被算作 hard absorbing.")
+    # 2026-05-17: split collision termination + runtime arm collision APIs.
+    # MUST match training value or eval env differs from training env and
+    # eval safety / success metrics will be misleading.
+    p.add_argument("--sphere_collision_terminates",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="Must match training. False = sphere collision is cost-only.")
+    p.add_argument("--physx_collision_terminates",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="Must match training. True = PhysX real contact terminates episode.")
+    p.add_argument("--enable_physx_arm_collision",
+                   action=argparse.BooleanOptionalAction, default=False,
+                   help="Must match training. True = runtime apply capsule colliders to arm links.")
+    p.add_argument("--enable_table_collision",
+                   action=argparse.BooleanOptionalAction, default=False,
+                   help="Must match training. True = geometry-plane arm/EE-vs-table safety.")
+    p.add_argument("--table_collision_terminates",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="Must match training. True = table clearance collision terminates episode.")
+    p.add_argument("--table_z", type=float, default=None)
+    p.add_argument("--table_clearance_hard", type=float, default=None)
+    p.add_argument("--table_clearance_cost_margin", type=float, default=None)
+    # CostEnv-specific cliff toggles (only used when --cost_signal is set).
+    # Must match training reward semantics for J/R to be comparable.
+    p.add_argument("--keep_collision_reward_penalty",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="CostEnv only. Must match training. Cliff at collision step.")
+    p.add_argument("--drop_penetration_reward_for_cost",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="CostEnv only. Must match training. Drop -w·pen from reward when cost=penetration.")
     p.add_argument("--use_axis_resid_obs", action="store_true",
                    help="34 维 obs (axis_resid 替换 axis_dot). **必须与 train 一致**, "
                         "否则 actor 输入维度对不上加载会失败.")
@@ -126,6 +158,9 @@ def parse_args():
     p.add_argument("--cost_signal", type=str, default=None,
                    choices=["collision", "penetration", "clearance"])
     p.add_argument("--clearance_cost_margin", type=float, default=None)
+    p.add_argument("--clearance_cost_clip_max", type=float, default=None,
+                   help="Optional upper clip for clearance cost. Default None = "
+                        "no upper clip, matching D-ATACOM-style positive violation.")
     p.add_argument("--cost_scale", type=float, default=None,
                    help="Multiplicative gain on info['cost']. Pass the same value used "
                         "at training time so eval_ep_cost is comparable to wandb logs.")
@@ -145,16 +180,23 @@ def main():
     args.n_episodes = resolve_eval_episode_count(
         args.n_episodes, args.num_envs, "--n_episodes"
     )
-    from envs import DualArmPegHoleEnv
+    # When --cost_signal is set, the saved checkpoint was trained with CostEnv
+    # reward semantics (cliff potentially split sphere/PhysX). Use CostEnv at
+    # eval so J/R reflect the same reward function. Otherwise fall back to
+    # parent env (legacy SAC eval).
+    from envs import DualArmPegHoleEnv, DualArmPegHoleCostEnv
+    EnvClass = DualArmPegHoleCostEnv if args.cost_signal is not None else DualArmPegHoleEnv
 
     env_kwargs = dict(num_envs=args.num_envs, headless=args.headless)
     if args.horizon is not None:
         env_kwargs["horizon"] = args.horizon
-    for key in ("initial_joint_noise", "preinsert_success_pos_threshold",
+    for key in ("initial_joint_noise", "default_pose_variant",
+                "preinsert_success_pos_threshold",
                 "preinsert_offset", "rew_axis", "rew_success", "rew_pos_success",
                 "rew_home", "home_weights", "axis_gate_radius",
                 "success_axis_threshold", "terminal_hold_bonus",
                 "clearance_hard", "proxy_arm_radius", "proxy_ee_radius",
+                "table_z", "table_clearance_hard", "table_clearance_cost_margin",
                 # Geom reward / threshold params.
                 "geom_stage", "geom_d_target_neg", "geom_d_target_pos",
                 "geom_d_target_ramp_start", "geom_d_target_ramp_end",
@@ -168,7 +210,8 @@ def main():
                 "rew_geom_progress", "geom_gate_radial_sigma",
                 "geom_gate_axis_sigma",
                 "rew_geom_penetration", "geom_gate_penetration_sigma",
-                "cost_signal", "clearance_cost_margin", "cost_scale",
+                "cost_signal", "clearance_cost_margin", "clearance_cost_clip_max",
+                "cost_scale",
                 "geom_progress_floor", "rew_geom_advance",
                 "geom_d_gate_mode", "rew_geom_bad_entry",
                 "geom_bad_entry_radial_safe", "geom_bad_entry_axis_safe",
@@ -191,10 +234,26 @@ def main():
         env_kwargs["use_axis_resid_obs"] = True
     if args.exclude_ee_from_physx_self_collision:
         env_kwargs["exclude_ee_from_physx_self_collision"] = True
+    # New collision flags pass through unconditionally (BooleanOptionalAction always
+    # produces a value, default matches env default).
+    env_kwargs["sphere_collision_terminates"] = bool(args.sphere_collision_terminates)
+    env_kwargs["physx_collision_terminates"] = bool(args.physx_collision_terminates)
+    env_kwargs["enable_physx_arm_collision"] = bool(args.enable_physx_arm_collision)
+    env_kwargs["enable_table_collision"] = bool(args.enable_table_collision)
+    env_kwargs["table_collision_terminates"] = bool(args.table_collision_terminates)
     env_kwargs["success_hold_steps"] = args.hold_success_steps
-    print(f"[EVAL ENV] {env_kwargs}")
+    # CostEnv-only flags: only pass them when using CostEnv (cost_signal set).
+    # Parent DualArmPegHoleEnv doesn't accept these and would raise.
+    if EnvClass is DualArmPegHoleCostEnv:
+        env_kwargs["keep_collision_reward_penalty"] = bool(
+            args.keep_collision_reward_penalty
+        )
+        env_kwargs["drop_penetration_reward_for_cost"] = bool(
+            args.drop_penetration_reward_for_cost
+        )
+    print(f"[EVAL ENV cls={EnvClass.__name__}] {env_kwargs}")
 
-    mdp = DualArmPegHoleEnv(**env_kwargs)
+    mdp = EnvClass(**env_kwargs)
 
     if args.geom_stage is not None:
         if args.geom_eval_epoch is not None:
@@ -327,6 +386,7 @@ def main():
         cm = compute_cost_metrics(dataset, args.n_episodes)
         print(
             f"[cost] signal={mdp._cost_signal}  cost_scale={mdp._cost_scale:g}  "
+            f"clearance_clip_max={mdp._clearance_cost_clip_max}  "
             f"cost_rate={cm['cost_rate']:.6f} (per step, post-scale)  "
             f"cost_episode_sum_mean={cm['cost_episode_sum_mean']:.4f} (per episode, post-scale)"
         )

@@ -37,7 +37,7 @@ use_axis_resid_obs: true
 exclude_ee_from_physx_self_collision: false
 
 # Collection / update cadence.
-n_epochs: 120
+n_epochs: 5                       # ★ smoke test 临时短跑, 验证 PhysX collision 触发后改回 120
 n_steps_per_epoch: 1600          # = horizon × num_envs = 100 × 16
 n_steps_per_fit: 16
 utd: null
@@ -100,16 +100,27 @@ geom_bad_entry_radial_safe: 0.014
 geom_bad_entry_axis_safe: 0.10
 geom_bad_entry_pen_safe: 0.00075
 
-# ── CMDP cost (clean version B: collision/clearance 只通过 cost critic) ──────
+# ── CMDP cost (B route hybrid: sphere=cost, PhysX=guard) ─────────────────────
 # D-ATACOM-style clearance cost = max((margin - min_clearance) / margin, 0).
-# 不截上界: 接触≈1, 穿透会 >1, cost critic 能看到严重程度.
-# margin=2cm: 双臂 sphere-proxy 表面距离 < 2cm 就给 cost.
 cost_signal: clearance
 clearance_cost_margin: 0.02
 clearance_cost_clip_max: null
 cost_scale: 1.0
-# ★ 关键差异 vs hybrid: collision 不再作为 reward cliff, 只走 cost constraint.
-keep_collision_reward_penalty: false
+
+# ★★★ B route hybrid (2026-05-17 evening) ★★★
+# Sphere proxy   = pure cost signal (no terminate, no cliff)
+#                  → continuous safety violation for cost critic + λ
+# PhysX contact  = absorbing terminate + cliff
+#                  → guards against suicide (cliff makes early-terminate expensive)
+#                  → guards against sim instability (real arm-arm overlap)
+#
+# enable_physx_arm_collision adds capsule colliders to iiwa arm links so PhysX
+# arm-arm contact actually triggers (USD has no CollisionAPI on arm links).
+# Without it, physx_collision_terminates is dead code.
+sphere_collision_terminates: false
+physx_collision_terminates: true
+keep_collision_reward_penalty: true        # cliff only on PhysX (cost env splits)
+enable_physx_arm_collision: true
 
 # ── Lagrangian controller (REVISION 2026-05-17 晚): 回到成功区间 ──────────────
 # 失败 run lag_S1g_prepos_clearance_conservative_seed0 (16:08): λ 36 epoch 涨 0.001,
@@ -145,7 +156,7 @@ hold_success_steps: 10
 
 # Sphere-proxy 双臂自碰撞 (hard absorbing guard, 独立于 cost signal).
 clearance_hard: 0.0
-proxy_arm_radius: 0.06
+proxy_arm_radius: 0.065
 proxy_ee_radius: 0.04
 
 # Cold-start (no warm-start, 同 SAC Stage 1 baseline).
@@ -155,6 +166,6 @@ keep_replay: false
 
 wandb_project: bimanual_peghole
 wandb_entity: miaoxu010522-lund
-wandb_run_name: lag_S1g_prepos_clearance_datacom_fastlambda_seed0
-wandb_group: lag_s1_clearance_datacom_fastlambda_vs_sac_baseline
+wandb_run_name: lag_S1g_prepos_clearance_b_route_seed0
+wandb_group: lag_s1_clearance_b_route_vs_sac_monitor
 no_wandb: false

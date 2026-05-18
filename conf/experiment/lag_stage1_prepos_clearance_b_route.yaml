@@ -37,7 +37,7 @@ use_axis_resid_obs: true
 exclude_ee_from_physx_self_collision: false
 
 # Collection / update cadence.
-n_epochs: 120
+n_epochs: 30                      # ★ 30-ep calibration run, 看 λ 轨迹 + cost 量级稳定后扩到 120
 n_steps_per_epoch: 1600          # = horizon × num_envs = 100 × 16
 n_steps_per_fit: 16
 utd: null
@@ -100,40 +100,63 @@ geom_bad_entry_radial_safe: 0.014
 geom_bad_entry_axis_safe: 0.10
 geom_bad_entry_pen_safe: 0.00075
 
-# ── CMDP cost (clean version B: collision/clearance 只通过 cost critic) ──────
+# ── CMDP cost (B route hybrid: sphere=cost, PhysX=guard) ─────────────────────
 # D-ATACOM-style clearance cost = max((margin - min_clearance) / margin, 0).
-# 不截上界: 接触≈1, 穿透会 >1, cost critic 能看到严重程度.
-# margin=2cm: 双臂 sphere-proxy 表面距离 < 2cm 就给 cost.
 cost_signal: clearance
 clearance_cost_margin: 0.02
 clearance_cost_clip_max: null
 cost_scale: 1.0
-# ★ 关键差异 vs hybrid: collision 不再作为 reward cliff, 只走 cost constraint.
-keep_collision_reward_penalty: false
 
-# ── Lagrangian controller (REVISION 2026-05-17 晚): 回到成功区间 ──────────────
-# 失败 run lag_S1g_prepos_clearance_conservative_seed0 (16:08): λ 36 epoch 涨 0.001,
-# absorb_sphere 64/epoch 不降, geom_hold_rate=0.
-# 失败 run lag_s1_clearance_datacom_cost_seed0 (16:51): D-ATACOM no-clip cost,
-# lrλ=0.01, γc=0.99, 到 epoch 42 λ≈2.0 仍 absorb_sphere=64, geom_hold=0.
+# ★★★ B route hybrid (2026-05-17 evening) ★★★
+# Sphere proxy   = pure cost signal (no terminate, no cliff)
+#                  → continuous safety violation for cost critic + λ
+# PhysX contact  = absorbing terminate + cliff
+#                  → guards against suicide (cliff makes early-terminate expensive)
+#                  → guards against sim instability (real arm-arm overlap)
+# Table clearance = geometry proxy hard absorbing + clearance cost
+#                  → guards harder/later-stage poses from hitting the tabletop
 #
-# 成功参考:
-#   run-20260516_174954: clipped clearance, no collision cliff, lrλ=0.05,
-#     init_logλ=1, γc=0.7; epoch 28 hold=1, epoch 35 absorb_sphere=0.
-#   run-20260516_164710: clipped clearance, no collision cliff, lrλ=0.05,
-#     init_logλ=0, γc=0.7; epoch 39 hold=1, later absorb_sphere=0.
+# enable_physx_arm_collision adds capsule colliders to iiwa arm links so PhysX
+# arm-arm contact actually triggers (USD has no CollisionAPI on arm links).
+# Without it, physx_collision_terminates is dead code.
+sphere_collision_terminates: false
+physx_collision_terminates: true
+keep_collision_reward_penalty: true        # cliff only on PhysX/table (cost env splits)
+enable_physx_arm_collision: true
+enable_table_collision: true
+table_collision_terminates: true
+table_z: 0.0
+table_clearance_hard: 0.0
+table_clearance_cost_margin: 0.03
+
+# ── Lagrangian controller (REVISION 2026-05-17 晚 v4): B route 重标定 ──────────
+# 设计沿革:
+#   v1 (conservative): lrλ=0.001, init_logλ=-2.3, cost_lim=1.0 → λ 36 epoch 不动
+#   v2 (active):       lrλ=0.01,  init_logλ=0,    cost_lim=1.0 → λ 42 epoch λ≈2 仍 fail
+#   v3 (fast):         lrλ=0.05,  init_logλ=1,    cost_lim=1.5 → ✓ Stage 1 verified 在旧 sphere absorb 模式
+#   v4 (B route):      lrλ=0.005, init_logλ=0,    cost_lim=50  → B route 重标定
 #
-# no-clip clearance cost 比旧 clipped cost 大约 2x, 因此 cost_limit 用 1.5
-# 而不是 0.5, 避免 λ 过度暴冲, 但仍保持明显 violation.
-cost_limit_per_ep: 1.5
+# B route 标定依据 (smoke run 20260517_2146):
+#   sphere_collision_terminates=false 让 episode 跑满 100 步 (不再被 sphere absorb 截断),
+#   rollout_ep_cost 量级从旧 1.5 跳到 0-263 (epoch 2 达 263.6, 因为大量 sphere overlap 不再终止).
+#   旧 cost_limit=1.5 在 B route 下 → λ epoch 2 直接顶 lambda_max=20.
+#
+# 新计算:
+#   平均 cost 估计:   rollout 中位值约 ~50 (smoke ep 1-5 mean)
+#   cost_limit_per_ep=50: 允许 binding 但不立即暴冲
+#   lr_lambda=0.005:  violation 早期 50-200 → Δlog_λ ≈ 0.25-1.0/epoch (合理 ramp)
+#   λ_max=20:         维持 (避免 actor 被 λ·Q_C 完全压死)
+#   init_log_lambda=0: λ_init=1.0 (比 v3 的 2.7 温和, 起步不立即扰动 actor)
+#   γ_cost=0.7:       保留 (v3 verified 短视 critic 有效)
+cost_limit_per_ep: 50.0
 lambda_update_mode: rollout_episode_rate
 min_lambda_update_episodes: 16
-lr_lambda: 0.05                  # ★ 回到成功 run 区间; λ 必须在 25-35 epoch 达到 ~4-8
-lambda_max: 20.0                 # 成功峰值约 8-9; no-clip 下 20 足够且防暴冲
+lr_lambda: 0.005                 # ★ B route 量级 ~30x, lr 同比例缩
+lambda_max: 20.0                 # 保留 v3 设置
 lambda_min: 0.0
-init_log_lambda: 1.0             # ★ λ_init=e≈2.7; 对齐最快成功 run-20260516_174954
+init_log_lambda: 0.0             # ★ λ_init=1 (从 v3 的 2.7 降, 起步温和)
 damp_scale: 0.0
-gamma_cost: 0.7                  # ★ 回到成功历史; 短视 cost critic 减少风险过度传播
+gamma_cost: 0.7                  # 保留 v3 verified
 
 # Regularization.
 rew_action: 0.005
@@ -145,7 +168,7 @@ hold_success_steps: 10
 
 # Sphere-proxy 双臂自碰撞 (hard absorbing guard, 独立于 cost signal).
 clearance_hard: 0.0
-proxy_arm_radius: 0.06
+proxy_arm_radius: 0.065
 proxy_ee_radius: 0.04
 
 # Cold-start (no warm-start, 同 SAC Stage 1 baseline).
@@ -155,6 +178,6 @@ keep_replay: false
 
 wandb_project: bimanual_peghole
 wandb_entity: miaoxu010522-lund
-wandb_run_name: lag_S1g_prepos_clearance_datacom_fastlambda_seed0
-wandb_group: lag_s1_clearance_datacom_fastlambda_vs_sac_baseline
+wandb_run_name: lag_S1g_b_route_v4_cost50_lr0p005_calib30ep_seed0
+wandb_group: lag_s1_b_route_v4_calibration
 no_wandb: false

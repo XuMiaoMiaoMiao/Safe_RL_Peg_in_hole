@@ -1,0 +1,138 @@
+train_script: scripts/train_sac.py
+
+# SAC Stage 1g (prepos) — CLEAN SAC BASELINE FOR PAPER COMPARISON vs LagSAC
+#
+# 2026-05-17 v2: B route 对齐 LagSAC v4 env semantics.
+#
+# 设计目标:
+#   SAC 跟 LagSAC (lag_stage1_prepos_clearance_b_route.yaml v4) 共用 env, 同 reward
+#   函数, 直接可比 J/R. 唯一区别是 SAC 没有 cost critic + λ.
+#
+# Reward 函数等价性 (重要):
+#   SAC 通过 train_sac.py → DualArmPegHoleEnv (parent env).
+#   LagSAC 通过 train_sac_lagrangian.py → DualArmPegHoleCostEnv.
+#   两者 reward 在 cost_signal=clearance 且 sphere_collision_terminates=False
+#   情况下数学上等价:
+#     - 都 sum 相同 geom reward components
+#     - 都只对 PhysX collision 触发 cliff (parent env cliff split logic
+#       2026-05-17 添加, 跟 CostEnv override 一致)
+#     - drop_penetration_reward_for_cost 只在 cost_signal=penetration 时触发,
+#       clearance 模式两边都不触发
+#
+# 任务 reward 完全同 LagSAC: rew_geom_d=8, rew_geom_radial_tip=8, 其他 = 0.
+# cost_signal=clearance 让 SAC 也上传 epoch_collision_sphere/eval_ep_cost 作 monitor,
+# wandb 直接跟 LagSAC 同 figure 对比 (SAC 不用 cost 学习, 但记录 cost 供画图).
+
+# Runtime / env count.
+num_envs: 16
+horizon: 100
+render: false
+seed: 0
+use_axis_resid_obs: true
+exclude_ee_from_physx_self_collision: false
+
+# Collection / update cadence.
+n_epochs: 30                      # ★ 30-ep calibration run; 跟 LagSAC 同步, 后扩 120
+n_steps_per_epoch: 1600          # = horizon × num_envs = 100 × 16
+n_steps_per_fit: 16
+utd: null
+critic_warmup_transitions: null
+n_eval_episodes: 16
+
+# Optimizer / entropy (与 LagSAC 完全一致).
+lr_actor: 7e-5
+lr_critic: 3e-4
+lr_alpha: 3e-4
+alpha_max: 0.15
+target_entropy: -7
+actor_grad_clip: null
+
+# Base env.
+initial_joint_noise: 0.1
+preinsert_success_pos_threshold: 0.10
+preinsert_offset: null
+
+# Geom Stage 1g (prepos) targets — 跟 LagSAC 一致.
+geom_stage: prepos
+geom_d_target_neg: -0.08
+geom_d_target_pos: 0.03
+geom_d_target_ramp_start: 0
+geom_d_target_ramp_end: 20
+
+geom_d_sat: 0.30
+geom_radial_sat: 1.5
+
+geom_d_th: 0.030
+geom_r_tip_th: 0.030
+geom_r_max_th: 0.030
+geom_axis_th: 0.400
+geom_insert_d_ins: 0.025
+geom_insert_r_max_th: 0.025
+geom_pen_th: 0.001
+
+# ── Task reward (= LagSAC) ──────────────────────────────────────────────────
+rew_geom_d: 8.0
+rew_geom_radial_tip: 8.0
+rew_geom_radial_max: 0.0
+rew_geom_axis: 0.0
+rew_geom_progress: 0.0
+rew_geom_advance: 0.0
+
+geom_gate_radial_sigma: 0.025
+geom_gate_axis_sigma: 0.30
+geom_gate_penetration_sigma: null
+geom_d_gate_mode: "off"
+
+rew_geom_penetration: 0.0
+rew_geom_soft_success: 0.0
+geom_soft_d_sigma: 0.020
+geom_soft_radial_sigma: 0.015
+geom_soft_axis_sigma: 0.30
+geom_soft_penetration_sigma: null
+
+rew_geom_bad_entry: 0.0
+geom_bad_entry_radial_safe: 0.014
+geom_bad_entry_axis_safe: 0.10
+geom_bad_entry_pen_safe: 0.00075
+
+# ── Cost monitor (SAC 不用 cost 学习, 但上传到 wandb 跟 LagSAC 对比) ──────────
+cost_signal: clearance
+clearance_cost_margin: 0.02
+clearance_cost_clip_max: null
+cost_scale: 1.0
+
+# ── B route env semantics (跟 LagSAC 完全一致) ───────────────────────────────
+# Parent env cliff split 逻辑: sphere_collision_terminates=False 时
+# cliff 只对 PhysX/table absorbing 触发 (与 CostEnv override 等价).
+sphere_collision_terminates: false
+physx_collision_terminates: true
+enable_physx_arm_collision: true
+enable_table_collision: true
+table_collision_terminates: true
+table_z: 0.0
+table_clearance_hard: 0.0
+table_clearance_cost_margin: 0.03
+
+# Sphere-proxy 双臂自碰撞 (跟 LagSAC 一致, 但 sphere 不再 terminate, 只算 cost).
+clearance_hard: 0.0
+proxy_arm_radius: 0.065
+proxy_ee_radius: 0.04
+
+# Regularization (= LagSAC).
+rew_action: 0.005
+rew_home: 0.00075
+home_weights: "1,1,1,1,0.75,0.5,0.5"
+
+terminal_hold_bonus: 0.0
+hold_success_steps: 10
+
+# Cold-start, no warm-start.
+load_agent: null
+actor_only_warmstart: false
+keep_replay: false
+
+wandb_project: bimanual_peghole
+wandb_entity: miaoxu010522-lund
+wandb_run_name: sac_S1g_b_route_v4_calib30ep_seed0
+wandb_group: lag_s1_b_route_v4_calibration
+no_wandb: false

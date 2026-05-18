@@ -406,6 +406,10 @@ def parse_args():
                    help="home regularizer 逐关节权重. 接受 7 维单臂或 14 维完整权重.")
     # env 几何 / 物理
     p.add_argument("--initial_joint_noise", type=float, default=None)
+    p.add_argument("--default_pose_variant", type=str, default=None,
+                   choices=["easy", "harder"],
+                   help="Reset pose variant. 'easy' keeps historical HOME_JOINT_POS; "
+                        "'harder' uses crossed-forearm reset pose.")
     p.add_argument("--preinsert_success_pos_threshold", type=float, default=None)
     p.add_argument("--preinsert_offset", type=float, default=None)
     p.add_argument("--success_axis_threshold", type=float, default=None)
@@ -431,6 +435,21 @@ def parse_args():
                         "默认禁止, 避免旧球形 reward manifold 污染 geom 路径; 仅 ablation 使用.")
     p.add_argument("--proxy_arm_radius", type=float, default=None)
     p.add_argument("--proxy_ee_radius", type=float, default=None)
+    p.add_argument("--enable_table_collision",
+                   action=argparse.BooleanOptionalAction, default=False,
+                   help="Enable geometry-plane arm/EE-vs-table clearance safety. "
+                        "When enabled, hard absorbing can fire on table contact and "
+                        "cost_signal=clearance includes table clearance violation.")
+    p.add_argument("--table_collision_terminates",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="If table safety is enabled, terminate episode when "
+                        "table clearance falls below table_clearance_hard.")
+    p.add_argument("--table_z", type=float, default=None,
+                   help="World/env-local table top z for proxy clearance. Default 0.0.")
+    p.add_argument("--table_clearance_hard", type=float, default=None,
+                   help="Hard absorbing threshold for arm/EE table clearance. Default 0.0m.")
+    p.add_argument("--table_clearance_cost_margin", type=float, default=None,
+                   help="Margin for table clearance cost. Default 0.03m.")
     p.add_argument("--exclude_ee_from_physx_self_collision", action="store_true",
                    help="Stage 3 peg/hole 真实 collider 用: PhysX arm_L vs arm_R "
                         "self-collision 分组排除左右 EE link, 避免正常 peg-hole "
@@ -486,6 +505,10 @@ def parse_args():
                    help="CMDP cost 信号: collision=机器人碰撞0/1; penetration=连续 penetration_max; "
                         "clearance=双臂 proxy clearance margin cost.")
     p.add_argument("--clearance_cost_margin", type=float, default=None)
+    p.add_argument("--clearance_cost_clip_max", type=float, default=None,
+                   help="Optional upper clip for clearance cost. Default None = "
+                        "D-ATACOM-style max((margin-clearance)/margin, 0) with "
+                        "no upper clip; pass 1.0 to reproduce the old [0,1] cost.")
     p.add_argument("--cost_scale", type=float, default=None,
                    help="Multiplicative gain on info['cost'] / env.cost(). "
                         "Default None = env default (1.0). For cost_signal=penetration "
@@ -496,6 +519,22 @@ def parse_args():
                    action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--drop_penetration_reward_for_cost",
                    action=argparse.BooleanOptionalAction, default=True)
+    # 2026-05-17: split absorbing sources (sphere proxy vs PhysX contact).
+    p.add_argument("--sphere_collision_terminates",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="True (default) preserves legacy behaviour. "
+                        "Set False for D-ATACOM-style: sphere overlap is a "
+                        "continuous cost signal only, does not terminate episode.")
+    p.add_argument("--physx_collision_terminates",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="True (default) keeps PhysX real-contact as episode terminal. "
+                        "Recommended True even in clean CMDP runs as physics-stability guard.")
+    p.add_argument("--enable_physx_arm_collision",
+                   action=argparse.BooleanOptionalAction, default=False,
+                   help="Apply PhysX CollisionAPI to iiwa arm links at runtime via "
+                        "capsule colliders sized from URDF. Without this, "
+                        "epoch_absorb_physx is always 0 because the robot USD has "
+                        "no CollisionAPI on arm links. Default False = legacy.")
     p.add_argument("--geom_progress_floor", type=float, default=None)
     p.add_argument("--rew_geom_advance", type=float, default=None)
     p.add_argument("--geom_d_gate_mode", type=str, default=None,
@@ -574,11 +613,15 @@ def main():
         "rew_joint_limit", "rew_action", "rew_home", "home_weights",
         "axis_gate_radius", "joint_limit_margin_frac",
         # 几何 / 物理
-        "initial_joint_noise", "preinsert_success_pos_threshold",
+        "initial_joint_noise", "default_pose_variant",
+        "preinsert_success_pos_threshold",
         "preinsert_offset", "success_axis_threshold",
         "clearance_hard", "proxy_arm_radius", "proxy_ee_radius",
-        "clearance_cost_margin", "cost_scale", "keep_collision_reward_penalty",
-        "drop_penetration_reward_for_cost",
+        "table_z", "table_clearance_hard", "table_clearance_cost_margin",
+        "clearance_cost_margin", "clearance_cost_clip_max", "cost_scale",
+        "keep_collision_reward_penalty", "drop_penetration_reward_for_cost",
+        "sphere_collision_terminates", "physx_collision_terminates",
+        "enable_physx_arm_collision",
         # Geometric preinsert kwargs:
         "geom_stage", "geom_d_target_neg", "geom_d_target_pos",
         "geom_d_target_ramp_start", "geom_d_target_ramp_end",
@@ -612,6 +655,8 @@ def main():
         env_kwargs["use_axis_resid_obs"] = True
     if args.exclude_ee_from_physx_self_collision:
         env_kwargs["exclude_ee_from_physx_self_collision"] = True
+    env_kwargs["enable_table_collision"] = bool(args.enable_table_collision)
+    env_kwargs["table_collision_terminates"] = bool(args.table_collision_terminates)
     env_kwargs["success_hold_steps"] = args.hold_success_steps
     mdp = DualArmPegHoleCostEnv(**env_kwargs)
     mdp.seed(args.seed)
@@ -827,6 +872,7 @@ def main():
     grad_clip_str = f"{args.actor_grad_clip:.2f}" if args.actor_grad_clip else "off"
     logger.info(f"[Lagrangian] cost_limit_per_ep={args.cost_limit_per_ep:.4f}  "
                 f"cost_signal={mdp._cost_signal}  "
+                f"clearance_clip_max={mdp._clearance_cost_clip_max}  "
                 f"cost_scale={mdp._cost_scale:g}  "
                 f"lr_lambda={args.lr_lambda:.1e}  "
                 f"lambda_max={args.lambda_max:.1f}  lambda_min={args.lambda_min:.4f}  "
@@ -890,6 +936,7 @@ def main():
                     "target_entropy_resolved": target_entropy,
                     "gamma_cost_resolved": gamma_cost_resolved,
                     "cost_signal_resolved": mdp._cost_signal,
+                    "clearance_cost_clip_max_resolved": mdp._clearance_cost_clip_max,
                     "cost_scale_resolved": mdp._cost_scale,
                     "geom_stage_resolved": mdp._geom_stage,
                     "obs_dim": obs_dim, "act_dim": act_dim,
@@ -898,27 +945,79 @@ def main():
         )
         logger.info(f"wandb run: {wandb_run.url}")
 
-        # Dashboard cleanup: hide noisy/debug metrics by default, set proper
-        # summary aggregation on key paper metrics. Future runs auto-organize.
-        # See WANDB_DASHBOARD.md for recommended workspace setup.
+        # ── Wandb dashboard organization (2026-05-17 cleanup) ───────────────
+        # Goal: dashboard shows ONLY paper-grade benchmark metrics by default.
+        # Everything else is hidden (still uploaded for offline analysis, but
+        # not cluttering the default workspace panel grid).
+        #
+        # Paper benchmark categories (kept visible):
+        #   Task return:     J, R, best_J
+        #   Task quality:    geom_hold_rate, geom_max_run_mean, geom_step_rate,
+        #                    geom_final_success_rate, best_geom_*
+        #   Safety events:   epoch_absorb_{sphere,physx,table},
+        #                    epoch_collision_{sphere,physx,table}
+        #   Cost signal:     eval_ep_cost, rollout_ep_cost, cost_limit_per_ep
+        #   Lagrangian:      lambda, eval_ep_violation, rollout_ep_violation
+        #
+        # All `geom_entry_*`, `geom_final_*`, `geom_pen_*`, `geom_radial_*`,
+        # `geom_axis_*`, `geom_d_*`, sub-mask rates, etc. — useful for
+        # post-hoc debugging but noise on training-time dashboard. Hidden.
         wandb.define_metric("epoch")
         wandb.define_metric("*", step_metric="epoch")
-        for pat in ("legacy_eval_*", "warmstart_*", "geom_raw_epoch",
-                    "geom_actor_epoch", "geom_d_target_eff", "env_steps",
-                    "eval_ep_len", "geom_n_ep_with_entry", "alpha"):
+        # Hide everything noisy / derived / debug-only.
+        for pat in (
+            # Existing hidden list (legacy + warmstart + meta diagnostics)
+            "legacy_eval_*", "warmstart_*",
+            "geom_raw_epoch", "geom_actor_epoch", "geom_d_target_eff",
+            "env_steps", "eval_ep_len", "geom_n_ep_with_entry", "alpha",
+            # 2026-05-17 cleanup: hide geom diagnostics noise
+            "geom_d_target_mean", "geom_d_err_mean", "geom_d_err_min",
+            "geom_radial_tip_mean", "geom_radial_tip_min",
+            "geom_radial_max_mean", "geom_radial_max_min",
+            "geom_axis_err_mean", "geom_axis_err_min",
+            "geom_prepos_step_rate", "geom_preaxis_step_rate", "geom_insert_step_rate",
+            "geom_ep_success_rate_mean",
+            # Entry-time diagnostics (useful for post-hoc, not training plot)
+            "geom_entry_d_mean", "geom_entry_d_err_mean",
+            "geom_entry_radial_max_mean", "geom_entry_radial_max_max",
+            "geom_entry_axis_err_mean", "geom_entry_axis_err_max",
+            "geom_entry_penetration_mean", "geom_entry_penetration_max",
+            # Final-state diagnostics (useful for post-hoc, not training plot)
+            "geom_final_d_mean", "geom_final_d_err_mean",
+            "geom_final_radial_max_mean", "geom_final_radial_max_max",
+            "geom_final_axis_err_mean", "geom_final_axis_err_max",
+            "geom_final_penetration_mean", "geom_final_penetration_max",
+            # Penetration analytics (only relevant for penetration-cost runs)
+            "geom_pen_max_mean", "geom_pen_max_max", "geom_clean_step_rate",
+            "geom_pen_in_active_mean", "geom_pen_in_active_max",
+            # Cost / λ internals (derived or string)
+            "log_lambda", "lambda_update_source", "rollout_ep_n",
+            "eval_step_cost", "epoch_absorb", "epoch_collision",
+            # Score / metric-rate duplicates of best_geom_*
+            "best_score", "best_metric_rate", "best_metric_max_run_mean",
+            "best_hold_rate", "best_hold_max_hold_mean",
+        ):
             wandb.define_metric(pat, hidden=True)
-        # Best/peak metrics: keep MAX summary (track peak across epochs).
-        for m in ("best_J", "best_score", "best_geom_rate",
-                  "best_geom_max_run_mean", "best_hold_rate",
-                  "best_hold_max_hold_mean"):
+        # ── Summary aggregations (run table column ordering) ────────────────
+        # Best/peak metrics: MAX summary (track peak across epochs).
+        for m in ("best_J", "best_geom_rate", "best_geom_max_run_mean"):
             wandb.define_metric(m, summary="max")
-        # Last-value summary on dynamic metrics (the LAST epoch value, not max).
-        for m in ("lambda", "log_lambda", "rollout_ep_cost", "eval_ep_cost",
-                  "rollout_ep_violation", "eval_ep_violation", "rollout_ep_n",
-                  "final_lambda"):
-            wandb.define_metric(m, summary="last")
-        # Last epoch safety counters (lower is better, but final state matters).
-        for m in ("epoch_absorb", "eval_step_cost"):
+        # Per-epoch metrics: LAST summary (final epoch value).
+        for m in (
+            # Task return
+            "J", "R",
+            # Task quality (current epoch)
+            "geom_hold_rate", "geom_max_run_mean", "geom_step_rate",
+            "geom_final_success_rate",
+            # Safety (last epoch)
+            "epoch_absorb_total", "epoch_collision_total",
+            "epoch_absorb_sphere", "epoch_absorb_physx", "epoch_absorb_table",
+            "epoch_collision_sphere", "epoch_collision_physx", "epoch_collision_table",
+            # Cost / λ (last epoch)
+            "eval_ep_cost", "rollout_ep_cost",
+            "eval_ep_violation", "rollout_ep_violation",
+            "cost_limit_per_ep", "lambda", "final_lambda",
+        ):
             wandb.define_metric(m, summary="last")
 
     empty_dataset = Dataset.generate(mdp.info, agent.info, n_steps=1, n_envs=args.num_envs)
@@ -1003,9 +1102,17 @@ def main():
             int(logging_state["absorb_count"]),
             int(logging_state["absorb_count_physx"]),
             int(logging_state["absorb_count_sphere"]),
+            int(logging_state.get("absorb_count_table", 0)),
+            int(logging_state.get("collision_count", 0)),
+            int(logging_state.get("collision_count_physx", 0)),
+            int(logging_state.get("collision_count_sphere", 0)),
+            int(logging_state.get("collision_count_table", 0)),
         )
 
-    absorb_prev, absorb_physx_prev, absorb_sphere_prev = _cmdp_absorb_counts()
+    (
+        absorb_prev, absorb_physx_prev, absorb_sphere_prev, absorb_table_prev,
+        coll_prev, coll_physx_prev, coll_sphere_prev, coll_table_prev,
+    ) = _cmdp_absorb_counts()
 
     for epoch in range(args.n_epochs):
         actor_epoch = max(0, epoch - critic_only_epochs)
@@ -1054,10 +1161,18 @@ def main():
             clamp_alpha()
         total_env_steps += args.n_steps_per_epoch
 
-        absorb_now, absorb_physx_now, absorb_sphere_now = _cmdp_absorb_counts()
+        (
+            absorb_now, absorb_physx_now, absorb_sphere_now, absorb_table_now,
+            coll_now, coll_physx_now, coll_sphere_now, coll_table_now,
+        ) = _cmdp_absorb_counts()
         absorb_epoch = absorb_now - absorb_prev
         absorb_physx_epoch = absorb_physx_now - absorb_physx_prev
         absorb_sphere_epoch = absorb_sphere_now - absorb_sphere_prev
+        absorb_table_epoch = absorb_table_now - absorb_table_prev
+        coll_epoch = coll_now - coll_prev
+        coll_physx_epoch = coll_physx_now - coll_physx_prev
+        coll_sphere_epoch = coll_sphere_now - coll_sphere_prev
+        coll_table_epoch = coll_table_now - coll_table_prev
 
         # Disable tracker during eval: eval runs the deterministic policy, and
         # those episode costs must NOT enter the rollout buffer (different policy,
@@ -1118,7 +1233,10 @@ def main():
             agent.save(str(best_hold_path))
             agent.save(str(best_hold_path_flat))
 
-        absorb_prev, absorb_physx_prev, absorb_sphere_prev = _cmdp_absorb_counts()
+        (
+            absorb_prev, absorb_physx_prev, absorb_sphere_prev, absorb_table_prev,
+            coll_prev, coll_physx_prev, coll_sphere_prev, coll_table_prev,
+        ) = _cmdp_absorb_counts()
 
         lambda_val = float(agent._log_lambda.exp().item())
         rollout_ep_cost = float(getattr(agent, "_rollout_ep_cost", float("nan")))
@@ -1201,8 +1319,14 @@ def main():
                     f"rollout_ep_violation={rollout_ep_violation:+.4f}  "
                     f"rollout_ep_n={_rollout_n_ep}  "
                     f"λ={lambda_val:.3f}  "
+                    f"epoch_absorb_total={absorb_epoch}  "
                     f"epoch_absorb_sphere={absorb_sphere_epoch}  "
-                    f"epoch_absorb_physx={absorb_physx_epoch}")
+                    f"epoch_absorb_physx={absorb_physx_epoch}  "
+                    f"epoch_absorb_table={absorb_table_epoch}  "
+                    f"epoch_collision_total={coll_epoch}  "
+                    f"epoch_collision_sphere={coll_sphere_epoch}  "
+                    f"epoch_collision_physx={coll_physx_epoch}  "
+                    f"epoch_collision_table={coll_table_epoch}")
 
         if wandb_run is not None:
             _legacy = (lambda k: f"legacy_{k}") if mg is not None else (lambda k: k)
@@ -1297,10 +1421,20 @@ def main():
                 "eval_ep_cost": c["cost_episode_sum_mean"],
                 "eval_ep_violation": eval_ep_violation,
                 "cost_limit_per_ep": args.cost_limit_per_ep,
-                # absorb 计数 (epoch 级别)
+                # absorb 计数 (epoch 级别) — collisions that actually terminated
                 "epoch_absorb": absorb_epoch,
+                "epoch_absorb_total": absorb_epoch,
                 "epoch_absorb_physx": absorb_physx_epoch,
                 "epoch_absorb_sphere": absorb_sphere_epoch,
+                "epoch_absorb_table": absorb_table_epoch,
+                # collision event 计数 — all events regardless of termination.
+                # In B route (sphere_collision_terminates=false), only these reveal
+                # how often the sphere proxy actually fired as a cost signal.
+                "epoch_collision": coll_epoch,
+                "epoch_collision_total": coll_epoch,
+                "epoch_collision_physx": coll_physx_epoch,
+                "epoch_collision_sphere": coll_sphere_epoch,
+                "epoch_collision_table": coll_table_epoch,
             }, step=epoch + 1)
 
     agent.save(str(final_path))

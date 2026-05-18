@@ -116,6 +116,11 @@ hold_success_steps: 10
 clearance_hard: 0.0
 proxy_arm_radius: 0.06
 proxy_ee_radius: 0.04
+enable_table_collision: true
+table_collision_terminates: true
+table_z: 0.0
+table_clearance_hard: 0.0
+table_clearance_cost_margin: 0.03
 
 # Warm-start: 从 Stage 1g best_hold actor-only 热启动; critic / α / replay 冷启动.
 load_agent: results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/best_hold.msh

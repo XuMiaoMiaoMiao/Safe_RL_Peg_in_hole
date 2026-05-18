@@ -103,6 +103,11 @@ hold_success_steps: 10
 clearance_hard: 0.0
 proxy_arm_radius: 0.06
 proxy_ee_radius: 0.04
+enable_table_collision: true
+table_collision_terminates: true
+table_z: 0.0
+table_clearance_hard: 0.0
+table_clearance_cost_margin: 0.03
 
 # Use the successful local Lagrangian Stage 1g checkpoint, not the current
 # flat results/best_hold_lag.msh (which may point to a later failed stage).

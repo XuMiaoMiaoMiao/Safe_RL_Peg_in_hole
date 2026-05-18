@@ -79,13 +79,28 @@ class DualArmPegHoleCostEnv(DualArmPegHoleEnv):
     # Diagnostics consumed by scripts/train_sac_lagrangian.py.
     # ------------------------------------------------------------------
     def get_logging_state(self):
-        """Return CMDP diagnostics consumed by training/logging code."""
+        """Return CMDP diagnostics consumed by training/logging code.
+
+        2026-05-17: collision_count_* tracks ALL collision events (independent
+        of whether they terminated the episode). absorb_count_* only counts
+        events that actually terminated. Under B route (sphere_collision_terminates
+        =false) absorb_count_sphere is always 0 but collision_count_sphere
+        reflects how often the sphere proxy fires — needed to verify that
+        cost critic is receiving the safety signal it expects.
+        """
         return {
             "absorb_count": self._absorb_count,
             "absorb_count_physx": self._absorb_count_physx,
             "absorb_count_sphere": self._absorb_count_sphere,
+            "absorb_count_table": getattr(self, "_absorb_count_table", 0),
+            "collision_count": self._collision_count,
+            "collision_count_physx": self._collision_count_physx,
+            "collision_count_sphere": self._collision_count_sphere,
+            "collision_count_table": getattr(self, "_collision_count_table", 0),
             "last_min_clearance": self._last_min_clearance,
+            "last_min_table_clearance": getattr(self, "_last_min_table_clearance", None),
             "last_collision_mask": self._last_collision_mask,
+            "last_table_collision_mask": getattr(self, "_last_table_collision_mask", None),
             "last_success_mask": self._last_success_mask,
         }
 
@@ -109,14 +124,31 @@ class DualArmPegHoleCostEnv(DualArmPegHoleEnv):
         if (
             self._keep_collision_reward_penalty
             and self._cost_signal in ("collision", "clearance")
-            and self._last_collision_mask is not None
         ):
-            absorbing_r = self._r_min / (1.0 - self.info.gamma)
-            r = torch.where(
-                self._last_collision_mask,
-                torch.full_like(r, absorbing_r),
-                r,
-            )
+            # 2026-05-17 hybrid B route: when sphere is configured as a *cost
+            # signal* (sphere_collision_terminates=False), the cliff should only
+            # fire on PhysX real-contact events — sphere events are handled by
+            # the cost critic + λ. When sphere DOES terminate, cliff still
+            # covers both (legacy behaviour).
+            if (
+                not self._sphere_collision_terminates
+                and self._last_physx_collision_mask is not None
+            ):
+                cliff_mask = self._last_physx_collision_mask
+                table_mask = getattr(self, "_last_table_collision_mask", None)
+                if table_mask is not None:
+                    cliff_mask = cliff_mask | table_mask
+            elif self._last_collision_mask is not None:
+                cliff_mask = self._last_collision_mask
+            else:
+                cliff_mask = None
+            if cliff_mask is not None:
+                absorbing_r = self._r_min / (1.0 - self.info.gamma)
+                r = torch.where(
+                    cliff_mask,
+                    torch.full_like(r, absorbing_r),
+                    r,
+                )
         return self._reward_scale * r
 
     # ------------------------------------------------------------------
@@ -126,12 +158,7 @@ class DualArmPegHoleCostEnv(DualArmPegHoleEnv):
         if self._cost_signal == "penetration" and self._cached_penetration_max is not None:
             c = self._cached_penetration_max.to(torch.float32)
         elif self._cost_signal == "clearance" and self._last_min_clearance is not None:
-            c = torch.clamp(
-                (self._clearance_cost_margin - self._last_min_clearance)
-                / self._clearance_cost_margin,
-                min=0.0,
-                max=1.0,
-            ).to(torch.float32)
+            c = self._compute_clearance_cost_signal()
         elif self._last_collision_mask is None:
             c = torch.zeros(self._n_envs, dtype=torch.float32, device=self._device)
         else:

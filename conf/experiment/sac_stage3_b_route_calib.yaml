@@ -1,0 +1,125 @@
+train_script: scripts/train_sac.py
+
+# SAC Stage 3g (insert) — B route calibration baseline (50ep)
+#
+# 目的: 与 lag_stage3_b_route_calib.yaml 做对照. 完全相同 task reward + 完全相同
+# B route 拓扑 (sphere=monitor, PhysX=guard), 唯一区别: SAC 不带 Lagrangian λ.
+#
+# SAC 仍开启 clearance cost 但只用作 monitoring (Lagrangian critic 不更新 actor).
+# Reward 端的 collision penalty 仍由 cliff (PhysX) 提供, 等于 sac_stage3_insert.yaml
+# 行为外加 sphere ↛ terminate (不再被球形 proxy 提前打断).
+#
+# 通过这对照可回答: B route 重构本身改变了 SAC 性能吗? 还是只有 LagSAC 在 B route
+# 下才显出优势?
+
+# Runtime / env count.
+num_envs: 16
+horizon: 200
+render: false
+seed: 1
+use_axis_resid_obs: true
+exclude_ee_from_physx_self_collision: true
+
+# Collection / update cadence.
+n_epochs: 100
+n_steps_per_epoch: 3200
+n_steps_per_fit: 16
+utd: null
+critic_warmup_transitions: 30000
+n_eval_episodes: 16
+
+# Optimizer / entropy.
+lr_actor: 1e-5
+lr_critic: 3e-4
+lr_alpha: 3e-4
+alpha_max: 0.015
+target_entropy: -7
+
+# Base env.
+initial_joint_noise: 0.1
+preinsert_success_pos_threshold: 0.10
+preinsert_offset: null
+
+# Geom Stage 3g reward design (= sac_stage3_insert.yaml).
+geom_stage: insert
+geom_d_target_neg: -0.08
+geom_d_target_pos: 0.03
+geom_d_target_ramp_start: 0
+geom_d_target_ramp_end: 20
+geom_progress_floor: 0.0
+
+geom_d_sat: 0.30
+geom_radial_sat: 1.0
+
+geom_d_th: 0.020
+geom_r_tip_th: 0.015
+geom_r_max_th: 0.025
+geom_axis_th: 0.300
+geom_insert_d_ins: 0.025
+geom_insert_r_max_th: 0.025
+geom_pen_th: 0.001
+
+rew_geom_d: 1.0
+rew_geom_radial_tip: 0.0
+rew_geom_radial_max: 5.0
+rew_geom_axis: 1.0
+rew_geom_progress: 0.0
+rew_geom_advance: 25.0
+
+geom_gate_radial_sigma: 0.025
+geom_gate_axis_sigma: 0.30
+geom_gate_penetration_sigma: 0.005
+geom_d_gate_mode: "off"
+
+rew_geom_penetration: 20.0
+rew_geom_soft_success: 1.25
+geom_soft_d_sigma: 0.018
+geom_soft_radial_sigma: 0.009
+geom_soft_axis_sigma: 0.15
+geom_soft_penetration_sigma: 0.0025
+
+rew_geom_bad_entry: 0.30
+geom_bad_entry_radial_safe: 0.014
+geom_bad_entry_axis_safe: 0.10
+geom_bad_entry_pen_safe: 0.00075
+
+# Cost monitoring (D-ATACOM-style clearance, scale=1).
+# SAC 不用 cost 训练 actor — 仅作 wandb 监控 / paper 对比.
+cost_signal: clearance
+clearance_cost_margin: 0.02
+clearance_cost_clip_max: null
+cost_scale: 1.0
+
+# B route 拓扑 (与 LagSAC 完全相同, 保证可比性).
+sphere_collision_terminates: false
+physx_collision_terminates: true
+# keep_collision_reward_penalty: 仅 LagSAC CostEnv 用; parent env (SAC) 不接受此 arg.
+enable_physx_arm_collision: true
+enable_table_collision: true
+table_collision_terminates: true
+table_z: 0.0
+table_clearance_hard: 0.0
+table_clearance_cost_margin: 0.03
+
+# Regularization.
+rew_action: 0.005
+rew_home: 0.001
+home_weights: "1,1,1,1,0.75,0.5,0.5"
+
+terminal_hold_bonus: 0.0
+hold_success_steps: 10
+
+clearance_hard: 0.0
+proxy_arm_radius: 0.06
+proxy_ee_radius: 0.04
+
+# Warm-start: same Stage 2g best_hold.
+load_agent: results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00/best_hold.msh
+actor_only_warmstart: true
+keep_replay: false
+
+wandb_project: bimanual_peghole
+wandb_entity: miaoxu010522-lund
+wandb_run_name: sac_S3g_b_route_calib_100ep_seed1
+wandb_group: sac_s3_b_route_calibration
+no_wandb: false
