@@ -1,0 +1,248 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="820" viewBox="0 0 1180 820">
+<style>
+text{font-family:Arial,Helvetica,sans-serif;fill:#111827}
+.suptitle{font-size:22px;font-weight:700}
+.subtitle{font-size:13px;fill:#4b5563}
+.title{font-size:15px;font-weight:700}
+.label{font-size:12px;fill:#374151}
+.curve-label{font-size:12px;font-weight:700}
+.tick{font-size:11px;fill:#4b5563}
+.grid{stroke:#e5e7eb;stroke-width:1}
+.axis{stroke:#111827;stroke-width:1.2}
+</style>
+<text x="590.0" y="30" text-anchor="middle" class="suptitle">SAC vs LagSAC, Stage 1 default pose</text>
+<text x="590.0" y="52" text-anchor="middle" class="subtitle">Paper-aligned panels. Proxies: return=J; max violation=max(eval_step_cost, rollout_ep_cost/100); episodic cost=eval_ep_cost.</text>
+<rect x="430" y="66" width="18" height="10" fill="#2563eb" opacity="0.16"/>
+<line x1="430" y1="71" x2="466" y2="71" stroke="#2563eb" stroke-width="3"/>
+<circle cx="448" cy="71" r="3" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<text x="474" y="75" class="label">LagSAC</text>
+<rect x="595" y="66" width="18" height="10" fill="#d97706" opacity="0.16"/>
+<line x1="595" y1="71" x2="631" y2="71" stroke="#d97706" stroke-width="3"/>
+<circle cx="613" cy="71" r="3" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<text x="639" y="75" class="label">SAC</text>
+<text x="760" y="75" class="subtitle">shaded band = std</text>
+<g class="panel">
+<rect x="40" y="100" width="560" height="315" fill="white"/>
+<text x="320.0" y="118" text-anchor="middle" class="title">Discounted Return</text>
+<line x1="98" y1="340.9" x2="582" y2="340.9" class="grid"/>
+<text x="90" y="344.9" text-anchor="end" class="tick">-400</text>
+<line x1="98" y1="281.2" x2="582" y2="281.2" class="grid"/>
+<text x="90" y="285.2" text-anchor="end" class="tick">-300</text>
+<line x1="98" y1="221.5" x2="582" y2="221.5" class="grid"/>
+<text x="90" y="225.5" text-anchor="end" class="tick">-200</text>
+<line x1="98" y1="161.8" x2="582" y2="161.8" class="grid"/>
+<text x="90" y="165.8" text-anchor="end" class="tick">-100</text>
+<line x1="164.8" y1="134" x2="164.8" y2="371" class="grid"/>
+<text x="164.8" y="389" text-anchor="middle" class="tick">5</text>
+<line x1="248.2" y1="134" x2="248.2" y2="371" class="grid"/>
+<text x="248.2" y="389" text-anchor="middle" class="tick">10</text>
+<line x1="331.7" y1="134" x2="331.7" y2="371" class="grid"/>
+<text x="331.7" y="389" text-anchor="middle" class="tick">15</text>
+<line x1="415.1" y1="134" x2="415.1" y2="371" class="grid"/>
+<text x="415.1" y="389" text-anchor="middle" class="tick">20</text>
+<line x1="498.6" y1="134" x2="498.6" y2="371" class="grid"/>
+<text x="498.6" y="389" text-anchor="middle" class="tick">25</text>
+<line x1="582.0" y1="134" x2="582.0" y2="371" class="grid"/>
+<text x="582.0" y="389" text-anchor="middle" class="tick">30</text>
+<line x1="98" y1="371" x2="582" y2="371" class="axis"/>
+<line x1="98" y1="134" x2="98" y2="371" class="axis"/>
+<text x="340.0" y="407" text-anchor="middle" class="label">Epoch</text>
+<text x="54" y="252.5" transform="rotate(-90 54 252.5)" text-anchor="middle" class="label">J (higher is better)</text>
+<polygon points="98.0,293.5 114.7,262.1 131.4,260.7 148.1,245.8 164.8,256.4 181.4,230.4 198.1,220.3 214.8,216.8 231.5,197.4 248.2,191.8 264.9,174.6 281.6,178.2 298.3,170.4 315.0,167.6 331.7,160.7 348.3,158.3 365.0,161.1 381.7,162.5 398.4,155.3 415.1,151.3 431.8,158.2 448.5,151.2 465.2,154.1 481.9,154.2 498.6,157.1 515.2,153.6 531.9,154.3 548.6,153.3 565.3,154.0 582.0,153.2 582.0,165.2 565.3,161.2 548.6,164.6 531.9,165.9 515.2,171.9 498.6,173.5 481.9,186.6 465.2,186.4 448.5,191.9 431.8,185.0 415.1,208.7 398.4,208.7 381.7,208.5 365.0,209.4 348.3,224.2 331.7,232.8 315.0,219.3 298.3,227.7 281.6,256.5 264.9,244.8 248.2,277.0 231.5,287.1 214.8,313.5 198.1,335.1 181.4,346.9 164.8,334.6 148.1,342.0 131.4,308.6 114.7,354.7 98.0,304.9" fill="#2563eb" opacity="0.16"/>
+<path d="M 98.0 299.2 L 114.7 308.4 L 131.4 284.7 L 148.1 293.9 L 164.8 295.5 L 181.4 288.7 L 198.1 277.7 L 214.8 265.2 L 231.5 242.3 L 248.2 234.4 L 264.9 209.7 L 281.6 217.3 L 298.3 199.0 L 315.0 193.5 L 331.7 196.7 L 348.3 191.2 L 365.0 185.2 L 381.7 185.5 L 398.4 182.0 L 415.1 180.0 L 431.8 171.6 L 448.5 171.5 L 465.2 170.3 L 481.9 170.4 L 498.6 165.3 L 515.2 162.8 L 531.9 160.1 L 548.6 159.0 L 565.3 157.6 L 582.0 159.2" fill="none" stroke="#2563eb" stroke-width="2.6"/>
+<circle cx="98.0" cy="299.2" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="148.1" cy="293.9" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="198.1" cy="277.7" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="248.2" cy="234.4" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="298.3" cy="199.0" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="348.3" cy="191.2" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="398.4" cy="182.0" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="448.5" cy="171.5" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="498.6" cy="165.3" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="548.6" cy="159.0" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<text x="536.0" y="151.2" fill="#2563eb" class="curve-label">LagSAC</text>
+<polygon points="98.0,293.4 114.7,287.9 131.4,268.5 148.1,275.1 164.8,292.3 181.4,275.2 198.1,248.2 214.8,226.9 231.5,213.6 248.2,214.4 264.9,207.0 281.6,196.1 298.3,196.2 315.0,182.3 331.7,182.3 348.3,170.4 365.0,168.3 381.7,166.2 398.4,165.4 415.1,163.3 431.8,163.8 448.5,156.6 465.2,157.4 481.9,157.4 498.6,157.5 515.2,152.3 531.9,151.6 548.6,150.3 565.3,151.7 582.0,151.3 582.0,195.1 565.3,198.2 548.6,204.4 531.9,206.5 515.2,203.1 498.6,207.8 481.9,212.4 465.2,211.6 448.5,221.4 431.8,227.6 415.1,230.1 398.4,238.0 381.7,242.4 365.0,253.6 348.3,253.8 331.7,262.9 315.0,258.1 298.3,263.8 281.6,269.4 264.9,268.4 248.2,272.5 231.5,277.2 214.8,295.3 198.1,307.3 181.4,344.4 164.8,341.5 148.1,341.3 131.4,299.2 114.7,328.9 98.0,304.9" fill="#d97706" opacity="0.16"/>
+<path d="M 98.0 299.2 L 114.7 308.4 L 131.4 283.8 L 148.1 308.2 L 164.8 316.9 L 181.4 309.8 L 198.1 277.8 L 214.8 261.1 L 231.5 245.4 L 248.2 243.4 L 264.9 237.7 L 281.6 232.7 L 298.3 230.0 L 315.0 220.2 L 331.7 222.6 L 348.3 212.1 L 365.0 211.0 L 381.7 204.3 L 398.4 201.7 L 415.1 196.7 L 431.8 195.7 L 448.5 189.0 L 465.2 184.5 L 481.9 184.9 L 498.6 182.7 L 515.2 177.7 L 531.9 179.1 L 548.6 177.4 L 565.3 175.0 L 582.0 173.2" fill="none" stroke="#d97706" stroke-width="2.6"/>
+<circle cx="98.0" cy="299.2" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="148.1" cy="308.2" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="198.1" cy="277.8" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="248.2" cy="243.4" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="298.3" cy="230.0" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="348.3" cy="212.1" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="398.4" cy="201.7" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="448.5" cy="189.0" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="498.6" cy="182.7" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="548.6" cy="177.4" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<text x="536.0" y="187.2" fill="#d97706" class="curve-label">SAC</text>
+</g>
+<g class="panel">
+<rect x="610" y="100" width="560" height="315" fill="white"/>
+<text x="890.0" y="118" text-anchor="middle" class="title">Maximum Violation</text>
+<line x1="668" y1="371.0" x2="1152" y2="371.0" class="grid"/>
+<text x="660" y="375.0" text-anchor="end" class="tick">0</text>
+<line x1="668" y1="320.2" x2="1152" y2="320.2" class="grid"/>
+<text x="660" y="324.2" text-anchor="end" class="tick">1</text>
+<line x1="668" y1="269.5" x2="1152" y2="269.5" class="grid"/>
+<text x="660" y="273.5" text-anchor="end" class="tick">2</text>
+<line x1="668" y1="218.7" x2="1152" y2="218.7" class="grid"/>
+<text x="660" y="222.7" text-anchor="end" class="tick">3</text>
+<line x1="668" y1="167.9" x2="1152" y2="167.9" class="grid"/>
+<text x="660" y="171.9" text-anchor="end" class="tick">4</text>
+<line x1="734.8" y1="134" x2="734.8" y2="371" class="grid"/>
+<text x="734.8" y="389" text-anchor="middle" class="tick">5</text>
+<line x1="818.2" y1="134" x2="818.2" y2="371" class="grid"/>
+<text x="818.2" y="389" text-anchor="middle" class="tick">10</text>
+<line x1="901.7" y1="134" x2="901.7" y2="371" class="grid"/>
+<text x="901.7" y="389" text-anchor="middle" class="tick">15</text>
+<line x1="985.1" y1="134" x2="985.1" y2="371" class="grid"/>
+<text x="985.1" y="389" text-anchor="middle" class="tick">20</text>
+<line x1="1068.6" y1="134" x2="1068.6" y2="371" class="grid"/>
+<text x="1068.6" y="389" text-anchor="middle" class="tick">25</text>
+<line x1="1152.0" y1="134" x2="1152.0" y2="371" class="grid"/>
+<text x="1152.0" y="389" text-anchor="middle" class="tick">30</text>
+<line x1="668" y1="371" x2="1152" y2="371" class="axis"/>
+<line x1="668" y1="134" x2="668" y2="371" class="axis"/>
+<text x="910.0" y="407" text-anchor="middle" class="label">Epoch</text>
+<text x="624" y="252.5" transform="rotate(-90 624 252.5)" text-anchor="middle" class="label">max step-cost proxy</text>
+<polygon points="668.0,184.5 684.7,192.2 701.4,319.9 718.1,337.2 734.8,362.7 751.4,349.6 768.1,351.9 784.8,361.0 801.5,361.8 818.2,361.8 834.9,365.0 851.6,363.4 868.3,349.1 885.0,349.1 901.7,366.2 918.3,346.0 935.0,366.6 951.7,364.4 968.4,350.0 985.1,359.0 1001.8,369.7 1018.5,371.0 1035.2,370.8 1051.9,370.2 1068.6,371.0 1085.2,371.0 1101.9,371.0 1118.6,371.0 1135.3,371.0 1152.0,370.9 1152.0,371.0 1135.3,371.0 1118.6,371.0 1101.9,371.0 1085.2,371.0 1068.6,371.0 1051.9,371.4 1035.2,371.1 1018.5,371.0 1001.8,371.6 985.1,377.2 968.4,381.9 951.7,374.4 935.0,372.9 918.3,380.7 901.7,373.1 885.0,379.3 868.3,378.9 851.6,373.4 834.9,372.7 818.2,374.4 801.5,374.7 784.8,372.4 768.1,374.0 751.4,373.7 734.8,372.2 718.1,384.4 701.4,372.3 684.7,215.2 668.0,217.5" fill="#2563eb" opacity="0.16"/>
+<path d="M 668.0 201.0 L 684.7 203.7 L 701.4 346.1 L 718.1 360.8 L 734.8 367.4 L 751.4 361.6 L 768.1 363.0 L 784.8 366.7 L 801.5 368.2 L 818.2 368.1 L 834.9 368.9 L 851.6 368.4 L 868.3 364.0 L 885.0 364.2 L 901.7 369.6 L 918.3 363.4 L 935.0 369.8 L 951.7 369.4 L 968.4 366.0 L 985.1 368.1 L 1001.8 370.7 L 1018.5 371.0 L 1035.2 370.9 L 1051.9 370.8 L 1068.6 371.0 L 1085.2 371.0 L 1101.9 371.0 L 1118.6 371.0 L 1135.3 371.0 L 1152.0 371.0" fill="none" stroke="#2563eb" stroke-width="2.6"/>
+<circle cx="668.0" cy="201.0" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="718.1" cy="360.8" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="768.1" cy="363.0" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="818.2" cy="368.1" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="868.3" cy="364.0" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="918.3" cy="363.4" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="968.4" cy="366.0" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="1018.5" cy="371.0" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="1068.6" cy="371.0" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="1118.6" cy="371.0" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<text x="1106.0" y="363.0" fill="#2563eb" class="curve-label">LagSAC</text>
+<polygon points="668.0,184.4 684.7,154.6 701.4,226.8 718.1,282.9 734.8,319.0 751.4,364.5 768.1,363.8 784.8,369.5 801.5,361.6 818.2,336.4 834.9,260.4 851.6,249.9 868.3,251.6 885.0,222.7 901.7,281.2 918.3,304.4 935.0,279.3 951.7,304.2 968.4,343.4 985.1,324.0 1001.8,289.6 1018.5,293.4 1035.2,286.6 1051.9,325.2 1068.6,328.0 1085.2,325.4 1101.9,333.1 1118.6,319.4 1135.3,322.2 1152.0,352.3 1152.0,380.4 1135.3,396.0 1118.6,397.3 1101.9,390.3 1085.2,394.7 1068.6,393.3 1051.9,394.4 1035.2,412.1 1018.5,411.3 1001.8,412.5 985.1,393.3 968.4,383.8 951.7,403.6 935.0,407.8 918.3,397.1 901.7,401.5 885.0,384.1 868.3,394.3 851.6,400.1 834.9,400.5 818.2,386.3 801.5,373.5 784.8,371.6 768.1,372.5 751.4,371.7 734.8,386.4 718.1,390.3 701.4,346.9 684.7,218.4 668.0,217.5" fill="#d97706" opacity="0.16"/>
+<path d="M 668.0 200.9 L 684.7 186.5 L 701.4 286.9 L 718.1 336.6 L 734.8 352.7 L 751.4 368.1 L 768.1 368.2 L 784.8 370.5 L 801.5 367.6 L 818.2 361.4 L 834.9 330.4 L 851.6 325.0 L 868.3 322.9 L 885.0 303.4 L 901.7 341.4 L 918.3 350.7 L 935.0 343.5 L 951.7 353.9 L 968.4 363.6 L 985.1 358.6 L 1001.8 351.1 L 1018.5 352.3 L 1035.2 349.3 L 1051.9 359.8 L 1068.6 360.7 L 1085.2 360.1 L 1101.9 361.7 L 1118.6 358.4 L 1135.3 359.1 L 1152.0 366.4" fill="none" stroke="#d97706" stroke-width="2.6"/>
+<circle cx="668.0" cy="200.9" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="718.1" cy="336.6" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="768.1" cy="368.2" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="818.2" cy="361.4" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="868.3" cy="322.9" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="918.3" cy="350.7" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="968.4" cy="363.6" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="1018.5" cy="352.3" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="1068.6" cy="360.7" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="1118.6" cy="358.4" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<text x="1106.0" y="380.4" fill="#d97706" class="curve-label">SAC</text>
+</g>
+<g class="panel">
+<rect x="40" y="450" width="560" height="315" fill="white"/>
+<text x="320.0" y="468" text-anchor="middle" class="title">Episodic Sum of Cost</text>
+<line x1="98" y1="721.0" x2="582" y2="721.0" class="grid"/>
+<text x="90" y="725.0" text-anchor="end" class="tick">0</text>
+<line x1="98" y1="670.6" x2="582" y2="670.6" class="grid"/>
+<text x="90" y="674.6" text-anchor="end" class="tick">100</text>
+<line x1="98" y1="620.3" x2="582" y2="620.3" class="grid"/>
+<text x="90" y="624.3" text-anchor="end" class="tick">200</text>
+<line x1="98" y1="569.9" x2="582" y2="569.9" class="grid"/>
+<text x="90" y="573.9" text-anchor="end" class="tick">300</text>
+<line x1="98" y1="519.6" x2="582" y2="519.6" class="grid"/>
+<text x="90" y="523.6" text-anchor="end" class="tick">400</text>
+<line x1="164.8" y1="484" x2="164.8" y2="721" class="grid"/>
+<text x="164.8" y="739" text-anchor="middle" class="tick">5</text>
+<line x1="248.2" y1="484" x2="248.2" y2="721" class="grid"/>
+<text x="248.2" y="739" text-anchor="middle" class="tick">10</text>
+<line x1="331.7" y1="484" x2="331.7" y2="721" class="grid"/>
+<text x="331.7" y="739" text-anchor="middle" class="tick">15</text>
+<line x1="415.1" y1="484" x2="415.1" y2="721" class="grid"/>
+<text x="415.1" y="739" text-anchor="middle" class="tick">20</text>
+<line x1="498.6" y1="484" x2="498.6" y2="721" class="grid"/>
+<text x="498.6" y="739" text-anchor="middle" class="tick">25</text>
+<line x1="582.0" y1="484" x2="582.0" y2="721" class="grid"/>
+<text x="582.0" y="739" text-anchor="middle" class="tick">30</text>
+<line x1="98" y1="721" x2="582" y2="721" class="axis"/>
+<line x1="98" y1="484" x2="98" y2="721" class="axis"/>
+<text x="340.0" y="757" text-anchor="middle" class="label">Epoch</text>
+<text x="54" y="602.5" transform="rotate(-90 54 602.5)" text-anchor="middle" class="label">eval episode cost</text>
+<polygon points="98.0,536.0 114.7,683.5 131.4,686.3 148.1,719.5 164.8,713.5 181.4,701.6 198.1,703.2 214.8,717.1 231.5,713.5 248.2,717.3 264.9,715.7 281.6,714.2 298.3,700.4 315.0,716.9 331.7,716.5 348.3,696.3 365.0,721.0 381.7,714.4 398.4,709.8 415.1,719.3 431.8,720.8 448.5,721.0 465.2,721.0 481.9,721.0 498.6,721.0 515.2,721.0 531.9,721.0 548.6,721.0 565.3,721.0 582.0,721.0 582.0,721.0 565.3,721.0 548.6,721.0 531.9,721.0 515.2,721.0 498.6,721.0 481.9,721.0 465.2,721.0 448.5,721.0 431.8,721.1 415.1,721.9 398.4,726.8 381.7,724.4 365.0,721.0 348.3,730.7 331.7,722.9 315.0,723.1 298.3,730.1 281.6,723.7 264.9,723.2 248.2,722.6 231.5,724.5 214.8,722.1 198.1,726.2 181.4,726.4 164.8,722.2 148.1,721.5 131.4,733.5 114.7,730.0 98.0,568.7" fill="#2563eb" opacity="0.16"/>
+<path d="M 98.0 552.3 L 114.7 706.8 L 131.4 709.9 L 148.1 720.5 L 164.8 717.9 L 181.4 714.0 L 198.1 714.7 L 214.8 719.6 L 231.5 719.0 L 248.2 720.0 L 264.9 719.4 L 281.6 719.0 L 298.3 715.2 L 315.0 720.0 L 331.7 719.7 L 348.3 713.5 L 365.0 721.0 L 381.7 719.4 L 398.4 718.3 L 415.1 720.6 L 431.8 720.9 L 448.5 721.0 L 465.2 721.0 L 481.9 721.0 L 498.6 721.0 L 515.2 721.0 L 531.9 721.0 L 548.6 721.0 L 565.3 721.0 L 582.0 721.0" fill="none" stroke="#2563eb" stroke-width="2.6"/>
+<circle cx="98.0" cy="552.3" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="148.1" cy="720.5" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="198.1" cy="714.7" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="248.2" cy="720.0" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="298.3" cy="715.2" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="348.3" cy="713.5" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="398.4" cy="718.3" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="448.5" cy="721.0" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="498.6" cy="721.0" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="548.6" cy="721.0" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<text x="536.0" y="713.0" fill="#2563eb" class="curve-label">LagSAC</text>
+<polygon points="98.0,535.8 114.7,504.6 131.4,600.1 148.1,641.4 164.8,669.4 181.4,714.8 198.1,714.0 214.8,719.5 231.5,713.3 248.2,686.7 264.9,611.2 281.6,600.9 298.3,602.6 315.0,574.4 331.7,633.0 348.3,667.4 365.0,638.4 381.7,655.1 398.4,694.1 415.1,674.4 431.8,640.3 448.5,644.0 465.2,637.2 481.9,675.6 498.6,678.4 515.2,675.8 531.9,683.4 548.6,669.9 565.3,672.7 582.0,702.4 582.0,730.4 565.3,745.8 548.6,747.2 531.9,740.2 515.2,744.5 498.6,743.2 481.9,744.2 465.2,761.8 448.5,761.0 431.8,762.2 415.1,743.2 398.4,734.1 381.7,753.8 365.0,753.7 348.3,740.5 331.7,751.6 315.0,734.0 298.3,744.2 281.6,749.9 264.9,750.3 248.2,736.3 231.5,723.0 214.8,721.6 198.1,722.6 181.4,721.8 164.8,736.3 148.1,741.7 131.4,706.5 114.7,582.6 98.0,568.7" fill="#d97706" opacity="0.16"/>
+<path d="M 98.0 552.3 L 114.7 543.6 L 131.4 653.3 L 148.1 691.6 L 164.8 702.9 L 181.4 718.3 L 198.1 718.3 L 214.8 720.5 L 231.5 718.2 L 248.2 711.5 L 264.9 680.8 L 281.6 675.4 L 298.3 673.4 L 315.0 654.2 L 331.7 692.3 L 348.3 704.0 L 365.0 696.1 L 381.7 704.4 L 398.4 714.1 L 415.1 708.8 L 431.8 701.2 L 448.5 702.5 L 465.2 699.5 L 481.9 709.9 L 498.6 710.8 L 515.2 710.1 L 531.9 711.8 L 548.6 708.6 L 565.3 709.2 L 582.0 716.4" fill="none" stroke="#d97706" stroke-width="2.6"/>
+<circle cx="98.0" cy="552.3" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="148.1" cy="691.6" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="198.1" cy="718.3" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="248.2" cy="711.5" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="298.3" cy="673.4" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="348.3" cy="704.0" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="398.4" cy="714.1" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="448.5" cy="702.5" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="498.6" cy="710.8" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="548.6" cy="708.6" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<text x="536.0" y="730.4" fill="#d97706" class="curve-label">SAC</text>
+</g>
+<g class="panel">
+<rect x="610" y="450" width="560" height="315" fill="white"/>
+<text x="890.0" y="468" text-anchor="middle" class="title">Task Success (Ours)</text>
+<line x1="668" y1="721.0" x2="1152" y2="721.0" class="grid"/>
+<text x="660" y="725.0" text-anchor="end" class="tick">0</text>
+<line x1="668" y1="673.6" x2="1152" y2="673.6" class="grid"/>
+<text x="660" y="677.6" text-anchor="end" class="tick">0.2</text>
+<line x1="668" y1="626.2" x2="1152" y2="626.2" class="grid"/>
+<text x="660" y="630.2" text-anchor="end" class="tick">0.4</text>
+<line x1="668" y1="578.8" x2="1152" y2="578.8" class="grid"/>
+<text x="660" y="582.8" text-anchor="end" class="tick">0.6</text>
+<line x1="668" y1="531.4" x2="1152" y2="531.4" class="grid"/>
+<text x="660" y="535.4" text-anchor="end" class="tick">0.8</text>
+<line x1="668" y1="484.0" x2="1152" y2="484.0" class="grid"/>
+<text x="660" y="488.0" text-anchor="end" class="tick">1</text>
+<line x1="734.8" y1="484" x2="734.8" y2="721" class="grid"/>
+<text x="734.8" y="739" text-anchor="middle" class="tick">5</text>
+<line x1="818.2" y1="484" x2="818.2" y2="721" class="grid"/>
+<text x="818.2" y="739" text-anchor="middle" class="tick">10</text>
+<line x1="901.7" y1="484" x2="901.7" y2="721" class="grid"/>
+<text x="901.7" y="739" text-anchor="middle" class="tick">15</text>
+<line x1="985.1" y1="484" x2="985.1" y2="721" class="grid"/>
+<text x="985.1" y="739" text-anchor="middle" class="tick">20</text>
+<line x1="1068.6" y1="484" x2="1068.6" y2="721" class="grid"/>
+<text x="1068.6" y="739" text-anchor="middle" class="tick">25</text>
+<line x1="1152.0" y1="484" x2="1152.0" y2="721" class="grid"/>
+<text x="1152.0" y="739" text-anchor="middle" class="tick">30</text>
+<line x1="668" y1="721" x2="1152" y2="721" class="axis"/>
+<line x1="668" y1="484" x2="668" y2="721" class="axis"/>
+<text x="910.0" y="757" text-anchor="middle" class="label">Epoch</text>
+<text x="624" y="602.5" transform="rotate(-90 624 602.5)" text-anchor="middle" class="label">geom hold success rate</text>
+<polygon points="668.0,721.0 684.7,714.9 701.4,721.0 718.1,708.7 734.8,721.0 751.4,721.0 768.1,684.0 784.8,622.4 801.5,628.5 818.2,650.8 834.9,671.3 851.6,682.7 868.3,634.8 885.0,613.4 901.7,579.3 918.3,548.9 935.0,522.3 951.7,550.4 968.4,523.6 985.1,537.6 1001.8,535.4 1018.5,469.4 1035.2,517.0 1051.9,491.4 1068.6,505.1 1085.2,467.8 1101.9,472.9 1118.6,466.7 1135.3,480.4 1152.0,459.4 1152.0,627.0 1135.3,555.7 1118.6,572.3 1101.9,601.9 1085.2,627.6 1068.6,670.4 1051.9,695.8 1035.2,688.0 1018.5,688.2 1001.8,711.1 985.1,726.6 968.4,746.6 951.7,755.3 935.0,736.0 918.3,742.1 901.7,753.1 885.0,757.4 868.3,753.9 851.6,738.6 834.9,729.2 818.2,746.8 801.5,769.1 784.8,772.2 768.1,740.2 751.4,721.0 734.8,721.0 718.1,727.4 701.4,721.0 684.7,724.2 668.0,721.0" fill="#2563eb" opacity="0.16"/>
+<path d="M 668.0 721.0 L 684.7 719.5 L 701.4 721.0 L 718.1 718.0 L 734.8 721.0 L 751.4 721.0 L 768.1 712.1 L 784.8 697.3 L 801.5 698.8 L 818.2 698.8 L 834.9 700.3 L 851.6 710.6 L 868.3 694.4 L 885.0 685.4 L 901.7 666.2 L 918.3 645.5 L 935.0 629.1 L 951.7 652.8 L 968.4 635.1 L 985.1 632.1 L 1001.8 623.2 L 1018.5 578.8 L 1035.2 602.5 L 1051.9 593.6 L 1068.6 587.7 L 1085.2 547.7 L 1101.9 537.4 L 1118.6 519.5 L 1135.3 518.1 L 1152.0 543.2" fill="none" stroke="#2563eb" stroke-width="2.6"/>
+<circle cx="668.0" cy="721.0" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="718.1" cy="718.0" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="768.1" cy="712.1" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="818.2" cy="698.8" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="868.3" cy="694.4" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="918.3" cy="645.5" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="968.4" cy="635.1" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="1018.5" cy="578.8" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="1068.6" cy="587.7" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<circle cx="1118.6" cy="519.5" r="2.4" fill="white" stroke="#2563eb" stroke-width="1.5"/>
+<text x="1106.0" y="535.2" fill="#2563eb" class="curve-label">LagSAC</text>
+<polygon points="668.0,721.0 684.7,721.0 701.4,721.0 718.1,721.0 734.8,721.0 751.4,721.0 768.1,721.0 784.8,721.0 801.5,721.0 818.2,721.0 834.9,721.0 851.6,684.0 868.3,721.0 885.0,619.8 901.7,658.9 918.3,636.8 935.0,619.9 951.7,630.5 968.4,569.5 985.1,587.8 1001.8,562.7 1018.5,536.3 1035.2,532.6 1051.9,538.1 1068.6,570.3 1085.2,528.3 1101.9,521.6 1118.6,489.8 1135.3,502.1 1152.0,522.3 1152.0,730.1 1135.3,708.8 1118.6,709.3 1101.9,713.1 1085.2,735.9 1068.6,747.4 1051.9,749.8 1035.2,746.4 1018.5,727.9 1001.8,760.8 985.1,738.6 968.4,759.9 951.7,746.3 935.0,759.9 918.3,748.9 901.7,741.7 885.0,768.8 868.3,721.0 851.6,740.2 834.9,721.0 818.2,721.0 801.5,721.0 784.8,721.0 768.1,721.0 751.4,721.0 734.8,721.0 718.1,721.0 701.4,721.0 684.7,721.0 668.0,721.0" fill="#d97706" opacity="0.16"/>
+<path d="M 668.0 721.0 L 684.7 721.0 L 701.4 721.0 L 718.1 721.0 L 734.8 721.0 L 751.4 721.0 L 768.1 721.0 L 784.8 721.0 L 801.5 721.0 L 818.2 721.0 L 834.9 721.0 L 851.6 712.1 L 868.3 721.0 L 885.0 694.3 L 901.7 700.3 L 918.3 692.9 L 935.0 689.9 L 951.7 688.4 L 968.4 664.7 L 985.1 663.2 L 1001.8 661.8 L 1018.5 632.1 L 1035.2 639.5 L 1051.9 644.0 L 1068.6 658.8 L 1085.2 632.1 L 1101.9 617.3 L 1118.6 599.5 L 1135.3 605.5 L 1152.0 626.2" fill="none" stroke="#d97706" stroke-width="2.6"/>
+<circle cx="668.0" cy="721.0" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="718.1" cy="721.0" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="768.1" cy="721.0" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="818.2" cy="721.0" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="868.3" cy="721.0" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="918.3" cy="692.9" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="968.4" cy="664.7" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="1018.5" cy="632.1" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="1068.6" cy="658.8" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<circle cx="1118.6" cy="599.5" r="2.4" fill="white" stroke="#d97706" stroke-width="1.5"/>
+<text x="1106.0" y="640.2" fill="#d97706" class="curve-label">SAC</text>
+</g>
+</svg>
