@@ -69,6 +69,11 @@ from scripts._eval_utils import (
     resolve_eval_episode_count,
     warmstart_actor_with_partial_copy,
 )
+from scripts.rollout_cost_tracker import (
+    StepCostBridge,
+    CostEnvWrapper,
+    EpisodeCostTracker,
+)
 
 
 INITIAL_REPLAY_SIZE = 10_000
@@ -526,7 +531,19 @@ def main():
         with torch.no_grad():
             agent._log_alpha.clamp_(max=math.log(args.alpha_max))
 
-    core = VectorCore(agent, mdp, callbacks_fit=[clamp_alpha])
+    # ── Rollout episode cost tracker (paper-benchmark monitor) ────────────────
+    # SAC does not learn from cost, but logs the same rollout safety metrics as
+    # LagSAC (rollout_ep_cost / rollout_ep_max_violation) via the SHARED tracker
+    # in scripts/rollout_cost_tracker.py, so the SAC-vs-LagSAC comparison uses an
+    # identical measurement path. The wrapper caches (cost, mask) for the
+    # callback; see rollout_cost_tracker.py for the bridge/wrapper rationale.
+    _bridge = StepCostBridge()
+    _tracker = EpisodeCostTracker(num_envs=args.num_envs, bridge=_bridge,
+                                  min_episodes=1)
+    _env_for_core = CostEnvWrapper(mdp, _bridge)
+
+    core = VectorCore(agent, _env_for_core, callbacks_fit=[clamp_alpha],
+                      callback_step=_tracker)
 
     from datetime import datetime
     results_dir = PROJECT_ROOT / "results"
@@ -678,6 +695,8 @@ def main():
                 f"axis_gate_radius={mdp._axis_gate_radius:.3f}m  "
                 f"w_home={mdp._w_home:.4f}  "
                 f"preinsert_offset={mdp._preinsert_offset:.3f}m")
+    # Paper plotter parses cost_scale from this line and asserts == 1.0.
+    logger.info(f"cost_signal={mdp._cost_signal}  cost_scale={mdp._cost_scale:g}")
     if mdp._w_home > 0:
         logger.info(
             "home_weights="
@@ -719,11 +738,16 @@ def main():
     wandb_run = None
     if not args.no_wandb:
         import wandb
+        plot_group = args.wandb_group or "ungrouped"
         wandb_run = wandb.init(
             project=args.wandb_project, entity=args.wandb_entity,
             name=args.wandb_run_name,
             group=args.wandb_group,
             config={**vars(args), "algo": "SAC",
+                    # Plain config key for W&B Reports "Group by".
+                    # wandb.init(group=...) is run metadata and is not always
+                    # exposed in the Group by selector; plot_group is.
+                    "plot_group": plot_group,
                     "target_entropy_resolved": target_entropy,
                     "obs_dim": obs_dim, "act_dim": act_dim,
                     "horizon": mdp.info.horizon, "gamma": mdp.info.gamma},
@@ -732,8 +756,9 @@ def main():
         logger.info(f"wandb run: {wandb_run.url}")
         # ── Wandb dashboard organization (2026-05-17 cleanup, mirrors LagSAC) ─
         # Goal: dashboard shows ONLY paper-grade benchmark metrics by default.
-        # SAC has no λ / no rollout_ep_cost (no cost critic), but eval_ep_cost
-        # is still uploaded as monitor for direct comparison vs LagSAC.
+        # SAC has no λ (no cost critic), but logs eval_ep_cost / rollout_ep_cost
+        # / *_max_violation via the shared rollout tracker — the same measurement
+        # path as LagSAC — for the paper SAC-vs-LagSAC comparison.
         wandb.define_metric("epoch")
         wandb.define_metric("*", step_metric="epoch")
         for pat in (
@@ -773,7 +798,8 @@ def main():
             "epoch_absorb_total", "epoch_collision_total",
             "epoch_absorb_sphere", "epoch_absorb_physx", "epoch_absorb_table",
             "epoch_collision_sphere", "epoch_collision_physx", "epoch_collision_table",
-            "eval_ep_cost",
+            "eval_ep_cost", "rollout_ep_cost",
+            "eval_ep_max_violation", "rollout_ep_max_violation",
         ):
             wandb.define_metric(m, summary="last")
 
@@ -814,6 +840,11 @@ def main():
                 f"{INITIAL_REPLAY_SIZE} env-steps "
                 f"(约 {warmup_vector_steps} vector-steps × {args.num_envs} envs)")
     core.learn(n_steps=INITIAL_REPLAY_SIZE, n_steps_per_fit=INITIAL_REPLAY_SIZE)
+    # Discard episodes accumulated during the initial replay fill (untrained
+    # policy, plus any epoch-0 warm-start eval); they must not seed epoch 1's
+    # rollout cost metrics. drain() / drain_max() throw the buffers away.
+    _tracker.drain()
+    _tracker.drain_max()
 
     fits_per_epoch = args.n_steps_per_epoch // args.n_steps_per_fit
     vector_steps_per_fit = args.n_steps_per_fit / args.num_envs
@@ -867,6 +898,9 @@ def main():
         actor_epoch = max(0, epoch - critic_only_epochs)
         stage2_state = apply_stage2_curriculum(actor_epoch)
         mdp.set_geom_epoch(actor_epoch)
+        # Reset per-env cost accumulators so the previous epoch's rollout-boundary
+        # partial episodes don't bleed into this epoch's first completed episode.
+        _tracker.reset_accum()
         core.learn(
             n_steps=args.n_steps_per_epoch,
             n_steps_per_fit=args.n_steps_per_fit,
@@ -877,6 +911,11 @@ def main():
             agent.fit(empty_dataset)
             clamp_alpha()
         total_env_steps += args.n_steps_per_epoch
+        # Rollout safety monitor (SAC does not learn from it): per-episode cost
+        # SUM and per-episode cost MAX over episodes completed during core.learn.
+        # Same shared tracker as LagSAC → identical measurement convention.
+        _rollout_ep_cost, _ = _tracker.drain()
+        _rollout_ep_max, _ = _tracker.drain_max()
 
         absorb_epoch = mdp._absorb_count - absorb_prev
         absorb_physx_epoch = mdp._absorb_count_physx - absorb_physx_prev
@@ -887,8 +926,12 @@ def main():
         coll_sphere_epoch = getattr(mdp, "_collision_count_sphere", 0) - coll_sphere_prev
         coll_table_epoch = getattr(mdp, "_collision_count_table", 0) - coll_table_prev
 
+        # Suppress the tracker during eval so deterministic-policy eval episodes
+        # don't enter the rollout cost buffer.
+        _tracker.active = False
         with deterministic_policy(agent):
             dataset = core.evaluate(n_episodes=args.n_eval_episodes, quiet=True)
+        _tracker.active = True
         J = torch.mean(dataset.discounted_return).item()
         R = torch.mean(dataset.undiscounted_return).item()
         ep_len = len(dataset) / args.n_eval_episodes
@@ -1056,6 +1099,9 @@ def main():
             f"cost/collision stats: "
             f"eval_step_cost={c['cost_rate']:.4f}  "
             f"eval_ep_cost={c['cost_episode_sum_mean']:.3f}  "
+            f"eval_ep_max_violation={c['cost_episode_max_mean']:.4f}  "
+            f"rollout_ep_cost={_rollout_ep_cost:.3f}  "
+            f"rollout_ep_max_violation={_rollout_ep_max:.4f}  "
             f"epoch_absorb_total={absorb_epoch}  "
             f"epoch_absorb_sphere={absorb_sphere_epoch}  "
             f"epoch_absorb_physx={absorb_physx_epoch}  "
@@ -1156,8 +1202,13 @@ def main():
                     m["axis_gate_in_pos_thresh_mean"]
                     if m["pos_in_thresh_count"] > 0 else float("nan"),
                 "alpha": agent._alpha.item(),
-                # Cost monitor (D-ATACOM-style continuous violation, info["cost"])
+                # Cost monitor (D-ATACOM-style continuous violation, info["cost"]).
+                # SAC does not learn from cost; these mirror LagSAC for the paper
+                # SAC-vs-LagSAC comparison. rollout_* = training rollout.
                 "eval_ep_cost": c["cost_episode_sum_mean"],
+                "eval_ep_max_violation": c["cost_episode_max_mean"],
+                "rollout_ep_cost": _rollout_ep_cost,
+                "rollout_ep_max_violation": _rollout_ep_max,
                 # Safety event counters per epoch (split by source)
                 # _collision_* = all events (incl. cost-only sphere)
                 # _absorb_*    = events that actually terminated episode
@@ -1203,6 +1254,10 @@ def main():
                 "**eval 时务必对三个都跑一遍**, best_J 不一定 = 最稳策略.")
 
     if wandb_run is not None:
+        # Duplicate the grouping field into summary as a W&B UI fallback.
+        # Some Reports/Workspace dropdowns discover summary keys faster than
+        # config keys added to old runs through the Public API.
+        wandb_run.summary["plot_group"] = args.wandb_group or "ungrouped"
         wandb_run.summary["best_J"] = best_J
         wandb_run.summary["best_score"] = best_score
         best_rate_value = best_hold_rate if best_hold_rate >= 0 else 0.0

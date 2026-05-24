@@ -48,6 +48,8 @@ def parse_args():
     p.add_argument("--stochastic", action="store_true")
 
     p.add_argument("--initial_joint_noise", type=float, default=None)
+    p.add_argument("--default_pose_variant", type=str, default=None,
+                   choices=("easy", "harder"))
     p.add_argument("--preinsert_offset", type=float, default=None)
     p.add_argument("--rew_home", type=float, default=None)
     p.add_argument("--home_weights", type=parse_home_weights, default=None)
@@ -403,6 +405,8 @@ def main():
     )
     if args.initial_joint_noise is not None:
         env_kwargs["initial_joint_noise"] = args.initial_joint_noise
+    if args.default_pose_variant is not None:
+        env_kwargs["default_pose_variant"] = args.default_pose_variant
     if args.rew_home is not None:
         env_kwargs["rew_home"] = args.rew_home
     if args.home_weights is not None:

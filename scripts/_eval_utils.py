@@ -269,19 +269,47 @@ def compute_geom_metrics(dataset, mdp, hold_n_steps):
 
 
 def compute_cost_metrics(dataset, n_eval_episodes):
-    """从 eval flatten dataset 的 info.data["cost"] 算 cost_rate / per-ep cost sum.
+    """从 eval flatten dataset 的 info.data["cost"] 算 cost_rate / per-ep cost sum / max.
 
     依赖 env._create_info_dictionary 把 cost 写进 step_info; flatten 后顺序与
     reward 对齐. cost 可为 0/1 collision indicator, 也可为 penetration 连续量.
+
+    sum 和 max 共用同一段 `last`-flag segmentation (与 compute_hold_metrics 同约定),
+    保证 paper "Episodic Sum of Cost" 与 "Maximum Violation per Episode" 口径完全一致.
+    `n_eval_episodes` 仅作为 segmentation 不可用时的 sum 分母 fallback.
     """
     import torch
     cost = dataset.info.data.get("cost")
     if cost is None:
-        return {"cost_rate": float("nan"), "cost_episode_sum_mean": float("nan")}
+        return {"cost_rate": float("nan"),
+                "cost_episode_sum_mean": float("nan"),
+                "cost_episode_max_mean": float("nan")}
     cost_t = cost if isinstance(cost, torch.Tensor) else torch.as_tensor(cost)
-    cost_rate = float(cost_t.float().mean())
-    cost_episode_sum_mean = float(cost_t.float().sum()) / max(n_eval_episodes, 1)
-    return {"cost_rate": cost_rate, "cost_episode_sum_mean": cost_episode_sum_mean}
+    cost_t = cost_t.float()
+    cost_rate = float(cost_t.mean())
+    # Segment by real `last` flag — both sum and max from the same episode slices.
+    cost_episode_sum_mean = float("nan")
+    cost_episode_max_mean = float("nan")
+    try:
+        *_, last = dataset.parse(to="torch")
+        last_np = last.cpu().numpy().astype(bool)
+        cost_np = cost_t.cpu().numpy()
+        ep_sums, ep_maxes, start = [], [], 0
+        for end in np.flatnonzero(last_np):
+            seg = cost_np[start:end + 1]
+            if len(seg):
+                ep_sums.append(float(seg.sum()))
+                ep_maxes.append(float(seg.max()))
+            start = end + 1
+        if ep_sums:
+            cost_episode_sum_mean = float(np.mean(ep_sums))
+            cost_episode_max_mean = float(np.mean(ep_maxes))
+    except Exception:
+        # `last` unavailable — fall back to total/N for sum (legacy behaviour).
+        cost_episode_sum_mean = float(cost_t.sum()) / max(n_eval_episodes, 1)
+    return {"cost_rate": cost_rate,
+            "cost_episode_sum_mean": cost_episode_sum_mean,
+            "cost_episode_max_mean": cost_episode_max_mean}
 
 
 def resolve_eval_episode_count(requested_episodes, num_envs, arg_name):

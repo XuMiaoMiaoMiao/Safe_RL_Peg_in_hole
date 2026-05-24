@@ -101,25 +101,16 @@ HOME_JOINT_POS = (
 assert len(HOME_JOINT_POS) == 14, "HOME_JOINT_POS 必须 14 维 (左 7 + 右 7)"
 
 # 2026-05-18 harder pose variant for SAC vs LagSAC benchmark.
-# Goal: keep the shoulder / upper-arm silhouette close to HOME_JOINT_POS, but
-# make the distal forearms pass near the midline.  Strictly keeping A1-A4 fixed
-# cannot move the forearm enough: A5-A7 mostly change wrist/EE orientation.  This
-# variant therefore keeps A1/A3 close to default and uses the smallest useful
-# A2/A4 change to lower + fold the forearm, with A5/A6 doing the inward turn.
-# It avoids the high chest-arch pose and avoids reset-time contact.
-#
-# URDF FK check (rounded):
-#   link_4 y: left=-0.47, right=+0.48  (still wide; not collapsed at chest)
-#   link_6 y: left=-0.11, right=+0.19
-#   link_7 y: left=-0.09, right=+0.09
-#   EE y:     left=-0.09, right=+0.09
-#   distal z ~= 0.10-0.33m
-#   forearm sphere-proxy clearance ~= +9cm (positive, but still harder)
+# Hand-tuned in IsaacSim Joint State Publisher: arms stay low / forward rather
+# than arching high at the chest, while A2/A3/A4 put the distal forearms close
+# enough to make early safety constraints more active than the easy pose.
+# This pose is intentionally not symmetric in A1: the visual reset pose was
+# chosen to be harder but not already in contact.
 HOME_JOINT_POS_HARDER = (
-    # left arm   A1     A2     A3      A4     A5   A6    A7
-    -2.450,  -0.820, -0.150,  1.470, -2.55, -0.90,  0.010,
-    # right arm - mirror (A1, A3, A5, A7 sign-flipped)
-    +2.450,  -0.820, +0.150,  1.470, +2.55, -0.90, -0.010,
+    # left arm   A1      A2      A3      A4      A5     A6   A7
+    -2.693,  -1.096,  -0.950,  1.399,  0.003,  0.0, 0.0,
+    # right arm  A1      A2      A3      A4      A5     A6   A7
+    +2.195,  -1.118,  +0.950,  1.399,  0.000,  0.0, 0.0,
 )
 assert len(HOME_JOINT_POS_HARDER) == 14, "HOME_JOINT_POS_HARDER 必须 14 维"
 

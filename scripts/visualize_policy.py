@@ -19,6 +19,7 @@ axis_th=inf 会让 freeze 在"位置进阈但姿态没达标"时误触发, 看�
 """
 
 import argparse
+import math
 import sys
 import time
 from pathlib import Path
@@ -247,6 +248,26 @@ def _update_sphere_proxy_markers(mdp, sphere_handles, env_idx):
 
 def main():
     args = parse_args()
+    if args.num_envs < 2:
+        raise ValueError("--num_envs must be >= 2 (num_envs=1 triggers cloner bugs)")
+    # Mushroom VectorCore expects completed episodes to align with vectorized
+    # env batches. For visualization, be permissive: users often ask for
+    # `--n_episodes 1 --num_envs 4` just to look at env 0. Run one full vector
+    # batch instead of failing at dataset.flatten() after the render.
+    requested_episodes = int(args.n_episodes)
+    min_episodes = args.num_envs
+    if requested_episodes < min_episodes:
+        args.n_episodes = min_episodes
+        print(
+            f"[VIZ] adjusted n_episodes {requested_episodes} -> {args.n_episodes} "
+            f"to match num_envs={args.num_envs}"
+        )
+    elif requested_episodes % args.num_envs != 0:
+        args.n_episodes = int(math.ceil(requested_episodes / args.num_envs) * args.num_envs)
+        print(
+            f"[VIZ] adjusted n_episodes {requested_episodes} -> {args.n_episodes} "
+            f"so it is divisible by num_envs={args.num_envs}"
+        )
     if not (0 <= args.viz_env_idx < args.num_envs):
         raise ValueError(
             f"--viz_env_idx ({args.viz_env_idx}) 必须落在 [0, {args.num_envs - 1}]"

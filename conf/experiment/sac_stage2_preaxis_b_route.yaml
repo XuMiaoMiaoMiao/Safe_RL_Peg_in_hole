@@ -1,0 +1,115 @@
+train_script: scripts/train_sac.py
+
+# SAC Stage 2g (preaxis) — B-route monitor baseline for paper-grade chain.
+#
+# Mirrors sac_stage2_preaxis.yaml task reward / optimization, but uses the same
+# B-route safety semantics as Stage 1/3:
+#   sphere clearance = cost monitor only
+#   PhysX arm contact + table contact = hard absorbing guard + cliff
+#
+# SAC does not optimize the cost, but logs the same clearance/table metrics so
+# Stage 2 SAC and LagSAC are comparable under the same environment semantics.
+
+# Runtime / env count.
+num_envs: 16
+horizon: 150
+render: false
+seed: 0
+use_axis_resid_obs: true
+exclude_ee_from_physx_self_collision: false
+
+# Collection / update cadence.
+n_epochs: 120
+n_steps_per_epoch: 2400          # = horizon x num_envs = 150 x 16
+n_steps_per_fit: 16
+utd: null
+critic_warmup_transitions: 50000
+n_eval_episodes: 16
+
+# Optimizer / entropy.
+lr_actor: 3e-5
+lr_critic: 3e-4
+lr_alpha: 3e-4
+alpha_max: 0.05
+target_entropy: -7
+actor_grad_clip: 1.0
+
+# Base env.
+initial_joint_noise: 0.1
+preinsert_success_pos_threshold: 0.10
+preinsert_offset: null
+
+# Geom Stage 2g preaxis task (= sac_stage2_preaxis.yaml).
+geom_stage: preaxis
+geom_d_target_neg: -0.08
+geom_d_target_pos: 0.03
+geom_d_target_ramp_start: 0
+geom_d_target_ramp_end: 20
+
+geom_d_sat: 0.30
+geom_radial_sat: 1.0
+
+geom_d_th: 0.020
+geom_r_tip_th: 0.020
+geom_r_max_th: 0.025
+geom_axis_th: 0.300
+geom_insert_d_ins: 0.025
+geom_insert_r_max_th: 0.025
+geom_pen_th: 0.001
+
+rew_geom_d: 8.0
+rew_geom_radial_tip: 2.0
+rew_geom_radial_max: 5.0
+rew_geom_axis: 1.2
+rew_geom_progress: 0.0
+rew_geom_advance: 0.0
+
+geom_gate_radial_sigma: 0.025
+geom_gate_axis_sigma: 0.30
+geom_gate_penetration_sigma: null
+geom_d_gate_mode: "off"
+
+rew_geom_penetration: 0.0
+
+rew_geom_soft_success: 0.0
+geom_soft_d_sigma: 0.020
+geom_soft_radial_sigma: 0.015
+geom_soft_axis_sigma: 0.30
+geom_soft_penetration_sigma: null
+
+rew_geom_bad_entry: 0.0
+geom_bad_entry_radial_safe: 0.014
+geom_bad_entry_axis_safe: 0.10
+geom_bad_entry_pen_safe: 0.00075
+
+# B-route cost monitor and hard guards.
+cost_signal: clearance
+clearance_cost_margin: 0.02
+clearance_cost_clip_max: null
+cost_scale: 1.0
+
+sphere_collision_terminates: false
+physx_collision_terminates: true
+keep_collision_reward_penalty: true
+enable_physx_arm_collision: true
+enable_table_collision: true
+table_collision_terminates: true
+table_z: 0.0
+table_clearance_hard: 0.0
+table_clearance_cost_margin: 0.03
+
+# Safety geometry: keep consistent with Stage 1 B-route for chain comparison.
+clearance_hard: 0.0
+proxy_arm_radius: 0.065
+proxy_ee_radius: 0.04
+
+# Warm-start: tonight script overrides this path.
+load_agent: results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/best_hold.msh
+actor_only_warmstart: true
+keep_replay: false
+
+wandb_project: bimanual_peghole
+wandb_entity: miaoxu010522-lund
+wandb_run_name: sac_S2g_preaxis_b_route_120ep_seed0
+wandb_group: sac_s2_b_route
+no_wandb: false
