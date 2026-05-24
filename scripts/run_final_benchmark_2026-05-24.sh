@@ -16,7 +16,7 @@
 #   - Logs rollout_ep_cost and rollout_ep_max_violation for strict benchmark plots
 #   - Use best_hold.msh (NOT final_agent) for all per-seed metrics
 #   - Summary table reports mean ± std over completed seeds
-#   - Plot script can export median+IQR (default) or mean+95% CI (--band ci)
+#   - Plot script defaults to mean+95% CI
 #
 # Time budget (15 seeds × 2 algos = 30 runs):
 #   LagSAC 60ep ≈ 21min × 15 = 315 min
@@ -104,6 +104,7 @@ m_J = re.search(r'训练完成.*?best J = (-?\d+\.\d+)', log)
 m_geom = re.search(r'训练完成.*?best[ _]geom(_hold)?_rate[ =]+(\d+\.\d+)', log)
 m_score = re.search(r'best_score = (-?\d+\.\d+)', log)
 holds = [float(x) for x in re.findall(r'geom_hold_rate=(\d+\.\d+)', log)]
+physx = [int(x) for x in re.findall(r'epoch_collision_physx=(\d+)', log)]
 spheres = [int(x) for x in re.findall(r'epoch_collision_sphere=(\d+)', log)]
 tables = [int(x) for x in re.findall(r'epoch_collision_table=(\d+)', log)]
 lambdas = [float(x) for x in re.findall(r'lam: ([\d.e+-]+)', log)]
@@ -118,7 +119,8 @@ print(f"  best_geom={m_geom.group(2) if m_geom else '?'}")
 print(f"  best_score={m_score.group(1) if m_score else '?'}")
 print(f"  first_hold_ep={first_hold}  first_full_ep={first_full}  full_hold_epochs={full_epochs}")
 print(f"  hold_at_last={hold_last:.3f}  hold_last10_mean={hold_last10:.3f}")
-print(f"  cum_collision_sphere={sum(spheres)}  cum_table={sum(tables)}")
+print(f"  cum_physx_contact={sum(physx)}")
+print(f"  cum_sphere_proxy_violation={sum(spheres)}  cum_table_physx_contact={sum(tables)}")
 if lam_late is not None: print(f"  mean_lambda_late20={lam_late:.4f}")
 PY
 }
@@ -214,24 +216,26 @@ print(f"\nLagSAC ({sum(1 for n in runs if n.startswith('lag'))} completed seeds)
 print(f"  best_geom:            {agg('lag', 'best_geom')}")
 print(f"  best_J:               {agg('lag', 'best_J')}")
 print(f"  full_hold_epochs:     {agg('lag', 'full_hold_epochs')}")
-print(f"  cum_collision_sphere: {agg('lag', 'cum_collision_sphere')}")
-print(f"  cum_collision_table:  {agg('lag', 'cum_collision_table')}")
+print(f"  cum_physx_contact:           {agg('lag', 'cum_physx_contact')}")
+print(f"  cum_sphere_proxy_violation:  {agg('lag', 'cum_sphere_proxy_violation')}")
+print(f"  cum_table_physx_contact:     {agg('lag', 'cum_table_physx_contact')}")
 print(f"  best_geom ≥ 0.5:      {passed('lag', 'best_geom', 0.5)[0]}/{passed('lag', 'best_geom', 0.5)[1]}")
 
 print(f"\nSAC ({sum(1 for n in runs if n.startswith('sac'))} completed seeds):")
 print(f"  best_geom:            {agg('sac', 'best_geom')}")
 print(f"  best_J:               {agg('sac', 'best_J')}")
 print(f"  full_hold_epochs:     {agg('sac', 'full_hold_epochs')}")
-print(f"  cum_collision_sphere: {agg('sac', 'cum_collision_sphere')}")
-print(f"  cum_collision_table:  {agg('sac', 'cum_collision_table')}")
+print(f"  cum_physx_contact:           {agg('sac', 'cum_physx_contact')}")
+print(f"  cum_sphere_proxy_violation:  {agg('sac', 'cum_sphere_proxy_violation')}")
+print(f"  cum_table_physx_contact:     {agg('sac', 'cum_table_physx_contact')}")
 print(f"  best_geom ≥ 0.5:      {passed('sac', 'best_geom', 0.5)[0]}/{passed('sac', 'best_geom', 0.5)[1]}")
 
-# Safety ratio
-lag_s = [d.get('cum_collision_sphere', 0) for n, d in runs.items() if n.startswith('lag')]
-sac_s = [d.get('cum_collision_sphere', 0) for n, d in runs.items() if n.startswith('sac')]
+# Ratio on the cost proxy, not on absorbing collisions.
+lag_s = [d.get('cum_sphere_proxy_violation', 0) for n, d in runs.items() if n.startswith('lag')]
+sac_s = [d.get('cum_sphere_proxy_violation', 0) for n, d in runs.items() if n.startswith('sac')]
 if lag_s and sac_s:
     lag_mean = statistics.mean(lag_s); sac_mean = statistics.mean(sac_s)
-    print(f"\nSafety ratio: SAC sphere / LagSAC sphere = {sac_mean/max(1,lag_mean):.2f}x")
+    print(f"\nCost-proxy ratio: SAC sphere / LagSAC sphere = {sac_mean/max(1,lag_mean):.2f}x")
 PY
 
 echo ""

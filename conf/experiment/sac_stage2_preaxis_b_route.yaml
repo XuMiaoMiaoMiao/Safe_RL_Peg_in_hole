@@ -1,11 +1,11 @@
 train_script: scripts/train_sac.py
 
-# SAC Stage 2g (preaxis) — B-route monitor baseline for paper-grade chain.
+# SAC Stage 2g (preaxis) — current monitor baseline for paper-grade chain.
 #
 # Mirrors sac_stage2_preaxis.yaml task reward / optimization, but uses the same
-# B-route safety semantics as Stage 1/3:
+# current safety semantics as Stage 1/3:
 #   sphere clearance = cost monitor only
-#   PhysX arm contact + table contact = hard absorbing guard + cliff
+#   PhysX arm contact = hard absorbing guard + cliff
 #
 # SAC does not optimize the cost, but logs the same clearance/table metrics so
 # Stage 2 SAC and LagSAC are comparable under the same environment semantics.
@@ -82,7 +82,7 @@ geom_bad_entry_radial_safe: 0.014
 geom_bad_entry_axis_safe: 0.10
 geom_bad_entry_pen_safe: 0.00075
 
-# B-route cost monitor and hard guards.
+# current cost monitor and hard guards.
 cost_signal: clearance
 clearance_cost_margin: 0.02
 clearance_cost_clip_max: null
@@ -98,7 +98,7 @@ table_z: 0.0
 table_clearance_hard: 0.0
 table_clearance_cost_margin: 0.03
 
-# Safety geometry: keep consistent with Stage 1 B-route for chain comparison.
+# Safety geometry: keep consistent with Stage 1 current for chain comparison.
 clearance_hard: 0.0
 proxy_arm_radius: 0.065
 proxy_ee_radius: 0.04
@@ -110,6 +110,6 @@ keep_replay: false
 
 wandb_project: bimanual_peghole
 wandb_entity: miaoxu010522-lund
-wandb_run_name: sac_S2g_preaxis_b_route_120ep_seed0
-wandb_group: sac_s2_b_route
+wandb_run_name: sac_S2g_preaxis_current scheme_120ep_seed0
+wandb_group: sac_s2_current scheme
 no_wandb: false

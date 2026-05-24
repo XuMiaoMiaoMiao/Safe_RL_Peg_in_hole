@@ -194,10 +194,8 @@ def collect(
 def _summary(values: list[float], band: str) -> tuple[float, float, float]:
     """Return (center, band_lo, band_hi) for one (epoch, metric) cell.
 
-    band="iqr"  — center = median, band = [Q1, Q3]. Robust to LagSAC seed
-                  collapse (one outlier seed barely shifts the band).
     band="ci"   — center = mean,   band = mean ± 1.96 · σ/√n  (normal-approx
-                  95% confidence interval for conventional mean-CI reporting).
+                  95% confidence interval; default benchmark plot).
                   Uses normal approx (1.96) not t-dist; for n<10 the t-dist
                   correction would widen the band slightly (n=15: ×1.09).
     band="sem"  — center = mean,   band = mean ± σ/√n.
@@ -206,13 +204,6 @@ def _summary(values: list[float], band: str) -> tuple[float, float, float]:
     """
     if not values:
         return math.nan, math.nan, math.nan
-    if band == "iqr":
-        center = statistics.median(values)
-        if len(values) >= 4:
-            qs = statistics.quantiles(values, n=4)
-            return center, qs[0], qs[2]
-        # Tiny n: shade = full range (best honest signal we can give).
-        return center, min(values), max(values)
     center = statistics.mean(values)
     if len(values) <= 1:
         return center, center, center
@@ -472,7 +463,6 @@ def write_svg(
     legend_y = 80
     legend_x = (width // 2) - 200
     band_label = {
-        "iqr": "median line, shaded = Q1–Q3",
         "ci":  "mean line, shaded = 95% CI (mean ± 1.96·σ/√n)",
         "sem": "mean line, shaded = ± sem (σ/√n)",
         "std": "mean line, shaded = ± std",
@@ -497,10 +487,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--logs", type=Path, default=Path("/tmp/overnight_logs"))
     parser.add_argument("--out_dir", type=Path, default=Path("results/plots/overnight_paper"))
-    parser.add_argument("--band", choices=["iqr", "ci", "sem", "std", "none"], default="iqr",
-                        help="Shaded-band convention. 'ci' = 95%% confidence interval, "
-                             "'iqr' = median + Q1–Q3 (robust to "
-                             "seed collapse, default), 'sem' = ±σ/√n, 'std' = ±σ.")
+    parser.add_argument("--band", choices=["ci", "sem", "std", "none"], default="ci",
+                        help="Shaded-band convention. 'ci' = 95%% confidence interval "
+                             "(default), 'sem' = ±σ/√n, 'std' = ±σ.")
     parser.add_argument(
         "--allow_legacy_proxy",
         action="store_true",

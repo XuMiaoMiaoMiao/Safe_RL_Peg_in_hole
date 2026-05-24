@@ -252,13 +252,11 @@ def parse_args():
     p.add_argument("--proxy_ee_radius", type=float, default=None)
     p.add_argument("--enable_table_collision",
                    action=argparse.BooleanOptionalAction, default=False,
-                   help="Enable geometry-plane arm/EE-vs-table clearance safety. "
-                        "When enabled, hard absorbing can fire on table contact and "
-                        "cost_signal=clearance includes table clearance violation.")
+                   help="Enable table safety: geometry-plane table clearance enters cost, "
+                        "and a runtime PhysX table collider provides contact/absorbing diagnostics.")
     p.add_argument("--table_collision_terminates",
                    action=argparse.BooleanOptionalAction, default=True,
-                   help="If table safety is enabled, terminate episode when "
-                        "table clearance falls below table_clearance_hard.")
+                   help="If table safety is enabled, terminate on PhysX arm/EE-vs-table contact.")
     p.add_argument("--table_z", type=float, default=None,
                    help="World/env-local table top z for proxy clearance. Default 0.0.")
     p.add_argument("--table_clearance_hard", type=float, default=None,
@@ -334,12 +332,12 @@ def parse_args():
                    action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--drop_penetration_reward_for_cost",
                    action=argparse.BooleanOptionalAction, default=True)
-    # 2026-05-17: split absorbing sources (sphere proxy vs PhysX contact).
+    # Current benchmark semantics: sphere proxy + table clearance proxy are cost-only;
+    # collision absorbing and reward cliff use PhysX real-contact masks only.
     p.add_argument("--sphere_collision_terminates",
-                   action=argparse.BooleanOptionalAction, default=True,
-                   help="True (default) preserves legacy behaviour. "
-                        "Set False for D-ATACOM-style: sphere overlap is a "
-                        "continuous cost signal only, does not terminate episode.")
+                   action=argparse.BooleanOptionalAction, default=False,
+                   help="Deprecated compatibility flag. Ignored: sphere proxy is "
+                        "cost-only and does not trigger absorbing.")
     p.add_argument("--physx_collision_terminates",
                    action=argparse.BooleanOptionalAction, default=True,
                    help="True (default) keeps PhysX real-contact as episode terminal. "
@@ -1258,9 +1256,9 @@ def main():
                 "epoch_absorb_physx": absorb_physx_epoch,
                 "epoch_absorb_sphere": absorb_sphere_epoch,
                 "epoch_absorb_table": absorb_table_epoch,
-                # collision event 计数 — all events regardless of termination.
-                # When sphere_collision_terminates=false, these reveal how often
-                # the sphere proxy actually fired as a cost signal.
+                # collision event 计数:
+                # total/physx = real PhysX contact events;
+                # sphere = cost-proxy violations; table/physx = PhysX contact.
                 "epoch_collision": coll_epoch,
                 "epoch_collision_total": coll_epoch,
                 "epoch_collision_physx": coll_physx_epoch,

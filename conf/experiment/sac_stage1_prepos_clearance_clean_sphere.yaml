@@ -2,10 +2,8 @@ train_script: scripts/train_sac.py
 
 # SAC Stage 1g (prepos) — CLEAN SAC BASELINE FOR PAPER COMPARISON vs LagSAC
 #
-# 2026-05-17 v2: B route 对齐 LagSAC v4 env semantics.
-#
 # 设计目标:
-#   SAC 跟 LagSAC (lag_stage1_prepos_clearance_b_route.yaml v4) 共用 env, 同 reward
+#   SAC 跟 LagSAC (LagSAC Stage 1 config) 共用 env, 同 reward
 #   函数, 直接可比 J/R. 唯一区别是 SAC 没有 cost critic + λ.
 #
 # Reward 函数等价性 (重要):
@@ -101,14 +99,14 @@ clearance_cost_margin: 0.02
 clearance_cost_clip_max: null
 cost_scale: 1.0
 
-# ── B route env semantics (跟 LagSAC 完全一致) ───────────────────────────────
-# Parent env cliff split 逻辑: sphere_collision_terminates=False 时
-# cliff 只对 PhysX/table absorbing 触发 (与 CostEnv override 等价).
+# ── Env semantics (跟 LagSAC 完全一致) ──────────────────────────────────────
+# sphere/table clearance proxies are cost-only; collision absorbing and cliff
+# use PhysX real-contact masks only (including table contact).
 sphere_collision_terminates: false
 physx_collision_terminates: true
 enable_physx_arm_collision: true
-enable_table_collision: true
-table_collision_terminates: true
+enable_table_collision: true               # table proxy cost + PhysX contact guard
+table_collision_terminates: true           # PhysX table contact absorbs
 table_z: 0.0
 table_clearance_hard: 0.0
 table_clearance_cost_margin: 0.03

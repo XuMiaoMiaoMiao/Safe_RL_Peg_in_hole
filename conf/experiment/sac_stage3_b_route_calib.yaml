@@ -1,15 +1,15 @@
 train_script: scripts/train_sac.py
 
-# SAC Stage 3g (insert) — B route calibration baseline (50ep)
+# SAC Stage 3g (insert) — current scheme calibration baseline (50ep)
 #
-# 目的: 与 lag_stage3_b_route_calib.yaml 做对照. 完全相同 task reward + 完全相同
-# B route 拓扑 (sphere=monitor, PhysX=guard), 唯一区别: SAC 不带 Lagrangian λ.
+# 目的: 与 lag_stage3_current scheme_calib.yaml 做对照. 完全相同 task reward + 完全相同
+# current scheme 拓扑 (sphere/table=cost proxy, PhysX=guard), 唯一区别: SAC 不带 Lagrangian λ.
 #
 # SAC 仍开启 clearance cost 但只用作 monitoring (Lagrangian critic 不更新 actor).
 # Reward 端的 collision penalty 仍由 cliff (PhysX) 提供, 等于 sac_stage3_insert.yaml
 # 行为外加 sphere ↛ terminate (不再被球形 proxy 提前打断).
 #
-# 通过这对照可回答: B route 重构本身改变了 SAC 性能吗? 还是只有 LagSAC 在 B route
+# 通过这对照可回答: current scheme 重构本身改变了 SAC 性能吗? 还是只有 LagSAC 在 current scheme
 # 下才显出优势?
 
 # Runtime / env count.
@@ -83,14 +83,14 @@ geom_bad_entry_radial_safe: 0.014
 geom_bad_entry_axis_safe: 0.10
 geom_bad_entry_pen_safe: 0.00075
 
-# Cost monitoring (D-ATACOM-style clearance, scale=1).
+# Cost monitoring (clearance, scale=1).
 # SAC 不用 cost 训练 actor — 仅作 wandb 监控 / paper 对比.
 cost_signal: clearance
 clearance_cost_margin: 0.02
 clearance_cost_clip_max: null
 cost_scale: 1.0
 
-# B route 拓扑 (与 LagSAC 完全相同, 保证可比性).
+# current scheme 拓扑 (与 LagSAC 完全相同, 保证可比性).
 sphere_collision_terminates: false
 physx_collision_terminates: true
 # keep_collision_reward_penalty: 仅 LagSAC CostEnv 用; parent env (SAC) 不接受此 arg.
@@ -120,6 +120,6 @@ keep_replay: false
 
 wandb_project: bimanual_peghole
 wandb_entity: miaoxu010522-lund
-wandb_run_name: sac_S3g_b_route_calib_100ep_seed1
-wandb_group: sac_s3_b_route_calibration
+wandb_run_name: sac_S3g_current scheme_calib_100ep_seed1
+wandb_group: sac_s3_current scheme_calibration
 no_wandb: false

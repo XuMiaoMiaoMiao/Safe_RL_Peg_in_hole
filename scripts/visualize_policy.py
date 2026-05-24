@@ -92,11 +92,11 @@ def parse_args():
     p.add_argument("--exclude_ee_from_physx_self_collision", action="store_true",
                    help="geom insert 可视化用: PhysX self-collision 分组排除 EE link, "
                         "避免 peg-hole 正常接触被 hard absorbing 截断.")
-    # 2026-05-17: split collision termination + runtime arm collision APIs.
-    # Must match training env for visualization to reflect actual policy behavior.
+    # Current env semantics: sphere proxy + table clearance proxy are cost-only;
+    # collision absorbing uses PhysX real-contact masks only.
     p.add_argument("--sphere_collision_terminates",
-                   action=argparse.BooleanOptionalAction, default=True,
-                   help="Must match training. False = sphere collision is cost-only.")
+                   action=argparse.BooleanOptionalAction, default=False,
+                   help="Deprecated compatibility flag. Ignored: sphere proxy is cost-only.")
     p.add_argument("--physx_collision_terminates",
                    action=argparse.BooleanOptionalAction, default=True,
                    help="Must match training. True = PhysX real contact terminates episode.")
@@ -105,10 +105,10 @@ def parse_args():
                    help="Must match training. True = runtime apply capsule colliders to arm links.")
     p.add_argument("--enable_table_collision",
                    action=argparse.BooleanOptionalAction, default=False,
-                   help="Must match training. True = geometry-plane arm/EE-vs-table safety.")
+                   help="Must match training. True = table clearance cost + PhysX table contact.")
     p.add_argument("--table_collision_terminates",
                    action=argparse.BooleanOptionalAction, default=True,
-                   help="Must match training. True = table clearance collision terminates episode.")
+                   help="Must match training. True = PhysX table contact terminates episode.")
     p.add_argument("--table_z", type=float, default=None)
     p.add_argument("--table_clearance_hard", type=float, default=None)
     p.add_argument("--table_clearance_cost_margin", type=float, default=None)

@@ -10,13 +10,13 @@
 - 41-D obs (joint_pos + joint_vel + relative geometry)
 - 3-stage curriculum: prepos (Stage 1g) → preaxis (Stage 2g) → insert (Stage 3g)
 
-## Safety Architecture (B-route)
-Three independent safety signals, all treated as a single soft constraint:
-1. **Arm-arm sphere proxy** (17 spheres per side, joint + midpoint + EE) → cost-only (no termination)
-2. **Arm-arm PhysX contact** (14 invisible capsule colliders on iiwa links) → hard absorbing + cliff
-3. **Arm/EE-table geometric clearance** (`z - radius - table_z`) → hard absorbing + cliff + cost
+## Safety Architecture
+Three safety signals are kept separate:
+1. **Arm-arm sphere proxy** (17 spheres per side, joint + midpoint + EE) → clearance cost / diagnostics only
+2. **Arm/EE-table geometric clearance** (`z - radius - table_z`) → clearance cost / diagnostics only
+3. **Arm-arm PhysX contact** (14 invisible capsule colliders on iiwa links) → the only collision absorbing source + reward cliff
 
-CMDP cost = `max(arm_arm_clearance_violation, table_clearance_violation)` (D-ATACOM-style positive constraint, no clip).
+CMDP cost = `max(arm_arm_clearance_violation, table_clearance_violation)` with positive, unclipped violations.
 
 ## Results Summary
 
@@ -88,7 +88,7 @@ Once peg enters hole, both EEs are kinematically locked relative to each other (
 
 ## Headline Narrative (for paper)
 
-LagSAC with B-route safety achieves both higher returns and substantially fewer safety violations than vanilla SAC on Stage 1 prepos (J = -99.4 ± 14.6 vs -116.2 ± 32.7, cumulative violations 2.6× lower, 4 seeds). Under a harder initial pose, both methods converge to comparable returns and 95-99% success rate, but LagSAC retains a 1.4× safety advantage during training, with its Lagrange multiplier decaying to ≈0 once task gradient dominates (consistent with D-ATACOM's analysis of dual variable behavior under successful primal optimization). On Stage 3 insertion (100 epochs, single seed), LagSAC with proportional cost_limit=100 reaches breakthrough 8 epochs before SAC (ep 71 vs 79), but with tighter cost_limit=50 fails to learn insertion at all — exposing a sensitivity to the Lagrangian setpoint even when the constraint is not actively binding. Across all three stages, the Lagrangian dual variable converges to ≈0 once primal task performance dominates, supporting D-ATACOM's analysis that successful primal optimization naturally retires soft constraints.
+LagSAC with the current safety formulation achieves both higher returns and substantially fewer safety violations than vanilla SAC on Stage 1 prepos (J = -99.4 ± 14.6 vs -116.2 ± 32.7, cumulative violations 2.6× lower, 4 seeds). Under a harder initial pose, both methods converge to comparable returns and 95-99% success rate, but LagSAC retains a 1.4× safety advantage during training, with its Lagrange multiplier decaying to ≈0 once task gradient dominates (consistent with D-ATACOM's analysis of dual variable behavior under successful primal optimization). On Stage 3 insertion (100 epochs, single seed), LagSAC with proportional cost_limit=100 reaches breakthrough 8 epochs before SAC (ep 71 vs 79), but with tighter cost_limit=50 fails to learn insertion at all — exposing a sensitivity to the Lagrangian setpoint even when the constraint is not actively binding. Across all three stages, the Lagrangian dual variable converges to ≈0 once primal task performance dominates, supporting D-ATACOM's analysis that successful primal optimization naturally retires soft constraints.
 
 ## Reproduction Artifacts
 

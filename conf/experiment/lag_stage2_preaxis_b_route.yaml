@@ -1,18 +1,18 @@
 train_script: scripts/train_sac_lagrangian.py
 
-# LagSAC Stage 2g (preaxis) — B-route safety, 用于 paper-grade chain
+# LagSAC Stage 2g (preaxis) — current safety, 用于 paper-grade chain
 #
-# 设计原则: 镜像 Stage 1 b_route + Stage 3 b_route 的 CMDP, 但保留 lag_stage2_preaxis_local_tuned.yaml
+# 设计原则: 镜像 Stage 1 current scheme + Stage 3 current scheme 的 CMDP, 但保留 lag_stage2_preaxis_local_tuned.yaml
 # 已 verified 的 Stage 2g preaxis 任务 reward (4-channel: d + radial_tip + radial_max + axis).
 #
 # 与 lag_stage2_preaxis_local_tuned.yaml 唯一差异: CMDP block 从 cost_signal=collision /
-# damp_scale=1 / q_cost 切到 B-route clearance signal + rollout_episode_rate + Stage 1/3
+# damp_scale=1 / q_cost 切到 current clearance signal + rollout_episode_rate + Stage 1/3
 # 同款 lr_λ/γ_cost/λ_init.
 #
 # cost_limit_per_ep 取值依据: Stage 1 (horizon=100) 用 50, Stage 3 (horizon=200) 用 100.
 # Stage 2 horizon=150, 按线性 per-step rate 推 75. 允许 rollout cost ~50/ep 不立即 binding.
 #
-# 用法: tonight chain warmstart 从 Stage 1 b_route best_hold 接.
+# 用法: tonight chain warmstart 从 Stage 1 current scheme best_hold 接.
 
 # Runtime / env count.
 num_envs: 16
@@ -83,8 +83,8 @@ geom_bad_entry_radial_safe: 0.014
 geom_bad_entry_axis_safe: 0.10
 geom_bad_entry_pen_safe: 0.00075
 
-# ── CMDP cost (B route: sphere=cost, PhysX/table=guard + cliff) ─────────────
-# D-ATACOM-style clearance cost = max((margin - min_clearance) / margin, 0).
+# ── CMDP cost (current scheme: sphere=cost, PhysX=guard + cliff; table proxy=cost only) ─────────────
+# clearance cost = max((margin - min_clearance) / margin, 0).
 cost_signal: clearance
 clearance_cost_margin: 0.02
 clearance_cost_clip_max: null
@@ -100,7 +100,7 @@ table_z: 0.0
 table_clearance_hard: 0.0
 table_clearance_cost_margin: 0.03
 
-# ── Lagrangian controller (= Stage 1/3 B-route v4) ──────────────────────────
+# ── Lagrangian controller (= Stage 1/3 current v4) ──────────────────────────
 # cost_limit_per_ep proportional to horizon:
 #   Stage 1 (h=100, cost_lim=50)  → 0.5/step
 #   Stage 2 (h=150, cost_lim=75)  → 0.5/step ✓
@@ -123,8 +123,8 @@ home_weights: "1,1,1,1,0.75,0.5,0.5"
 terminal_hold_bonus: 0.0
 hold_success_steps: 10
 
-# Sphere-proxy 双臂自碰撞 (hard absorbing guard).
-# Keep the same arm proxy radius as Stage 1 B-route.  The paper chain should not
+# Sphere-proxy 双臂 clearance cost threshold (not absorbing).
+# Keep the same arm proxy radius as Stage 1 current.  The paper chain should not
 # silently change the safety geometry exactly when transferring the S1 policy to
 # S2; otherwise cross-stage cost curves are harder to interpret.
 clearance_hard: 0.0
@@ -138,6 +138,6 @@ keep_replay: false
 
 wandb_project: bimanual_peghole
 wandb_entity: miaoxu010522-lund
-wandb_run_name: lag_S2g_preaxis_b_route_cost75_lr0p005_120ep_seed0
-wandb_group: lag_s2_b_route
+wandb_run_name: lag_S2g_preaxis_current scheme_cost75_lr0p005_120ep_seed0
+wandb_group: lag_s2_current scheme
 no_wandb: false

@@ -1,16 +1,16 @@
 train_script: scripts/train_sac_lagrangian.py
 
-# LagSAC Stage 3g (insert) — B route calibration (50ep)
+# LagSAC Stage 3g (insert) — current scheme calibration (50ep)
 #
-# 目的: 首次测试 B route 架构 (sphere=cost, PhysX=guard, clearance signal) 在
+# 目的: 首次测试 current scheme 架构 (sphere=cost, PhysX=guard, clearance signal) 在
 # Stage 3 insert 任务下是否收敛. 之前所有 Stage 3 LagSAC 尝试都失败 (penetration cost,
 # hybrid keepshape, clean ablation).
 #
-# 设计: 完全 mirror sac_stage3_insert.yaml v8 reward + Stage 1 B route Lagrangian.
+# 设计: 完全 mirror sac_stage3_insert.yaml v8 reward + Stage 1 current scheme Lagrangian.
 #   - Reward = 5-channel v8 baseline (same as SAC stage 3)
-#   - Cost = D-ATACOM clearance (margin=0.02, no clip), cost_scale=1.0
+#   - Cost = clearance (margin=0.02, no clip), cost_scale=1.0
 #   - cost_limit_per_ep = 100 (proportional scale from Stage 1's 50, horizon 200 vs 100)
-#   - lr_lambda 同 Stage 1 B route v4 verified
+#   - lr_lambda 同 Stage 1 current scheme v4 verified
 #
 # 校准目标 (50 ep 内观察):
 #   1. λ 不应立即 clip 到 lambda_max (≥30 ep 后才接近) → cost_limit 合理
@@ -91,7 +91,7 @@ geom_bad_entry_radial_safe: 0.014
 geom_bad_entry_axis_safe: 0.10
 geom_bad_entry_pen_safe: 0.00075
 
-# ── CMDP cost (B route: sphere=cost, PhysX=guard) ────────────────────────────
+# ── CMDP cost (current scheme: sphere=cost, PhysX=guard) ────────────────────────────
 cost_signal: clearance
 clearance_cost_margin: 0.02
 clearance_cost_clip_max: null
@@ -107,7 +107,7 @@ table_z: 0.0
 table_clearance_hard: 0.0
 table_clearance_cost_margin: 0.03
 
-# Lagrangian controller — proportional scale from Stage 1 B route v4.
+# Lagrangian controller — proportional scale from Stage 1 current scheme v4.
 # Stage 1 cost_limit=50 / horizon=100 = 0.5 violation rate per step.
 # Stage 3 horizon=200: scale to cost_limit=100 keeps same per-step tolerance.
 cost_limit_per_ep: 100.0
@@ -140,6 +140,6 @@ keep_replay: false
 
 wandb_project: bimanual_peghole
 wandb_entity: miaoxu010522-lund
-wandb_run_name: lag_S3g_b_route_calib_cost100_lr0p005_100ep_seed1
-wandb_group: lag_s3_b_route_calibration
+wandb_run_name: lag_S3g_current scheme_calib_cost100_lr0p005_100ep_seed1
+wandb_group: lag_s3_current scheme_calibration
 no_wandb: false

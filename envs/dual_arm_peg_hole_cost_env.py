@@ -81,12 +81,9 @@ class DualArmPegHoleCostEnv(DualArmPegHoleEnv):
     def get_logging_state(self):
         """Return CMDP diagnostics consumed by training/logging code.
 
-        2026-05-17: collision_count_* tracks ALL collision events (independent
-        of whether they terminated the episode). absorb_count_* only counts
-        events that actually terminated. Under B route (sphere_collision_terminates
-        =false) absorb_count_sphere is always 0 but collision_count_sphere
-        reflects how often the sphere proxy fires — needed to verify that
-        cost critic is receiving the safety signal it expects.
+        collision_count_physx / absorb_count_physx track arm-arm PhysX contact.
+        collision_count_table / absorb_count_table track table PhysX contact.
+        collision_count_sphere is a cost-proxy diagnostic only.
         """
         return {
             "absorb_count": self._absorb_count,
@@ -125,23 +122,15 @@ class DualArmPegHoleCostEnv(DualArmPegHoleEnv):
             self._keep_collision_reward_penalty
             and self._cost_signal in ("collision", "clearance")
         ):
-            # 2026-05-17 hybrid B route: when sphere is configured as a *cost
-            # signal* (sphere_collision_terminates=False), the cliff should only
-            # fire on PhysX real-contact events — sphere events are handled by
-            # the cost critic + λ. When sphere DOES terminate, cliff still
-            # covers both (legacy behaviour).
-            if (
-                not self._sphere_collision_terminates
-                and self._last_physx_collision_mask is not None
-            ):
-                cliff_mask = self._last_physx_collision_mask
-                table_mask = getattr(self, "_last_table_collision_mask", None)
-                if table_mask is not None:
-                    cliff_mask = cliff_mask | table_mask
-            elif self._last_collision_mask is not None:
-                cliff_mask = self._last_collision_mask
-            else:
-                cliff_mask = None
+            # Reward cliff follows absorbing semantics: PhysX real contact only.
+            # sphere geometry proxy is cost-only; table contact here is the
+            # PhysX table mask.
+            cliff_mask = self._last_physx_collision_mask
+            table_mask = getattr(self, "_last_table_collision_mask", None)
+            if cliff_mask is not None and table_mask is not None:
+                cliff_mask = cliff_mask | table_mask
+            elif cliff_mask is None:
+                cliff_mask = table_mask
             if cliff_mask is not None:
                 absorbing_r = self._r_min / (1.0 - self.info.gamma)
                 r = torch.where(

@@ -115,8 +115,8 @@ def parse_args():
     p.add_argument("--hold_success_steps", type=int, default=10)
     p.add_argument("--exclude_ee_from_physx_self_collision", action="store_true")
     p.add_argument("--clearance_hard", type=float, default=None,
-                   help="Sphere-proxy hard absorbing threshold. Use -inf to disable "
-                        "the sphere-proxy hard termination during recording.")
+                   help="Sphere-proxy clearance threshold for cost/diagnostics. "
+                        "It does not trigger absorbing; absorbing uses PhysX only.")
     p.add_argument("--proxy_arm_radius", type=float, default=None)
     p.add_argument("--proxy_ee_radius", type=float, default=None)
     p.add_argument("--horizon", type=int, default=200)

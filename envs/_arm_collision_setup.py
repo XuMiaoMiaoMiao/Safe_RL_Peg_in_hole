@@ -197,10 +197,83 @@ def apply_arm_link_colliders(
     return n_applied
 
 
+def apply_table_collider(
+    stage,
+    robot_prim_path: str,
+    *,
+    table_path: str = "/TableCollision",
+    table_z: float = 0.0,
+    table_size: float = 3.0,
+    table_thickness: float = 0.04,
+    strict: bool = True,
+    visible: bool = False,
+) -> int:
+    """Add one per-env invisible PhysX table collider under the robot root.
+
+    The project has no stable table prim in the USD asset.  The env's table
+    clearance proxy uses an env-local plane at table_z; this function creates a
+    matching thin box collider with its top face at table_z so absorbing table
+    contact can be detected by PhysX instead of by the geometry proxy.
+    """
+    from pxr import UsdGeom, UsdPhysics, PhysxSchema, Gf
+
+    full_path = robot_prim_path + table_path
+    existing = stage.GetPrimAtPath(full_path)
+    if existing.IsValid():
+        if visible:
+            UsdGeom.Imageable(existing).MakeVisible()
+        else:
+            UsdGeom.Imageable(existing).MakeInvisible()
+        return 0
+
+    cube = UsdGeom.Cube.Define(stage, full_path)
+    cube.CreateSizeAttr().Set(1.0)
+    cube.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, float(table_z) - float(table_thickness) / 2.0))
+    cube.AddScaleOp().Set(Gf.Vec3f(float(table_size), float(table_size), float(table_thickness)))
+    if visible:
+        cube.CreateDisplayColorAttr().Set([Gf.Vec3f(0.55, 0.55, 0.55)])
+        try:
+            cube.CreateDisplayOpacityAttr().Set([0.25])
+        except Exception:
+            pass
+        UsdGeom.Imageable(cube.GetPrim()).MakeVisible()
+    else:
+        UsdGeom.Imageable(cube.GetPrim()).MakeInvisible()
+
+    prim = cube.GetPrim()
+    UsdPhysics.CollisionAPI.Apply(prim)
+    rigid = UsdPhysics.RigidBodyAPI.Apply(prim)
+    try:
+        rigid.CreateKinematicEnabledAttr().Set(True)
+    except Exception:
+        pass
+    PhysxSchema.PhysxCollisionAPI.Apply(prim)
+    PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+
+    msg = (
+        f"[arm_collision_setup] table_collider applied=1 path={full_path} "
+        f"top_z={float(table_z):+.4f} size={float(table_size):.2f} "
+        f"thickness={float(table_thickness):.3f}"
+    )
+    print(msg, flush=True)
+    import sys as _sys
+    print(msg, file=_sys.stderr, flush=True)
+
+    if strict and not stage.GetPrimAtPath(full_path).IsValid():
+        raise RuntimeError(f"[arm_collision_setup] failed to create table collider at {full_path}")
+    return 1
+
+
 def install_collision_helper_patch(
     arm_link_paths: Iterable[str],
     *,
     visible: bool = False,
+    table_enabled: bool = False,
+    table_path: str = "/TableCollision",
+    table_z: float = 0.0,
+    table_size: float = 3.0,
+    table_thickness: float = 0.04,
+    table_visible: bool = False,
 ) -> None:
     """Monkey-patch `mushroom_rl.utils.isaac_sim.CollisionHelper.prepare_env`
     so it runs our `apply_arm_link_colliders` BEFORE the original prepare_env
@@ -229,6 +302,12 @@ def install_collision_helper_patch(
     # the patched prepare_env (when fired) sees the latest link set.
     CollisionHelper._dual_arm_collider_link_paths = arm_link_paths
     CollisionHelper._dual_arm_collider_visible = bool(visible)
+    CollisionHelper._dual_arm_table_enabled = bool(table_enabled)
+    CollisionHelper._dual_arm_table_path = str(table_path)
+    CollisionHelper._dual_arm_table_z = float(table_z)
+    CollisionHelper._dual_arm_table_size = float(table_size)
+    CollisionHelper._dual_arm_table_thickness = float(table_thickness)
+    CollisionHelper._dual_arm_table_visible = bool(table_visible)
     active = getattr(CollisionHelper, "_dual_arm_collider_active", 0)
     CollisionHelper._dual_arm_collider_active = active + 1
 
@@ -247,6 +326,7 @@ def install_collision_helper_patch(
             links_for_this_patch = getattr(
                 CollisionHelper, "_dual_arm_collider_link_paths", []
             )
+            did_prepare = False
             if links_for_this_patch:
                 # strict=True raises if neither new nor existing colliders are
                 # found — smoke test fails LOUDLY instead of silently going to
@@ -261,9 +341,23 @@ def install_collision_helper_patch(
                         CollisionHelper, "_dual_arm_collider_visible", False
                     )),
                 )
-                # Count "successful patch fires" rather than "capsules created",
-                # so a re-fire on a stage with existing colliders still bumps
-                # the counter (env post-assert checks delta of this counter).
+                did_prepare = True
+            if getattr(CollisionHelper, "_dual_arm_table_enabled", False):
+                apply_table_collider(
+                    stage,
+                    robot_prim_path,
+                    table_path=getattr(CollisionHelper, "_dual_arm_table_path", "/TableCollision"),
+                    table_z=getattr(CollisionHelper, "_dual_arm_table_z", 0.0),
+                    table_size=getattr(CollisionHelper, "_dual_arm_table_size", 3.0),
+                    table_thickness=getattr(CollisionHelper, "_dual_arm_table_thickness", 0.04),
+                    strict=True,
+                    visible=bool(getattr(CollisionHelper, "_dual_arm_table_visible", False)),
+                )
+                did_prepare = True
+            if did_prepare:
+                # Count successful patch fires rather than newly-created prims, so
+                # a re-fire on a stage with existing colliders still bumps the
+                # counter (env post-assert checks delta of this counter).
                 CollisionHelper._dual_arm_collider_fire_count = (
                     getattr(CollisionHelper, "_dual_arm_collider_fire_count", 0) + 1
                 )

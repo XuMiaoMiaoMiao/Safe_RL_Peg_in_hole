@@ -9,15 +9,14 @@ train_script: scripts/train_sac_lagrangian.py
 #   v2 (16:51): "active" — lr_λ=0.01, λ_init=1.0, γ_cost=0.99.
 #     失败: 到 epoch 42 λ≈2.0, absorb_sphere 仍 64/epoch, geom_hold=0.
 #   v3 (current): 回到 2026-05-16 两个成功 clean-clearance LagSAC 的控制器区间:
-#     lr_λ=0.05, γ_cost=0.7, λ_init=e^1≈2.7, 但保留 D-ATACOM-style no-clip
+#     lr_λ=0.05, γ_cost=0.7, λ_init=e^1≈2.7, 但保留 unclipped positive
 #     clearance cost; cost_limit 从旧 clipped 的 0.5 放大到 1.5 适配 no-clip 尺度.
 #
 # 设计原则 (这次坚持):
 #   1. ★ NO collision reward cliff (keep_collision_reward_penalty=false)
-#      → 与教授原话 "use constraints" 一致, 与 d-atacom 一致, 避免 reward/cost double-count.
+#      → 与教授原话 "use constraints" 一致, 避免 reward/cost double-count.
 #   2. ★ 保留 absorbing termination (clearance_hard=0.0)
-#      → simulation stability guard, 防双臂物理嵌入 PhysX. d-atacom air-hockey 任务
-#        结构不需要 (双臂自然分离), 我们 peg-in-hole 需要靠近, 必须保留.
+#      → simulation stability guard, 防双臂物理嵌入 PhysX. 我们 peg-in-hole 需要靠近, 必须保留.
 #   3. ★ Cost constraint 必须真能动 (两版失败教训)
 #      → 成功历史: run-20260516_174954 / run-20260516_164710 都用 lr_λ=0.05,
 #        γ_cost=0.7, λ 在 epoch 25-35 达到 4-8 后 absorb_sphere 才降到 0.
@@ -100,58 +99,40 @@ geom_bad_entry_radial_safe: 0.014
 geom_bad_entry_axis_safe: 0.10
 geom_bad_entry_pen_safe: 0.00075
 
-# ── CMDP cost (B route hybrid: sphere=cost, PhysX=guard) ─────────────────────
-# D-ATACOM-style clearance cost = max((margin - min_clearance) / margin, 0).
+# ── CMDP cost / PhysX absorbing semantics ───────────────────────────────────
+# Clearance cost = max((margin - min_clearance) / margin, 0).
 cost_signal: clearance
 clearance_cost_margin: 0.02
 clearance_cost_clip_max: null
 cost_scale: 1.0
 
-# ★★★ B route hybrid (2026-05-17 evening) ★★★
-# Sphere proxy   = pure cost signal (no terminate, no cliff)
-#                  → continuous safety violation for cost critic + λ
-# PhysX contact  = absorbing terminate + cliff
-#                  → guards against suicide (cliff makes early-terminate expensive)
-#                  → guards against sim instability (real arm-arm overlap)
-# Table clearance = geometry proxy hard absorbing + clearance cost
-#                  → guards harder/later-stage poses from hitting the tabletop
+# Current scheme:
+# - sphere proxy = clearance cost only; no terminate, no reward cliff
+# - table clearance proxy = clearance cost; PhysX table contact = terminate
+# - PhysX contact = the only collision absorbing source + reward cliff
 #
 # enable_physx_arm_collision adds capsule colliders to iiwa arm links so PhysX
 # arm-arm contact actually triggers (USD has no CollisionAPI on arm links).
 # Without it, physx_collision_terminates is dead code.
 sphere_collision_terminates: false
 physx_collision_terminates: true
-keep_collision_reward_penalty: true        # cliff only on PhysX/table (cost env splits)
+keep_collision_reward_penalty: true        # cliff only on PhysX real contact
 enable_physx_arm_collision: true
-enable_table_collision: true
-table_collision_terminates: true
+enable_table_collision: true               # table proxy cost + PhysX contact guard
+table_collision_terminates: true           # PhysX table contact absorbs
 table_z: 0.0
 table_clearance_hard: 0.0
 table_clearance_cost_margin: 0.03
 
-# ── Lagrangian controller (REVISION 2026-05-17 晚 v4): B route 重标定 ──────────
-# 设计沿革:
-#   v1 (conservative): lrλ=0.001, init_logλ=-2.3, cost_lim=1.0 → λ 36 epoch 不动
-#   v2 (active):       lrλ=0.01,  init_logλ=0,    cost_lim=1.0 → λ 42 epoch λ≈2 仍 fail
-#   v3 (fast):         lrλ=0.05,  init_logλ=1,    cost_lim=1.5 → ✓ Stage 1 verified 在旧 sphere absorb 模式
-#   v4 (B route):      lrλ=0.005, init_logλ=0,    cost_lim=50  → B route 重标定
-#
-# B route 标定依据 (smoke run 20260517_2146):
-#   sphere_collision_terminates=false 让 episode 跑满 100 步 (不再被 sphere absorb 截断),
-#   rollout_ep_cost 量级从旧 1.5 跳到 0-263 (epoch 2 达 263.6, 因为大量 sphere overlap 不再终止).
-#   旧 cost_limit=1.5 在 B route 下 → λ epoch 2 直接顶 lambda_max=20.
-#
-# 新计算:
-#   平均 cost 估计:   rollout 中位值约 ~50 (smoke ep 1-5 mean)
-#   cost_limit_per_ep=50: 允许 binding 但不立即暴冲
-#   lr_lambda=0.005:  violation 早期 50-200 → Δlog_λ ≈ 0.25-1.0/epoch (合理 ramp)
-#   λ_max=20:         维持 (避免 actor 被 λ·Q_C 完全压死)
-#   init_log_lambda=0: λ_init=1.0 (比 v3 的 2.7 温和, 起步不立即扰动 actor)
-#   γ_cost=0.7:       保留 (v3 verified 短视 critic 有效)
+# ── Lagrangian controller ───────────────────────────────────────────────────
+# Calibration basis:
+#   sphere/table clearance proxies are cost-only, so rollout_ep_cost is larger than old
+#   early-terminating runs. cost_limit_per_ep=50 and lr_lambda=0.005 keep λ
+#   responsive without immediately saturating lambda_max.
 cost_limit_per_ep: 50.0
 lambda_update_mode: rollout_episode_rate
 min_lambda_update_episodes: 16
-lr_lambda: 0.005                 # ★ B route 量级 ~30x, lr 同比例缩
+lr_lambda: 0.005
 lambda_max: 20.0                 # 保留 v3 设置
 lambda_min: 0.0
 init_log_lambda: 0.0             # ★ λ_init=1 (从 v3 的 2.7 降, 起步温和)
@@ -166,7 +147,7 @@ home_weights: "1,1,1,1,0.75,0.5,0.5"
 terminal_hold_bonus: 0.0
 hold_success_steps: 10
 
-# Sphere-proxy 双臂自碰撞 (hard absorbing guard, 独立于 cost signal).
+# Sphere-proxy 双臂 clearance cost threshold (not absorbing).
 clearance_hard: 0.0
 proxy_arm_radius: 0.065
 proxy_ee_radius: 0.04

@@ -40,10 +40,10 @@ Reward (统一骨架):
                    # axis_gate_radius=inf 时 gate ≡ 1 (不门控, Stage 1 / 旧行为)
 
 终止:
-    - 自碰撞 (双信号 OR, 任一触发即吸收 r = r_min / (1 - γ)):
-        * PhysX 接触力 > collision_force_threshold
-        * sphere-proxy clearance < clearance_hard (PhysX 在 1cm-5cm 边缘失明
-          的几何兜底, 默认 clearance_hard=0.0 即球壳一接触就算碰撞)
+    - collision absorbing (r = r_min / (1 - γ)) only on PhysX contact:
+        * arm_L vs arm_R PhysX contact force > collision_force_threshold
+        * optional runtime table collider vs arm/EE PhysX contact
+      Sphere/table geometry proxies are cost signals / diagnostics, not absorbing.
     - success 本身不终止 (沿用 phase 1 结论, 避免 Q-target 边界断崖, 见
       feedback_bimanual_reward_shaping.md Rule 1)
     - hold-N (success 连续 N 步) 软 absorbing + terminal_hold_bonus 默认关闭
@@ -127,6 +127,7 @@ RIGHT_EE_PATH = "/right_hande_robotiq_hande_link"
 
 LEFT_ARM_GROUP = LEFT_ARM_LINKS + [LEFT_EE_PATH]
 RIGHT_ARM_GROUP = RIGHT_ARM_LINKS + [RIGHT_EE_PATH]
+TABLE_COLLISION_PATH = "/TableCollision"
 
 # ---- Sphere-proxy clearance 几何常量 -------------------------------------
 # 把每条机械臂离散成一组球, 球心从 articulation BODY_POS 拿. 两侧球心两两算
@@ -274,9 +275,9 @@ class DualArmPegHoleEnv(IsaacSim):
         axis_gate_radius=float("inf"),
         joint_limit_margin_frac=0.8,
         preinsert_offset=DEFAULT_PREINSERT_OFFSET,
-        # Sphere-proxy 自碰撞兜底 (PhysX 失明区补丁, 全 stage 通用):
-        #   min_clearance < clearance_hard 时与 PhysX 力 OR, 触发 hard absorbing.
-        #   default 0.0 = 球壳一接触就算碰撞. 设 -inf 即关闭.
+        # Sphere-proxy 自碰撞只作为 clearance cost / diagnostics:
+        #   min_clearance < clearance_hard 记录 cost-proxy violation, 但不触发
+        #   absorbing. 碰撞 absorbing 只走 PhysX contact.
         clearance_hard=0.0,
         proxy_arm_radius=ARM_PROXY_RADIUS,
         proxy_ee_radius=EE_PROXY_RADIUS,
@@ -285,15 +286,12 @@ class DualArmPegHoleEnv(IsaacSim):
         # crosses the midline). Used for SAC vs LagSAC difficulty-spectrum
         # benchmark.
         default_pose_variant="easy",
-        # ── 2026-05-17 split absorbing / collision sources ──────────────────
-        # Decouple "sphere proxy violation" from "PhysX real contact" as two
-        # independent termination sources. Defaults preserve historical
-        # behaviour: any collision (sphere OR PhysX) terminates episode.
-        #
-        # B route (D-ATACOM style): sphere_collision_terminates=False,
-        # physx_collision_terminates=True. Sphere overlap becomes a continuous
-        # cost signal only; PhysX real contact stays as termination guard.
-        sphere_collision_terminates=True,
+        # Collision absorbing policy:
+        #   sphere proxy and table clearance proxy are cost-only;
+        #   hard absorbing uses PhysX real-contact masks only.
+        # sphere_collision_terminates is retained for old CLI/YAML compatibility
+        # but ignored by the current implementation.
+        sphere_collision_terminates=False,
         physx_collision_terminates=True,
         # 2026-05-17: Apply PhysX CollisionAPI to iiwa arm links at runtime.
         # The robot USD has no CollisionAPI on arm links, so PhysX arm-arm
@@ -306,11 +304,9 @@ class DualArmPegHoleEnv(IsaacSim):
         # Debug visualization only: render the runtime capsule proxies used for
         # PhysX arm-arm contact. Default False keeps training visuals unchanged.
         debug_show_physx_arm_collision=False,
-        # 2026-05-18 table safety: geometry-plane clearance for arm/EE proxies.
-        # This is intentionally independent of PhysX table contact because the
-        # table prim lives outside the robot articulation and its USD path/contact
-        # API setup is less stable than the arm-arm contact groups. When enabled,
-        # min_table_clearance = proxy_center_z - proxy_radius - table_z.
+        # Table safety has two separate paths when enabled:
+        #   1) geometry table clearance proxy contributes to the scalar cost;
+        #   2) a runtime invisible PhysX table collider provides absorbing contact.
         enable_table_collision=False,
         table_collision_terminates=True,
         table_z=0.0,
@@ -523,8 +519,15 @@ class DualArmPegHoleEnv(IsaacSim):
         self._exclude_ee_from_physx_self_collision = bool(
             exclude_ee_from_physx_self_collision
         )
-        # Split absorbing sources (2026-05-17).
-        self._sphere_collision_terminates = bool(sphere_collision_terminates)
+        # Collision absorbing uses PhysX only. Keep the old sphere flag as an
+        # accepted CLI/YAML input, but force sphere proxies to remain cost-only.
+        if sphere_collision_terminates:
+            print(
+                "[DualArmPegHoleEnv] sphere_collision_terminates=True ignored: "
+                "sphere proxy is cost-only; absorbing uses PhysX only.",
+                flush=True,
+            )
+        self._sphere_collision_terminates = False
         self._physx_collision_terminates = bool(physx_collision_terminates)
         self._enable_physx_arm_collision = bool(enable_physx_arm_collision)
         self._debug_show_physx_arm_collision = bool(debug_show_physx_arm_collision)
@@ -552,24 +555,23 @@ class DualArmPegHoleEnv(IsaacSim):
                 f"default_pose_variant must be one of {list(POSE_VARIANTS)}, "
                 f"got {default_pose_variant!r}"
             )
-        # When PhysX arm collision is enabled, install monkey-patch BEFORE
-        # super().__init__() so CollisionHelper.prepare_env picks it up during
-        # the first world.reset() inside mushroom IsaacSim init.
-        # We snapshot the apply counter NOW (before install) so the post-init
-        # assertion below can verify a fresh apply happened for THIS env
-        # specifically — not just "some earlier env in this process applied".
-        if self._enable_physx_arm_collision:
+        # Install monkey-patch BEFORE super().__init__() so CollisionHelper.prepare_env
+        # can add missing runtime colliders before MushroomRL creates contact views.
+        # We snapshot the fire counter NOW (before install) so the post-init
+        # assertion below can verify a fresh apply happened for THIS env.
+        if self._enable_physx_arm_collision or self._enable_table_collision:
             from envs._arm_collision_setup import install_collision_helper_patch
             from mushroom_rl.utils.isaac_sim.collision_helper import CollisionHelper
-            # Snapshot "successful patch fire" counter (not capsule count) so
-            # we can detect "patch never fired for THIS env" even when an
-            # earlier env in same process already created the prims.
             self._physx_arm_fire_count_before = getattr(
                 CollisionHelper, "_dual_arm_collider_fire_count", 0
             )
             install_collision_helper_patch(
-                LEFT_ARM_LINKS + RIGHT_ARM_LINKS,
+                LEFT_ARM_LINKS + RIGHT_ARM_LINKS if self._enable_physx_arm_collision else [],
                 visible=self._debug_show_physx_arm_collision,
+                table_enabled=self._enable_table_collision,
+                table_path=TABLE_COLLISION_PATH,
+                table_z=self._table_z,
+                table_visible=self._debug_show_physx_arm_collision,
             )
         # Geometric preinsert 设置必须先于 obs dim 决定:
         # geom_stage 启用时隐含 use_axis_resid_obs=True, obs = AXIS_RESID 34 + 7 维几何 = 41 维.
@@ -839,8 +841,8 @@ class DualArmPegHoleEnv(IsaacSim):
         self._last_axis_err = None
         self._last_success_mask = None
         self._last_pos_success_mask = None
-        # sphere-proxy clearance: is_absorbing 里每步算并 cache,
-        # _last_min_clearance < clearance_hard 即触发 hard absorbing.
+        # sphere-proxy/table clearance: is_absorbing 里每步算并 cache, 只用于
+        # cost / diagnostics. hard absorbing 只由 PhysX contact 决定.
         self._last_min_clearance = None
         self._last_min_table_clearance = None
         # _preprocess_action → reward 链路里缓存 pre-scale 的 raw action,
@@ -872,6 +874,14 @@ class DualArmPegHoleEnv(IsaacSim):
             collision_groups = [("arm_L", LEFT_ARM_LINKS), ("arm_R", RIGHT_ARM_LINKS)]
         else:
             collision_groups = [("arm_L", LEFT_ARM_GROUP), ("arm_R", RIGHT_ARM_GROUP)]
+        if self._enable_table_collision:
+            # Use full arm+EE groups for table contact even when arm-arm PhysX
+            # self-collision excludes EE to avoid false peg-hole contacts.
+            collision_groups += [
+                ("table_L", LEFT_ARM_GROUP),
+                ("table_R", RIGHT_ARM_GROUP),
+                ("table", [TABLE_COLLISION_PATH]),
+            ]
 
         super().__init__(
             usd_path=str(self._usd_path),
@@ -893,19 +903,16 @@ class DualArmPegHoleEnv(IsaacSim):
             camera_target=(5, 0, 0.5),
         )
 
-        # Post super().__init__() assertion: if enable_physx_arm_collision=True,
-        # the patched prepare_env MUST have fired AND applied capsule colliders
-        # specifically during THIS env's construction. We check the per-env
-        # delta against the snapshot taken before install, so a multi-env
-        # process can't get a false-positive from an earlier env's apply.
-        if self._enable_physx_arm_collision:
+        # Post super().__init__() assertion: if runtime PhysX colliders were
+        # requested, the patched prepare_env MUST have fired for THIS env.
+        if self._enable_physx_arm_collision or self._enable_table_collision:
             from mushroom_rl.utils.isaac_sim.collision_helper import CollisionHelper
             after = getattr(CollisionHelper, "_dual_arm_collider_fire_count", 0)
             before = getattr(self, "_physx_arm_fire_count_before", 0)
             delta = after - before
             if delta <= 0:
                 raise RuntimeError(
-                    "[DualArmPegHoleEnv] enable_physx_arm_collision=True but "
+                    "[DualArmPegHoleEnv] runtime PhysX collider patch requested but "
                     f"prepare_env did not fire for this env (fire_count "
                     f"before={before}, after={after}). Mushroom init order "
                     "changed? Patch not wired up? Check that "
@@ -915,7 +922,7 @@ class DualArmPegHoleEnv(IsaacSim):
                     "prepare_env fired."
                 )
             print(
-                f"[DualArmPegHoleEnv] verified PhysX arm collision patch "
+                f"[DualArmPegHoleEnv] verified runtime PhysX collision patch "
                 f"fired {delta} time(s) this env (total fires in process: {after})",
                 flush=True,
             )
@@ -968,15 +975,13 @@ class DualArmPegHoleEnv(IsaacSim):
         self._cj = cj
         self._robots = robots
 
-        # 2026-05-17: collision events vs episode-terminating collisions are
-        # tracked separately so we can use sphere collision as a continuous
-        # cost signal (no termination) while still seeing how often it fires.
+        # 2026-05-24: PhysX contact is the only source of collision absorbing.
+        # sphere proxy / table clearance proxy remain cost diagnostics.
         #
-        # _collision_count_*  — every collision event detected, regardless of
-        #                       whether it caused episode termination.
-        # _absorb_count_*     — collisions that actually terminated the episode
-        #                       (filtered by sphere/physx_collision_terminates).
-        # PhysX / arm-arm sphere / table 可同步触发, 所以 source sums ≥ total.
+        # _collision_count      — real PhysX collision events (arm-arm OR table).
+        # _collision_count_*    — per-source diagnostics; sphere is proxy violation,
+        #                         physx/table are real contact events.
+        # _absorb_count_*       — events that actually terminated the episode.
         self._collision_count = 0
         self._collision_count_physx = 0
         self._collision_count_sphere = 0
@@ -1272,8 +1277,8 @@ class DualArmPegHoleEnv(IsaacSim):
     def is_absorbing(self, obs):
         physx_collision = self._check_collision("arm_L", "arm_R", self._collision_threshold,
                                                 dt=self._timestep)
-        # sphere-proxy 兜底: 双臂 sphere proxy 的最小 clearance 跌破 clearance_hard
-        # 也算 collision. clearance_hard=-inf 时此项恒 False, 退化为纯 PhysX.
+        # Sphere-proxy clearance violation: cost-only diagnostic. It never enters
+        # collision_done; absorbing uses PhysX contact only.
         min_clearance, clearance_info = self._compute_min_clearance()
         self._last_min_clearance = min_clearance
         if math.isfinite(self._clearance_hard):
@@ -1284,16 +1289,21 @@ class DualArmPegHoleEnv(IsaacSim):
             min_table_clearance, _ = self._compute_min_table_clearance_from_proxies(
                 clearance_info["left_proxies"], clearance_info["right_proxies"]
             )
-            table_collision = min_table_clearance < self._table_clearance_hard
+            table_collision = (
+                self._check_collision("table_L", "table", self._collision_threshold, dt=self._timestep)
+                | self._check_collision("table_R", "table", self._collision_threshold, dt=self._timestep)
+            )
         else:
             min_table_clearance = torch.full_like(
                 min_clearance, float("inf"), dtype=torch.float32
             )
             table_collision = torch.zeros_like(physx_collision)
         self._last_min_table_clearance = min_table_clearance
-        collision = physx_collision | sphere_collision | table_collision
-        # Per-source event counters (every collision detected, independent of
-        # whether it terminates the episode). Used for monitoring / paper plots.
+        # Real collision mask used by legacy cost_signal='collision' and reward
+        # cliff. It excludes geometry proxies and includes only PhysX contacts.
+        collision = physx_collision | table_collision
+        # Per-source counters. physx/table = real PhysX contact; sphere =
+        # cost-proxy violation used for diagnostics only.
         physx_n = int(physx_collision.sum().item())
         sphere_n = int(sphere_collision.sum().item())
         table_n = int(table_collision.sum().item())
@@ -1302,22 +1312,13 @@ class DualArmPegHoleEnv(IsaacSim):
         self._collision_count_sphere += sphere_n
         self._collision_count_table += table_n
         self._collision_count += collision_n
-        # Per-source termination counters (only events that actually terminated
-        # the episode, filtered by the _collision_terminates flags below).
-        # When sphere_collision_terminates=False these stay at 0 even if
-        # sphere collisions fire frequently.
-        if self._sphere_collision_terminates:
-            self._absorb_count_sphere += sphere_n
+        # Per-source termination counters. Sphere geometry proxy is cost-only;
+        # arm-arm and table absorbing are both PhysX contact masks.
         if self._physx_collision_terminates:
             self._absorb_count_physx += physx_n
         if self._enable_table_collision and self._table_collision_terminates:
             self._absorb_count_table += table_n
-        # _absorb_count = events that triggered absorbing
-        # under current settings — matches what the env will actually return.
-        sphere_term_mask = (
-            sphere_collision if self._sphere_collision_terminates
-            else torch.zeros_like(sphere_collision)
-        )
+        # _absorb_count = events that triggered absorbing under current settings.
         physx_term_mask = (
             physx_collision if self._physx_collision_terminates
             else torch.zeros_like(physx_collision)
@@ -1327,13 +1328,10 @@ class DualArmPegHoleEnv(IsaacSim):
             if (self._enable_table_collision and self._table_collision_terminates)
             else torch.zeros_like(table_collision)
         )
-        collision_done = sphere_term_mask | physx_term_mask | table_term_mask
+        collision_done = physx_term_mask | table_term_mask
         self._absorb_count += int(collision_done.sum().item())
-        # Cache both raw masks separately + the legacy combined mask.
-        # Legacy `_last_collision_mask` is preserved for backward compat
-        # (some callers like CostEnv's reward cliff read it). Downstream
-        # code that wants the PhysX-only mask (e.g. cliff only on real
-        # contact) should use `_last_physx_collision_mask`.
+        # Cache masks separately. `_last_collision_mask` now means real collision
+        # only (PhysX arm-arm OR PhysX table); sphere mask is proxy diagnostics.
         self._last_sphere_collision_mask = sphere_collision
         self._last_physx_collision_mask = physx_collision
         self._last_table_collision_mask = table_collision
@@ -1397,9 +1395,9 @@ class DualArmPegHoleEnv(IsaacSim):
 
     def _create_info_dictionary(self, obs):
         # cost = constraint cost signal for Lagrangian SAC.
-        # cost_signal='collision' (default): robot collision 0/1 indicator from
-        #   arm_L vs arm_R PhysX OR sphere-proxy. is_absorbing 已 cache
-        #   _last_collision_mask. Peg-hole penetration 不属于这个 cost.
+        # cost_signal='collision' (default): real PhysX collision 0/1 indicator
+        #   from arm-arm OR table contact. is_absorbing 已 cache _last_collision_mask.
+        #   Peg-hole penetration 不属于这个 cost.
         # cost_signal='penetration': 连续 [0, 4mm] = peg 表面相对 hole 内壁的
         #   physical overlap. 几何信号, 不依赖 PhysX contact.
         # cost_signal='clearance': 双臂 sphere-proxy clearance margin cost;
@@ -1728,23 +1726,13 @@ class DualArmPegHoleEnv(IsaacSim):
         # 三路选择: collision (硬 absorbing) > hold-N (软 absorbing) > normal
         # geom hold-N 默认关 (terminal_hold_bonus=0), 等价 normal 路径.
         #
-        # 2026-05-17 B route cliff split: 与 DualArmPegHoleCostEnv.reward 同步.
-        # 当 sphere_collision_terminates=False (sphere 是 cost-only 信号, 不 terminate)
-        # 时, cliff 不能对 sphere collision 触发 — 否则 reward 里偷偷塞 sphere
-        # safety penalty, 跟"sphere 只走 cost"的设计矛盾。此时 cliff 只对 PhysX
-        # 真接触 (它仍然 terminate) 触发。
-        # 当 sphere_collision_terminates=True (旧默认) 时, cliff 行为不变 (任何
-        # collision 都触发), 跟所有历史 ckpt 兼容。
-        if (
-            not getattr(self, "_sphere_collision_terminates", True)
-            and getattr(self, "_last_physx_collision_mask", None) is not None
-        ):
-            cliff_mask = self._last_physx_collision_mask
-            table_mask = getattr(self, "_last_table_collision_mask", None)
-            if table_mask is not None:
-                cliff_mask = cliff_mask | table_mask
-        else:
-            cliff_mask = self._last_collision_mask
+        # Collision reward cliff follows the same rule as absorbing: PhysX only.
+        cliff_mask = self._last_physx_collision_mask
+        table_mask = getattr(self, "_last_table_collision_mask", None)
+        if cliff_mask is not None and table_mask is not None:
+            cliff_mask = cliff_mask | table_mask
+        elif cliff_mask is None:
+            cliff_mask = table_mask
         absorbing_r = self._r_min / (1.0 - self.info.gamma)
         r = torch.where(
             cliff_mask,

@@ -1,29 +1,9 @@
 """SAC 训练 — 双臂 peg-in-hole preinsert (stage flag 化, mushroom-rl + VectorCore).
 
-SAC vs LagSAC paper-grade comparison (2026-05-17 B route refactor)
+SAC vs LagSAC benchmark semantics
 ─────────────────────────────────────────────────────────────────
-This script now supports the B route comparison setup natively, so SAC
-(this script) and LagSAC (train_sac_lagrangian.py) can run on IDENTICAL
-env / reward semantics — making J/R directly comparable in a paper figure.
-
-For clean SAC baseline vs LagSAC, pass:
-    --no-sphere_collision_terminates   (sphere = cost signal only, no cliff)
-    --physx_collision_terminates       (PhysX real contact terminates + cliff)
-    --enable_physx_arm_collision       (apply capsule colliders so PhysX fires)
-
-Parent env's reward (envs/dual_arm_peg_hole_env.py:reward) automatically
-splits cliff target: when sphere_collision_terminates=False, cliff fires
-ONLY on PhysX absorbing — same logic as DualArmPegHoleCostEnv. So:
-
-    SAC via train_sac.py + B route flags
-    LagSAC via train_sac_lagrangian.py + B route flags
-    → identical reward function, identical termination, only diff is
-      cost critic + λ (LagSAC only).
-
-Legacy mode (no B route flags) preserves the historical SAC-cliff baseline
-behavior — cliff on any sphere|physx collision. The existing
-S1g_prepos_h100_full_ep_balanced_seed0 checkpoint was trained in this mode
-and remains reproducible.
+SAC and LagSAC run on identical env / reward semantics. sphere proxy and table clearance proxy are used for clearance cost; collision absorbing and reward cliff use PhysX real-contact masks only. The only algorithmic
+difference is the cost critic + λ in LagSAC.
 
 ────────────────────────────────────────────────────────────────────────────
 
@@ -192,20 +172,18 @@ def parse_args():
                         "N=10 ≈ 1s hold (per-step dt≈0.1s).")
     p.add_argument("--clearance_hard", type=float, default=None,
                    help="覆盖 env 的 sphere-proxy 自碰撞兜底阈值 (m). 默认 0.0 = 球壳一接触即"
-                        "触发 hard absorbing. 关闭时写 --clearance_hard=-inf, 只信 PhysX 力检测.")
+                        "记录 sphere proxy violation. absorbing 始终只信 PhysX 力检测.")
     p.add_argument("--proxy_arm_radius", type=float, default=None,
                    help="覆盖 env 的 arm sphere proxy 半径 (默认 0.06m).")
     p.add_argument("--proxy_ee_radius", type=float, default=None,
                    help="覆盖 env 的 EE sphere proxy 半径 (默认 0.04m).")
     p.add_argument("--enable_table_collision",
                    action=argparse.BooleanOptionalAction, default=False,
-                   help="Enable geometry-plane arm/EE-vs-table clearance safety. "
-                        "When enabled, table collision can terminate episode and "
-                        "cost_signal=clearance includes table clearance violation.")
+                   help="Enable table safety: geometry-plane table clearance enters cost, "
+                        "and a runtime PhysX table collider provides contact/absorbing diagnostics.")
     p.add_argument("--table_collision_terminates",
                    action=argparse.BooleanOptionalAction, default=True,
-                   help="If table safety is enabled, terminate episode when "
-                        "table clearance falls below table_clearance_hard.")
+                   help="If table safety is enabled, terminate on PhysX arm/EE-vs-table contact.")
     p.add_argument("--table_z", type=float, default=None,
                    help="World/env-local table top z for proxy clearance. Default 0.0.")
     p.add_argument("--table_clearance_hard", type=float, default=None,
@@ -216,15 +194,12 @@ def parse_args():
                    help="Stage 3 peg/hole 真实 collider 用: PhysX arm_L vs arm_R "
                         "self-collision 分组排除左右 EE link, 避免正常 peg-hole "
                         "接触被 hard absorbing 误杀. EE 区域仍由 sphere-proxy 兜底.")
-    # 2026-05-17 B route flags: lets SAC (this script) and LagSAC
-    # (train_sac_lagrangian.py) operate on identical env semantics so J/R
-    # is directly comparable in a paper figure.
+    # Current benchmark semantics: sphere proxy + table clearance proxy are cost-only;
+    # collision absorbing and reward cliff use PhysX real-contact masks only.
     p.add_argument("--sphere_collision_terminates",
-                   action=argparse.BooleanOptionalAction, default=True,
-                   help="True (default) preserves legacy behaviour. "
-                        "Set False for clean comparison vs LagSAC: sphere overlap "
-                        "becomes cost-only (not in reward) and parent env's reward "
-                        "cliff only fires on PhysX real-contact absorbing.")
+                   action=argparse.BooleanOptionalAction, default=False,
+                   help="Deprecated compatibility flag. Ignored: sphere proxy is "
+                        "cost-only and does not trigger absorbing.")
     p.add_argument("--physx_collision_terminates",
                    action=argparse.BooleanOptionalAction, default=True,
                    help="True (default) keeps PhysX real-contact as episode terminal. "
@@ -434,8 +409,7 @@ def main():
         env_kwargs["use_axis_resid_obs"] = True
     if args.exclude_ee_from_physx_self_collision:
         env_kwargs["exclude_ee_from_physx_self_collision"] = True
-    # B route flags (always transmit — BooleanOptionalAction always has a value;
-    # defaults match env defaults so unchanged behaviour for legacy yaml).
+    # Safety semantic flags (always transmit — BooleanOptionalAction always has a value).
     env_kwargs["sphere_collision_terminates"] = bool(args.sphere_collision_terminates)
     env_kwargs["physx_collision_terminates"] = bool(args.physx_collision_terminates)
     env_kwargs["enable_physx_arm_collision"] = bool(args.enable_physx_arm_collision)
@@ -1213,10 +1187,9 @@ def main():
                 "rollout_ep_max_violation": _rollout_ep_max,
                 "rollout_ep_n": _rollout_n_ep,
                 # Safety event counters per epoch (split by source)
-                # _collision_* = all events (incl. cost-only sphere)
-                # _absorb_*    = events that actually terminated episode
-                # When sphere_collision_terminates=false, absorb_sphere is 0 but
-                # collision_sphere shows the cost-signal firing rate.
+                # epoch_collision_total/physx = real PhysX contact events
+                # epoch_collision_sphere = cost-proxy violations; table/physx = PhysX contact
+                # epoch_absorb_* = events that actually terminated episode
                 "epoch_absorb_total": absorb_epoch,
                 "epoch_absorb_sphere": absorb_sphere_epoch,
                 "epoch_absorb_physx": absorb_physx_epoch,
