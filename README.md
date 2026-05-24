@@ -84,7 +84,9 @@ Each benchmark pose is summarized with a 1×3 learning-curve figure:
 3. **Episodic Sum of Cost** — mean over episodes of `Σ_t cost_t` (rollout)
 
 Aggregation: **median + Q1–Q3 band** by default (robust to LagSAC's
-occasional single-seed collapse). Mean ± std / sem available via `--band`.
+occasional single-seed collapse). Also available via `--band`:
+`ci` (95% confidence interval, `mean ± 1.96·σ/√n`), `sem` (`±σ/√n`),
+`std` (`±σ`), or `none`.
 Strict mode refuses to plot runs missing `rollout_ep_max_violation` /
 `rollout_ep_cost` / `cost_scale=1.0` — use `--allow_legacy_proxy` to replay
 older logs with a clearly-warned per-step proxy.
@@ -114,7 +116,7 @@ distorting the central trend.
 | Cumulative sphere collisions (training)² | **601 ± 309** | 2160 ± 660 | **≈ 3.6× safer** |
 
 ¹ This benchmark predates the new `rollout_ep_max_violation` logging and falls
-back to a per-step proxy; values are not the true paper metric. New runs will
+back to a per-step proxy; values are not the true benchmark metric. New runs will
 plot the real metric in strict mode.
 
 ² Mean ± std reported here for cross-check with the earlier 2026-05-18 run.
@@ -157,11 +159,11 @@ results/
   checkpoints/saved/           canonical verified ckpt chain (Stage 1g/2g/3g)
   paper_archive/               frozen snapshots (2026-05-18 benchmark + Stage 3 100ep)
   videos/full_chain_best_hold_2026-05-12/  3 stage-end demo MP4s (the hero videos above)
-  plots/                       generated paper figures (gitignored; CI not required)
+  plots/                       generated benchmark figures (gitignored; CI not required)
 
 docs/
   PAPER_RESULTS.md             full ablation tables + narrative
-  figures/                     paper figures embedded in this README
+  figures/                     benchmark figures embedded in this README
   README_legacy_*.md           historical README snapshots
 ```
 

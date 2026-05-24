@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Draw paper-aligned SAC vs LagSAC comparison plots from training logs.
+"""Draw SAC vs LagSAC benchmark comparison plots from training logs.
 
 This script intentionally has no matplotlib dependency. It writes clean SVG
 figures directly, so it works in the current safe_rl environment.
 
-The panel names follow the paper convention as closely as possible. When our
-logs do not contain exactly the same statistic, the plotted proxy is stated in
-the subtitle and exported CSV.
+The panel names track the benchmark metrics used by this project. When logs
+do not contain the exact statistic, the plotted proxy is stated in the
+subtitle and exported CSV.
 
 Default:
   python scripts/plot_paper_benchmark.py
@@ -75,7 +75,7 @@ def parse_run(path: Path) -> list[dict]:
     run_cost_scale: float | None = None
     for line in path.read_text(errors="replace").splitlines():
         # One-shot capture from the env setup log (printed before epoch 1).
-        # The paper Maximum Violation panel requires cost_scale == 1.0 (so that
+        # The Maximum Violation panel requires cost_scale == 1.0 (so that
         # info["cost"] == raw violation); main() asserts this after collect().
         if run_cost_scale is None and "cost_scale=" in line:
             val = grab_float(line, "cost_scale")
@@ -196,8 +196,12 @@ def _summary(values: list[float], band: str) -> tuple[float, float, float]:
 
     band="iqr"  — center = median, band = [Q1, Q3]. Robust to LagSAC seed
                   collapse (one outlier seed barely shifts the band).
-    band="std"  — center = mean,   band = [mean−σ, mean+σ].
-    band="sem"  — center = mean,   band = [mean−σ/√n, mean+σ/√n].
+    band="ci"   — center = mean,   band = mean ± 1.96 · σ/√n  (normal-approx
+                  95% confidence interval for conventional mean-CI reporting).
+                  Uses normal approx (1.96) not t-dist; for n<10 the t-dist
+                  correction would widen the band slightly (n=15: ×1.09).
+    band="sem"  — center = mean,   band = mean ± σ/√n.
+    band="std"  — center = mean,   band = mean ± σ.
     band="none" — center = mean,   band = [center, center] (no shade).
     """
     if not values:
@@ -213,7 +217,9 @@ def _summary(values: list[float], band: str) -> tuple[float, float, float]:
     if len(values) <= 1:
         return center, center, center
     std = statistics.stdev(values)
-    if band == "sem":
+    if band == "ci":
+        err = 1.96 * std / math.sqrt(len(values))
+    elif band == "sem":
         err = std / math.sqrt(len(values))
     elif band == "none":
         err = 0.0
@@ -441,7 +447,7 @@ def write_svg(
     setting_title = "harder pose" if setting == "final" else f"{setting} pose"
     title = f"SAC vs LagSAC, Stage 1 {setting_title}"
     subtitle = (
-        "Paper-aligned 1×3 panels (D-ATACOM Fig 3-5). Return=J (eval); "
+        "Benchmark 1×3 panels. Return=J (eval); "
         "safety panels=rollout (training-time). "
         "Success rate reported in summary table (not shown)."
     )
@@ -467,8 +473,9 @@ def write_svg(
     legend_x = (width // 2) - 200
     band_label = {
         "iqr": "median line, shaded = Q1–Q3",
+        "ci":  "mean line, shaded = 95% CI (mean ± 1.96·σ/√n)",
+        "sem": "mean line, shaded = ± sem (σ/√n)",
         "std": "mean line, shaded = ± std",
-        "sem": "mean line, shaded = ± sem",
         "none": "mean line, no band",
     }.get(band, f"band = {band}")
     for i, algo in enumerate(ORDER):
@@ -490,7 +497,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--logs", type=Path, default=Path("/tmp/overnight_logs"))
     parser.add_argument("--out_dir", type=Path, default=Path("results/plots/overnight_paper"))
-    parser.add_argument("--band", choices=["iqr", "std", "sem", "none"], default="iqr")
+    parser.add_argument("--band", choices=["iqr", "ci", "sem", "std", "none"], default="iqr",
+                        help="Shaded-band convention. 'ci' = 95%% confidence interval, "
+                             "'iqr' = median + Q1–Q3 (robust to "
+                             "seed collapse, default), 'sem' = ±σ/√n, 'std' = ±σ.")
     parser.add_argument(
         "--allow_legacy_proxy",
         action="store_true",
@@ -535,7 +545,7 @@ def main() -> None:
             f"{scaled}"
         )
 
-    # Strict paper mode (default): require rollout_ep_cost, rollout_ep_max_violation
+    # Strict benchmark mode (default): require rollout_ep_cost, rollout_ep_max_violation
     # (→ row["maximum_violation"]) and cost_scale present in every row. Missing
     # any of these means the run predates the new tracker — silently plotting it
     # with a proxy would mislabel the panel. Opt out with --allow_legacy_proxy.
@@ -547,7 +557,7 @@ def main() -> None:
                 if f not in r:
                     missing.setdefault(k, set()).add(f)
     if missing and not args.allow_legacy_proxy:
-        lines = ["Strict paper mode: required fields missing from logs:"]
+        lines = ["Strict benchmark mode: required fields missing from logs:"]
         for k, fs in list(missing.items())[:10]:
             lines.append(f"  {k!r}: missing {sorted(fs)}")
         if len(missing) > 10:
@@ -593,7 +603,7 @@ def main() -> None:
         write_svg(runs, setting, out_path, args.band, subtitle_note)
         outputs.append(out_path)
 
-    print("Wrote paper-style benchmark plots:")
+    print("Wrote benchmark plots:")
     for path in outputs:
         print(f"  {path}")
 
