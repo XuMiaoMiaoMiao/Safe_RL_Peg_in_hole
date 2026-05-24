@@ -57,10 +57,11 @@ serves as the task-feasibility anchor.
 
 ## Method
 
-### B-route safety semantics
+### Safety design
 
-A hybrid CMDP topology that separates the **continuous safety cost** (fed to
-λ) from **hard physical guards** (kept as absorbing terminations).
+The current benchmark separates task reward from safety cost. Clearance
+violations are logged as a continuous positive cost for constrained learning,
+while physically unsafe contacts are kept as absorbing terminations.
 
 | Component | Reward? | Cost? | Terminates? | Role |
 |---|:-:|:-:|:-:|---|
@@ -126,7 +127,7 @@ The full Stage 1 / Stage 3 ablation discussion lives in
 ## Repository Layout
 
 ```
-envs/                          IsaacSim env + B-route cost env
+envs/                          IsaacSim env + safety cost wrapper
   dual_arm_peg_hole_env.py     parent env (also emits info["cost"] for monitor)
   dual_arm_peg_hole_cost_env.py  + Lagrangian wrapper
 
@@ -147,9 +148,9 @@ scripts/
   ...
 
 conf/experiment/               canonical YAMLs (loaded by name through Hydra)
-  lag_stage1_prepos_clearance_b_route.yaml     ← Stage 1 LagSAC (paper main)
-  sac_stage1_prepos_clearance_clean_sphere.yaml ← Stage 1 SAC (paper main)
-  lag_stage{2,3}_*_b_route_*.yaml              ← Stage 2/3 b_route variants
+  lag_stage1_prepos_clearance_b_route.yaml     ← current Stage 1 LagSAC benchmark
+  sac_stage1_prepos_clearance_clean_sphere.yaml ← current Stage 1 SAC benchmark
+  lag_stage{2,3}_*_b_route_*.yaml              ← current Stage 2/3 constrained variants
   record_checkpoint.yaml                        ← cluster recording config
 
 results/
@@ -197,7 +198,7 @@ cd ~/bimanual_peghole
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate safe_rl
 
-# LagSAC, paper-grade defaults
+# LagSAC, benchmark defaults
 python scripts/run_lagrangian_chain_local_from_yaml.py \
   --start_stage 1 --stop_stage 1 \
   --stage1_cfg conf/experiment/lag_stage1_prepos_clearance_b_route.yaml \
