@@ -972,7 +972,7 @@ def main():
         if _tracker is not None:
             if _tracker.ready():
                 _rollout_ep_mean, _rollout_n_ep = _tracker.drain()
-                # Companion drain for the paper "Maximum Violation per Episode".
+                # Companion drain for "Maximum Violation per Episode".
                 # Lockstep with drain(): same episodes, drained together each epoch.
                 _rollout_ep_max, _ = _tracker.drain_max()
                 agent.update_lambda_from_rollout_episodes(_rollout_ep_mean, _rollout_n_ep)
@@ -1243,8 +1243,8 @@ def main():
                 "rollout_ep_cost": rollout_ep_cost,
                 "rollout_ep_violation": rollout_ep_violation,
                 "rollout_ep_n": _rollout_n_ep,
-                # paper "Maximum Violation per Episode": mean over episodes of
-                # max_t cost_t, from training rollout (and eval, one epoch lag).
+                # Maximum Violation per Episode: mean over episodes of max_t cost_t,
+                # from training rollout (and eval, one epoch lag).
                 "rollout_ep_max_violation": _rollout_ep_max,
                 # eval signal (deterministic policy, one epoch lag)
                 "eval_step_cost": c["cost_rate"],
@@ -1259,8 +1259,8 @@ def main():
                 "epoch_absorb_sphere": absorb_sphere_epoch,
                 "epoch_absorb_table": absorb_table_epoch,
                 # collision event 计数 — all events regardless of termination.
-                # In B route (sphere_collision_terminates=false), only these reveal
-                # how often the sphere proxy actually fired as a cost signal.
+                # When sphere_collision_terminates=false, these reveal how often
+                # the sphere proxy actually fired as a cost signal.
                 "epoch_collision": coll_epoch,
                 "epoch_collision_total": coll_epoch,
                 "epoch_collision_physx": coll_physx_epoch,

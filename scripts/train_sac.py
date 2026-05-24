@@ -782,7 +782,7 @@ def main():
             "geom_final_penetration_mean", "geom_final_penetration_max",
             "geom_pen_max_mean", "geom_pen_max_max", "geom_clean_step_rate",
             "geom_pen_in_active_mean", "geom_pen_in_active_max",
-            "eval_step_cost", "epoch_absorb", "epoch_collision",
+            "eval_step_cost", "rollout_ep_n", "epoch_absorb", "epoch_collision",
             "best_score", "best_hold_rate", "best_hold_max_hold_mean",
             # best_metric_* are LagSAC-compatible aliases logged for cross-script
             # query convenience; duplicates of best_geom_*. Hide to avoid clutter.
@@ -914,7 +914,7 @@ def main():
         # Rollout safety monitor (SAC does not learn from it): per-episode cost
         # SUM and per-episode cost MAX over episodes completed during core.learn.
         # Same shared tracker as LagSAC → identical measurement convention.
-        _rollout_ep_cost, _ = _tracker.drain()
+        _rollout_ep_cost, _rollout_n_ep = _tracker.drain()
         _rollout_ep_max, _ = _tracker.drain_max()
 
         absorb_epoch = mdp._absorb_count - absorb_prev
@@ -1102,6 +1102,7 @@ def main():
             f"eval_ep_max_violation={c['cost_episode_max_mean']:.4f}  "
             f"rollout_ep_cost={_rollout_ep_cost:.3f}  "
             f"rollout_ep_max_violation={_rollout_ep_max:.4f}  "
+            f"rollout_ep_n={_rollout_n_ep}  "
             f"epoch_absorb_total={absorb_epoch}  "
             f"epoch_absorb_sphere={absorb_sphere_epoch}  "
             f"epoch_absorb_physx={absorb_physx_epoch}  "
@@ -1202,18 +1203,20 @@ def main():
                     m["axis_gate_in_pos_thresh_mean"]
                     if m["pos_in_thresh_count"] > 0 else float("nan"),
                 "alpha": agent._alpha.item(),
-                # Cost monitor (D-ATACOM-style continuous violation, info["cost"]).
-                # SAC does not learn from cost; these mirror LagSAC for the paper
-                # SAC-vs-LagSAC comparison. rollout_* = training rollout.
+                # Cost monitor (continuous violation, info["cost"]).
+                # SAC does not learn from cost; these mirror LagSAC for the
+                # SAC-vs-LagSAC benchmark. rollout_* = training rollout.
+                "eval_step_cost": c["cost_rate"],
                 "eval_ep_cost": c["cost_episode_sum_mean"],
                 "eval_ep_max_violation": c["cost_episode_max_mean"],
                 "rollout_ep_cost": _rollout_ep_cost,
                 "rollout_ep_max_violation": _rollout_ep_max,
+                "rollout_ep_n": _rollout_n_ep,
                 # Safety event counters per epoch (split by source)
                 # _collision_* = all events (incl. cost-only sphere)
                 # _absorb_*    = events that actually terminated episode
-                # In B route (sphere_collision_terminates=false), absorb_sphere
-                # is 0 but collision_sphere shows the cost-signal firing rate.
+                # When sphere_collision_terminates=false, absorb_sphere is 0 but
+                # collision_sphere shows the cost-signal firing rate.
                 "epoch_absorb_total": absorb_epoch,
                 "epoch_absorb_sphere": absorb_sphere_epoch,
                 "epoch_absorb_physx": absorb_physx_epoch,
