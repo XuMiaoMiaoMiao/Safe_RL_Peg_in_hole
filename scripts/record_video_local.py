@@ -29,7 +29,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts._eval_utils import deterministic_policy, parse_home_weights
-from scripts.record_video import (
+from scripts.record_geom_video import (
     _get_frame,
     _make_writer,
     _setup_offscreen_camera,

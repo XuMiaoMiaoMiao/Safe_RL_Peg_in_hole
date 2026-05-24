@@ -5,7 +5,7 @@ ffmpeg x11grab, runs the command after ``--`` (typically visualize_policy.py),
 then stops ffmpeg when that command exits.
 
 Why this exists:
-  scripts.record_video / record_geom_video use Replicator offscreen rendering.
+  scripts.record_geom_video can use Replicator offscreen rendering.
   Replicator requires rep.orchestrator.step() to fetch frames, and that extra
   step perturbs geom-stage policy rollouts.  Screen capture is passive: it
   records exactly the GUI window you see, without touching the simulation.

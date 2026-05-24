@@ -1,8 +1,12 @@
-"""Record geom-stage SAC checkpoints to mp4.
+"""Record geom-stage SAC checkpoints to mp4 (standalone).
 
-This is a thin geom-aware wrapper around scripts.record_video.  The original
-record_video.py is kept unchanged for legacy checkpoints; this script passes
-the 41D geom env arguments needed by current insert-stage policies.
+Records one checkpoint with the 41D geom env arguments needed by current
+insert-stage policies. The cluster YAML uses Replicator's headless offscreen
+camera backend; local runs may use the passive viewport capture backend.
+
+Self-contained: the three Replicator helpers (_setup_offscreen_camera,
+_get_frame, _make_writer) used to be imported from scripts.record_video and
+are now inlined below.
 """
 
 import argparse
@@ -18,11 +22,66 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts._eval_utils import compute_geom_metrics, deterministic_policy
 from scripts._eval_utils import parse_home_weights
-from scripts.record_video import (
-    _get_frame,
-    _make_writer,
-    _setup_offscreen_camera,
-)
+
+
+# ── Replicator offscreen render helpers (inlined from former record_video.py) ──
+# headless 模式里 viewport 的 RTX Hydra Engine 被关闭, viewport-based render
+# product 的 get_data() 会因 overscan=None 而崩 ("HydraEngine rtx failed
+# creating scene renderer"). 用 rep.create.camera() 建独立 prim + render
+# product, 有自己的渲染 context, 不依赖 viewport, headless 下正常工作.
+
+
+def _setup_offscreen_camera(width: int, height: int, position, look_at):
+    """Build a standalone offscreen camera + render product.
+
+    Returns (annot, rp): annotator and render product, fed to _get_frame.
+    """
+    import omni.replicator.core as rep
+
+    camera = rep.create.camera(
+        position=tuple(position),
+        look_at=tuple(look_at),
+    )
+    rp = rep.create.render_product(camera, (width, height))
+    annot = rep.AnnotatorRegistry.get_annotator("rgb")
+    annot.attach([rp])
+    return annot, rp
+
+
+def _get_frame(annot, width: int, height: int) -> np.ndarray:
+    """Trigger one render pass on the standalone camera, return BGR uint8 frame.
+
+    rep.orchestrator.step() drives the replicator render — fully decoupled from
+    viewport / _world.render().
+    """
+    import omni.replicator.core as rep
+
+    rep.orchestrator.step(rt_subframes=1)
+    raw = annot.get_data()
+
+    if hasattr(raw, 'numpy'):
+        arr = raw.numpy()
+    else:
+        arr = np.asarray(raw)
+
+    if arr.size == 0:
+        return np.zeros((height, width, 3), dtype=np.uint8)
+
+    rgb = arr[..., :3]
+    bgr = rgb[..., ::-1].copy()   # RGB → BGR (cv2), copy removes negative stride
+    return bgr.astype(np.uint8)
+
+
+def _make_writer(out_path: Path, fps: int, width: int, height: int):
+    import cv2
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (width, height))
+    if not writer.isOpened():
+        raise RuntimeError(
+            f"cv2.VideoWriter cannot open: {out_path}\n"
+            "Verify opencv-python-headless is installed (pip show opencv-python-headless)"
+        )
+    return writer
 
 
 def parse_args():
@@ -55,6 +114,11 @@ def parse_args():
     p.add_argument("--home_weights", type=parse_home_weights, default=None)
     p.add_argument("--hold_success_steps", type=int, default=10)
     p.add_argument("--exclude_ee_from_physx_self_collision", action="store_true")
+    p.add_argument("--clearance_hard", type=float, default=None,
+                   help="Sphere-proxy hard absorbing threshold. Use -inf to disable "
+                        "the sphere-proxy hard termination during recording.")
+    p.add_argument("--proxy_arm_radius", type=float, default=None)
+    p.add_argument("--proxy_ee_radius", type=float, default=None)
     p.add_argument("--horizon", type=int, default=200)
 
     p.add_argument("--geom_stage", type=str, default="insert",
@@ -411,6 +475,12 @@ def main():
         env_kwargs["rew_home"] = args.rew_home
     if args.home_weights is not None:
         env_kwargs["home_weights"] = args.home_weights
+    if args.clearance_hard is not None:
+        env_kwargs["clearance_hard"] = args.clearance_hard
+    if args.proxy_arm_radius is not None:
+        env_kwargs["proxy_arm_radius"] = args.proxy_arm_radius
+    if args.proxy_ee_radius is not None:
+        env_kwargs["proxy_ee_radius"] = args.proxy_ee_radius
     if args.exclude_ee_from_physx_self_collision:
         env_kwargs["exclude_ee_from_physx_self_collision"] = True
 
@@ -460,7 +530,7 @@ def main():
     agent_path = Path(args.agent_path)
     print(f"[REC GEOM] loading agent: {agent_path}", flush=True)
     agent = Agent.load(str(agent_path))
-    prefix = f"{args.tag}_" if args.tag else ""
+    prefix = f"{args.tag}_{agent_path.stem}_" if args.tag else f"{agent_path.stem}_"
     done = _record_one_geom_agent(mdp, agent, args, frame_grabber, out_dir, prefix)
     mdp.stop()
     print(f"[REC GEOM] done. {done} video(s) saved in: {out_dir}")

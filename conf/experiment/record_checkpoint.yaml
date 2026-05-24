@@ -1,38 +1,47 @@
-train_script: scripts/record_video.py
+train_script: scripts/record_geom_video.py
 
-# 同时适用于 phase1 和 phase2 的 checkpoint 录制
-
-# checkpoint 目录录制配置.
-# 自动录制 checkpoint_dir 下所有 .msh 文件, Isaac Sim 只启动一次顺序录制.
-# 视频文件名: <tag>_<agent_stem>_episode_000.mp4, ...
+# Cluster (Hydra+Apptainer) checkpoint 录制配置 — 配合 scripts/record_geom_video.py
 #
-# 用法:
-#   # 直接运行 (使用此文件中的默认路径)
-#   python scripts/train_hydra.py --multirun experiment@train=record_checkpoint
+# 2026-05-24 migration:
+#   旧版指向 scripts/record_video.py(已删除), 它支持目录批量录制
+#   (checkpoint_dir + 自动遍历所有 .msh). record_geom_video.py 是单 agent
+#   录制 (--agent_path), 因此原来的 checkpoint_dir / 部分 env 参数不再适用.
 #
-#   # 覆盖 checkpoint 目录 (每次录新的 checkpoint 时只需改这一个参数)
+# 用法 (cluster):
 #   python scripts/train_hydra.py --multirun experiment@train=record_checkpoint \
-#       train.checkpoint_dir=results/checkpoints/2026-05-07/11-59-24 \
-#       train.tag=ckpt_20260507
+#       train.agent_path=results/checkpoints/saved/.../best_hold.msh \
+#       train.tag=stage3g_insert
+#
+# 录制多个 ckpt: 多次调用 train_hydra (或外层 shell 循环), 每次传一个 agent_path.
 
-# --- checkpoint 目录 (替代单 agent 的 agent_path) ---
+# --- 单 ckpt 路径 (必须在 invocation 时覆盖) ---
 # 路径相对于容器内项目根目录 /workspace/Safe_RL_Peg_in_hole
-checkpoint_dir: results/checkpoints/2026-05-10/10-06-17
+agent_path: results/checkpoints/saved/Stage3g_insert_h200_from_h100_h150_stage2_2026-05-12_21-01-11/best_hold.msh
 
-# --- env (必须与训练时一致) ---
+# --- env (record_geom_video 接受的子集) ---
 num_envs: 2              # cloner bug 要求 >= 2; 录制只用 viz_env_idx=0
-use_axis_resid_obs: true
-preinsert_success_pos_threshold: 0.10
-rew_home: 0.0005
 hold_success_steps: 10
-clearance_hard: -.inf    # 录制时禁用 sphere-proxy (训练时为 0.0 即启用). null 会回落到 env
-                         # 默认值 0.0, 球壳一接触即截断 episode, 视频会提前结束.
+rew_home: 0.0005
 
 # --- 录制参数 ---
 n_episodes: 1            # 每个 agent 录制的 episode 数
 viz_env_idx: 0
-# output_dir 不设置: 自动推导为 results/videos/<DATE>/<TIME>
+# output_dir 不设置: 使用 record_geom_video.py 默认 results/videos
 fps: 30
 width: 1280
 height: 720
-tag: ckpt                # 前缀; 最终文件名: ckpt_best_agent_episode_000.mp4
+tag: ckpt                # 前缀; 最终文件名: <tag>_<agent_stem>_episode_000.mp4
+# 录制时禁用 sphere-proxy hard termination, 避免 proxy 接触导致 env reset 后
+# 同一个视频拼接多个短 episode. PhysX/table hard contact 仍按 env 默认处理.
+clearance_hard: -.inf
+capture_backend: replicator # cluster/headless 默认使用离屏相机; 本地可覆盖为 viewport
+
+# --- geom-paper 默认 (verified per memories) ---
+# 若录制非 v8 verified ckpt, 这些可在 invocation 时覆盖
+geom_stage: insert
+geom_d_sat: 0.8          # Mode 1 fix verified; 旧默认 0.30 会让 SAC 在多种 pose 学不动
+horizon: 200
+
+# --- 注意 ---
+# capture_backend=replicator 是 cluster/headless 安全默认值. 本地想录
+# visualize_policy 同口径轨迹时, 可覆盖 train.capture_backend=viewport.
