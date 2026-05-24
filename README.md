@@ -18,20 +18,20 @@ robust median + IQR aggregation across seeds.
 <tr>
 <td align="center" width="33%">
 <sub><b>Stage 1g — prepos</b><br>position alignment (h=100)</sub><br>
-<video src="results/videos/full_chain_best_hold_2026-05-12/stage1g_prepos_best_hold_episode_000.mp4" controls width="280"></video>
+<a href="results/videos/full_chain_best_hold_2026-05-12/stage1g_prepos_best_hold_episode_000.mp4"><img src="docs/figures/stage1g_prepos.gif" width="280" alt="Stage 1g prepos policy rollout"></a>
 </td>
 <td align="center" width="33%">
 <sub><b>Stage 2g — preaxis</b><br>add axis alignment (h=150)</sub><br>
-<video src="results/videos/full_chain_best_hold_2026-05-12/stage2g_preaxis_best_hold_episode_000.mp4" controls width="280"></video>
+<a href="results/videos/full_chain_best_hold_2026-05-12/stage2g_preaxis_best_hold_episode_000.mp4"><img src="docs/figures/stage2g_preaxis.gif" width="280" alt="Stage 2g preaxis policy rollout"></a>
 </td>
 <td align="center" width="33%">
 <sub><b>Stage 3g — insert</b><br>clean insertion, pen ≈ 0 (h=200)</sub><br>
-<video src="results/videos/full_chain_best_hold_2026-05-12/stage3g_insert_best_hold_episode_000.mp4" controls width="280"></video>
+<a href="results/videos/full_chain_best_hold_2026-05-12/stage3g_insert_best_hold_episode_000.mp4"><img src="docs/figures/stage3g_insert.gif" width="280" alt="Stage 3g insert policy rollout"></a>
 </td>
 </tr>
 </table>
 
-*If the videos do not render inline, browse them directly under*
+The GIF previews above link to the full-resolution MP4s in
 [`results/videos/full_chain_best_hold_2026-05-12/`](results/videos/full_chain_best_hold_2026-05-12/).
 
 ---
