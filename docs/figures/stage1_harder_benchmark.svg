@@ -11,7 +11,7 @@ text{font-family:Arial,Helvetica,sans-serif;fill:#111827}
 .axis{stroke:#111827;stroke-width:1.2}
 </style>
 <text x="720.0" y="30" text-anchor="middle" class="suptitle">SAC vs LagSAC, Stage 1 harder pose</text>
-<text x="720.0" y="52" text-anchor="middle" class="subtitle">Paper-aligned 1×3 panels (D-ATACOM Fig 3-5). Return=J (eval); safety panels=rollout (training-time). Success rate reported in summary table (not shown). LEGACY MODE: max-violation = step-cost proxy / episodic-cost = eval_ep_cost where rollout fields missing.</text>
+<text x="720.0" y="52" text-anchor="middle" class="subtitle">Benchmark 1×3 panels. Return=J (eval); safety panels=rollout (training-time). Success rate reported in summary table (not shown). LEGACY MODE: max-violation = step-cost proxy / episodic-cost = eval_ep_cost where rollout fields missing.</text>
 <rect x="520" y="70" width="18" height="10" fill="#2563eb" opacity="0.16"/>
 <line x1="520" y1="75" x2="556" y2="75" stroke="#2563eb" stroke-width="3"/>
 <circle cx="538" cy="75" r="3" fill="white" stroke="#2563eb" stroke-width="1.5"/>

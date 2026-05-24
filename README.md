@@ -1,18 +1,18 @@
-# Bimanual Peg-in-Hole — SAC vs Lagrangian SAC under D-ATACOM-style Safety
+# Bimanual Peg-in-Hole: SAC vs Lagrangian SAC Safety Benchmark
 
-A reproducible benchmark of an unconstrained baseline (**SAC**) against a CMDP
-constrained method (**Lagrangian SAC**) on a dual-arm IsaacSim peg-in-hole
-task. The two algorithms share the **same** environment, **same** task reward,
-and **same** hard-absorbing safety guards; the only difference is LagSAC's
-cost critic and Lagrangian multiplier λ. Paper-style reporting follows
-[D-ATACOM (Günster *et al.*, CoRL 2024)](https://arxiv.org/abs/2409.12045):
-1×3 learning curves of **Discounted Return** / **Maximum Violation per
-Episode** / **Episodic Sum of Cost**, plus a robust median + IQR aggregation.
+This repository trains two KUKA iiwa arms in Isaac Sim to solve a bimanual
+peg-in-hole task, then benchmarks an unconstrained baseline (**SAC**) against a
+constrained variant (**Lagrangian SAC**). Both algorithms share the **same**
+environment, **same** task reward, and **same** hard-absorbing safety guards;
+the only algorithmic difference is LagSAC's cost critic and Lagrangian
+multiplier λ. The benchmark reports 1×3 learning curves of **Discounted
+Return** / **Maximum Violation per Episode** / **Episodic Sum of Cost**, with a
+robust median + IQR aggregation across seeds.
 
 > [!NOTE]
-> This is a research / course-level reproduction, **not** an accepted paper.
-> The cited D-ATACOM work is the reference for the safety formulation and the
-> evaluation metrics; the LagSAC implementation here is independent.
+> This README describes the current verified project path: the Stage 1 SAC vs
+> LagSAC safety benchmark, plus the 3-stage geometric curriculum that proves the
+> peg-in-hole task is learnable end to end.
 
 <table>
 <tr>
@@ -65,7 +65,7 @@ A hybrid CMDP topology that separates the **continuous safety cost** (fed to
 | Component | Reward? | Cost? | Terminates? | Role |
 |---|:-:|:-:|:-:|---|
 | task geometry reward | ✓ | ✗ | ✗ | drives task |
-| arm-arm sphere-proxy clearance | ✗ | ✓ continuous | ✗ | D-ATACOM-style soft constraint |
+| arm-arm sphere-proxy clearance | ✗ | ✓ continuous | ✗ | soft clearance constraint |
 | arm/EE-table clearance | ✗ | ✓ continuous | ✓ | + soft cost + hard guard |
 | PhysX arm contact | cliff only | counted | ✓ | guard against suicide policy |
 
@@ -74,9 +74,9 @@ positive constraint (no clip). SAC sees the same env but ignores the cost;
 LagSAC's λ is driven by the **rollout** episode cost (not eval), updated as
 `Δlog λ = lr_λ · (cost − cost_limit)`.
 
-### Paper-style metrics (D-ATACOM Fig 3–5 alignment)
+### Benchmark metrics
 
-Per pose, a 1×3 learning-curve figure:
+Each benchmark pose is summarized with a 1×3 learning-curve figure:
 
 1. **Discounted Return** (eval, deterministic policy)
 2. **Maximum Violation per Episode** — mean over episodes of `max_t cost_t` (rollout)
@@ -138,7 +138,7 @@ scripts/
   train_sac_lagrangian.py      Lagrangian SAC entry
   rollout_cost_tracker.py      shared per-episode cost SUM + MAX tracker
   _eval_utils.py               eval / hold / geom / cost metrics
-  plot_paper_benchmark.py      1×3 paper figure + CSV (median+IQR default)
+  plot_paper_benchmark.py      1×3 benchmark figure + CSV (median+IQR default)
   analyze_overnight_paper.py   log → benchmark report
   visualize_policy.py          policy rollout viewer (X11)
   record_geom_video.py         standalone offscreen MP4 recorder (Replicator)
@@ -215,7 +215,7 @@ A full 10-seed paired benchmark template:
 A Stage 3 calibration template:
 [`scripts/run_stage3_100ep.sh`](scripts/run_stage3_100ep.sh).
 
-### Reproducing the paper figure
+### Reproducing the benchmark figure
 
 ```bash
 # from log files written by the runs above
@@ -295,23 +295,6 @@ General invariants:
   truncation quirk — see [`scripts/train_sac_lagrangian.py`](scripts/train_sac_lagrangian.py) header).
 - Stage 3 insertion requires `exclude_ee_from_physx_self_collision: true`.
 - Judge Stage 3 only after ≥ 80 epochs (SAC v8 typically breaks through at ep ~74).
-
----
-
-## Citation
-
-This repository is not itself a paper. Please cite the D-ATACOM reference if
-you use this codebase or the metric design:
-
-```bibtex
-@inproceedings{gunster2024datacom,
-  title  = {Handling Long-Term Safety and Uncertainty in Safe Reinforcement Learning},
-  author = {Günster, Jonas and Liu, Puze and Peters, Jan and Tateo, Davide},
-  booktitle = {Conference on Robot Learning (CoRL)},
-  year   = {2024},
-  url    = {https://arxiv.org/abs/2409.12045}
-}
-```
 
 ---
 
