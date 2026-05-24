@@ -1,304 +1,326 @@
-# bimanual_peghole
+# Bimanual Peg-in-Hole — SAC vs Lagrangian SAC under D-ATACOM-style Safety
 
-双臂 KUKA iiwa 在 IsaacSim 中做 peg-in-hole 的 SAC / LagSAC 训练。
+A reproducible benchmark of an unconstrained baseline (**SAC**) against a CMDP
+constrained method (**Lagrangian SAC**) on a dual-arm IsaacSim peg-in-hole
+task. The two algorithms share the **same** environment, **same** task reward,
+and **same** hard-absorbing safety guards; the only difference is LagSAC's
+cost critic and Lagrangian multiplier λ. Paper-style reporting follows
+[D-ATACOM (Günster *et al.*, CoRL 2024)](https://arxiv.org/abs/2409.12045):
+1×3 learning curves of **Discounted Return** / **Maximum Violation per
+Episode** / **Episodic Sum of Cost**, plus a robust median + IQR aggregation.
 
-当前主线是 **paper-grade SAC vs LagSAC benchmark**：两个算法使用同一个环境、同一个 task reward、同一个 hard termination 规则，区别只在 LagSAC 使用 cost critic 和 Lagrangian multiplier。
+> [!NOTE]
+> This is a research / course-level reproduction, **not** an accepted paper.
+> The cited D-ATACOM work is the reference for the safety formulation and the
+> evaluation metrics; the LagSAC implementation here is independent.
 
-旧版长 README 已归档到 [docs/README_legacy_20260512.md](docs/README_legacy_20260512.md) 和 [docs/README_pre_rewrite_20260518.md](docs/README_pre_rewrite_20260518.md)。
+<table>
+<tr>
+<td align="center" width="33%">
+<sub><b>Stage 1g — prepos</b><br>position alignment (h=100)</sub><br>
+<video src="results/videos/full_chain_best_hold_2026-05-12/stage1g_prepos_best_hold_episode_000.mp4" controls width="280"></video>
+</td>
+<td align="center" width="33%">
+<sub><b>Stage 2g — preaxis</b><br>add axis alignment (h=150)</sub><br>
+<video src="results/videos/full_chain_best_hold_2026-05-12/stage2g_preaxis_best_hold_episode_000.mp4" controls width="280"></video>
+</td>
+<td align="center" width="33%">
+<sub><b>Stage 3g — insert</b><br>clean insertion, pen ≈ 0 (h=200)</sub><br>
+<video src="results/videos/full_chain_best_hold_2026-05-12/stage3g_insert_best_hold_episode_000.mp4" controls width="280"></video>
+</td>
+</tr>
+</table>
 
-## Current Status
+*If the videos do not render inline, browse them directly under*
+[`results/videos/full_chain_best_hold_2026-05-12/`](results/videos/full_chain_best_hold_2026-05-12/).
 
-日期：2026-05-18
+---
 
-当前 benchmark 使用 **B-route CMDP semantics**：
+## Overview
 
-- task reward 和 safety cost 分离。
-- sphere proxy / table clearance 是连续 cost signal，不再直接 terminate。
-- PhysX arm contact 和 table collision 是 hard absorbing guard。
-- hard absorbing 触发同一类 collision penalty，用来避免物理不稳定和 suicide policy。
-- SAC 和 LagSAC 都记录同一组 safety/cost metrics，方便画论文风格对比图。
+Two parallel 7-DoF KUKA iiwa arms hold a peg and a hole. The right arm holds
+the hole; the left arm holds the peg. The policy outputs 14-DoF joint-velocity
+setpoints. Training proceeds through a 3-stage geometric curriculum:
 
-Stage 1 是当前主要对比实验。Stage 3 仍在做 100 epoch calibration；不要用 50 epoch 判断 Stage 3 是否失败，因为历史 SAC v8 第一次成功插入通常在 epoch 70 以后出现。
+| Stage | Objective | Horizon | Reward |
+|---|---|---|---|
+| **1g — prepos** | position alignment (tip toward hole) | 100 | linear depth + radial-tip penalty |
+| **2g — preaxis** | + axis alignment | 150 | + axis + radial-max terms |
+| **3g — insert** | clean peg insertion (penetration → 0) | 200 | 5-channel "v8" recipe (radial / axis / advance / penetration / dwell + bad-entry) |
+
+The repo's main line is the **algorithm comparison at Stage 1** (where the
+safety signal is most active); the Stage 3 insertion chain (verified
+checkpoints in [`results/checkpoints/saved/`](results/checkpoints/saved/))
+serves as the task-feasibility anchor.
+
+---
+
+## Method
+
+### B-route safety semantics
+
+A hybrid CMDP topology that separates the **continuous safety cost** (fed to
+λ) from **hard physical guards** (kept as absorbing terminations).
+
+| Component | Reward? | Cost? | Terminates? | Role |
+|---|:-:|:-:|:-:|---|
+| task geometry reward | ✓ | ✗ | ✗ | drives task |
+| arm-arm sphere-proxy clearance | ✗ | ✓ continuous | ✗ | D-ATACOM-style soft constraint |
+| arm/EE-table clearance | ✗ | ✓ continuous | ✓ | + soft cost + hard guard |
+| PhysX arm contact | cliff only | counted | ✓ | guard against suicide policy |
+
+Per-step cost = `max(arm_arm_violation, table_violation)`, normalized to a
+positive constraint (no clip). SAC sees the same env but ignores the cost;
+LagSAC's λ is driven by the **rollout** episode cost (not eval), updated as
+`Δlog λ = lr_λ · (cost − cost_limit)`.
+
+### Paper-style metrics (D-ATACOM Fig 3–5 alignment)
+
+Per pose, a 1×3 learning-curve figure:
+
+1. **Discounted Return** (eval, deterministic policy)
+2. **Maximum Violation per Episode** — mean over episodes of `max_t cost_t` (rollout)
+3. **Episodic Sum of Cost** — mean over episodes of `Σ_t cost_t` (rollout)
+
+Aggregation: **median + Q1–Q3 band** by default (robust to LagSAC's
+occasional single-seed collapse). Mean ± std / sem available via `--band`.
+Strict mode refuses to plot runs missing `rollout_ep_max_violation` /
+`rollout_ep_cost` / `cost_scale=1.0` — use `--allow_legacy_proxy` to replay
+older logs with a clearly-warned per-step proxy.
+
+---
+
+## Results
+
+### Stage 1 benchmark — harder pose, 10 seeds, 60 epochs
+
+`geom_d_sat=0.8` · `initial_joint_noise=0.05` · LagSAC `cost_limit_per_ep=10`.
+
+![Stage 1 harder-pose benchmark](docs/figures/stage1_harder_benchmark.svg)
+
+Median learning curves with Q1–Q3 shaded bands, generated by
+[`scripts/plot_paper_benchmark.py`](scripts/plot_paper_benchmark.py). One
+LagSAC seed (s3) collapses; the IQR aggregation absorbs it without
+distorting the central trend.
+
+**Headline (epoch 60, median [Q1, Q3])**
+
+| Metric | LagSAC | SAC | LagSAC vs SAC |
+|---|---:|---:|---|
+| Discounted Return (J) | −79.8 [−115, −56] | −91.7 [−117, −65] | tie / mild Lag |
+| Maximum Violation per Episode¹ | 0.04 | 0.04 | tie (uninformative; legacy proxy) |
+| Episodic Sum of Cost | **2.18** [0.97, 5.55] | 4.29 [2.68, 9.24] | **≈ 1.97× safer** |
+| Cumulative sphere collisions (training)² | **601 ± 309** | 2160 ± 660 | **≈ 3.6× safer** |
+
+¹ This benchmark predates the new `rollout_ep_max_violation` logging and falls
+back to a per-step proxy; values are not the true paper metric. New runs will
+plot the real metric in strict mode.
+
+² Mean ± std reported here for cross-check with the earlier 2026-05-18 run.
+
+The full Stage 1 / Stage 3 ablation discussion lives in
+[`docs/PAPER_RESULTS.md`](docs/PAPER_RESULTS.md).
+
+---
+
+## Repository Layout
+
+```
+envs/                          IsaacSim env + B-route cost env
+  dual_arm_peg_hole_env.py     parent env (also emits info["cost"] for monitor)
+  dual_arm_peg_hole_cost_env.py  + Lagrangian wrapper
+
+algorithm/lagrangian_sac.py    ConstrainedReplayMemory + SACLagrangian
+networks.py                    actor / critic networks
+
+scripts/
+  train_sac.py                 SAC entry
+  train_sac_lagrangian.py      Lagrangian SAC entry
+  rollout_cost_tracker.py      shared per-episode cost SUM + MAX tracker
+  _eval_utils.py               eval / hold / geom / cost metrics
+  plot_paper_benchmark.py      1×3 paper figure + CSV (median+IQR default)
+  analyze_overnight_paper.py   log → benchmark report
+  visualize_policy.py          policy rollout viewer (X11)
+  record_geom_video.py         standalone offscreen MP4 recorder (Replicator)
+  run_lagrangian_chain_local_from_yaml.py  local YAML-driven runner
+  train_hydra.py               Hydra+Apptainer+Slurm cluster entry
+  ...
+
+conf/experiment/               canonical YAMLs (loaded by name through Hydra)
+  lag_stage1_prepos_clearance_b_route.yaml     ← Stage 1 LagSAC (paper main)
+  sac_stage1_prepos_clearance_clean_sphere.yaml ← Stage 1 SAC (paper main)
+  lag_stage{2,3}_*_b_route_*.yaml              ← Stage 2/3 b_route variants
+  record_checkpoint.yaml                        ← cluster recording config
+
+results/
+  checkpoints/saved/           canonical verified ckpt chain (Stage 1g/2g/3g)
+  paper_archive/               frozen snapshots (2026-05-18 benchmark + Stage 3 100ep)
+  videos/full_chain_best_hold_2026-05-12/  3 stage-end demo MP4s (the hero videos above)
+  plots/                       generated paper figures (gitignored; CI not required)
+
+docs/
+  PAPER_RESULTS.md             full ablation tables + narrative
+  figures/                     paper figures embedded in this README
+  README_legacy_*.md           historical README snapshots
+```
+
+---
+
+## Installation
+
+Requires NVIDIA Isaac Sim (tested 4.x) and `mushroom-rl` ≥ 2.0-rc1 (editable
+install on the `dev` branch). The env spec lives in
+[`environment.yml`](environment.yml).
+
+```bash
+# (one-time) build a conda env named safe_rl
+conda env create -f environment.yml
+conda activate safe_rl
+
+# mushroom-rl editable from the dev branch
+git clone --branch dev https://github.com/MushroomRL/mushroom-rl.git ~/mushroom-rl
+pip install -e ~/mushroom-rl
+
+# Isaac Sim Python is expected at ~/isaac-sim/python.sh or wired via
+# scripts/run_lagrangian_chain_local_from_yaml.py (local) /
+# scripts/train_hydra.py (cluster)
+```
+
+---
 
 ## Quick Start
 
-进入环境：
+Activate the env and launch a Stage 1 run:
 
 ```bash
 cd ~/bimanual_peghole
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate safe_rl
-```
 
-跑 Stage 1 LagSAC：
-
-```bash
+# LagSAC, paper-grade defaults
 python scripts/run_lagrangian_chain_local_from_yaml.py \
   --start_stage 1 --stop_stage 1 \
   --stage1_cfg conf/experiment/lag_stage1_prepos_clearance_b_route.yaml \
   --tag manual_lagsac_s1
-```
 
-跑 Stage 1 SAC baseline：
-
-```bash
+# SAC baseline (same env, same reward)
 python scripts/run_lagrangian_chain_local_from_yaml.py \
   --start_stage 1 --stop_stage 1 \
   --stage1_cfg conf/experiment/sac_stage1_prepos_clearance_clean_sphere.yaml \
   --tag manual_sac_s1
 ```
 
-跑 Stage 3 100 epoch calibration：
+A full 10-seed paired benchmark template:
+[`scripts/run_final_benchmark_2026-05-20.sh`](scripts/run_final_benchmark_2026-05-20.sh).
+A Stage 3 calibration template:
+[`scripts/run_stage3_100ep.sh`](scripts/run_stage3_100ep.sh).
+
+### Reproducing the paper figure
 
 ```bash
-bash scripts/run_stage3_100ep.sh
+# from log files written by the runs above
+python scripts/plot_paper_benchmark.py \
+    --logs <log_dir> \
+    --out_dir results/plots/<run_tag> \
+    --settings final          # or 'default' / 'harder'
+# default band = iqr (median + Q1–Q3). Force strict mode by NOT passing
+# --allow_legacy_proxy; new runs have all required fields.
 ```
 
-生成论文风格结果图：
+Outputs `stage1_<setting>_paper.svg` + `stage1_paper_curves.csv`.
 
-```bash
-python scripts/analyze_overnight_paper.py
-python scripts/plot_paper_benchmark.py
-```
+---
 
-输出：
+## Pre-trained Checkpoints
 
-- `/tmp/overnight_report.md`
-- `results/plots/overnight_paper/stage1_default_paper.svg`
-- `results/plots/overnight_paper/stage1_harder_paper.svg`
-- `results/plots/overnight_paper/stage1_paper_curves.csv`
+The canonical 3-stage chain (used as warm-starts and as the hero videos above):
 
-## B-Route Semantics
-
-| Component | Meaning | Used By Reward | Used By Cost | Terminates |
-|---|---|---:|---:|---:|
-| task geometry reward | prepos / preaxis / insert shaping | yes | no | no |
-| arm-arm sphere clearance | D-ATACOM-style proxy violation | no | yes | no |
-| table clearance | table collision / clearance violation | no | yes | yes when hard table collision is enabled |
-| PhysX arm contact | real physical arm contact guard | hard cliff only | counted as safety event | yes |
-
-The intended benchmark interpretation:
-
-```text
-SAC:
-  maximize task reward
-  monitor cost and violations
-
-LagSAC:
-  maximize task reward under E[cost] <= cost_limit
-  update lambda with rollout episode cost
-```
-
-For paper plots, table contact and arm collision are both treated as safety violations. This is deliberate: a policy that avoids arm-arm contact by hitting the table is not safe.
-
-## Canonical Configs
-
-| Experiment | Config | Script | Epochs | Purpose |
-|---|---|---|---:|---|
-| Stage 1 LagSAC | [lag_stage1_prepos_clearance_b_route.yaml](conf/experiment/lag_stage1_prepos_clearance_b_route.yaml) | `scripts/train_sac_lagrangian.py` | 30 | main constrained baseline |
-| Stage 1 SAC | [sac_stage1_prepos_clearance_clean_sphere.yaml](conf/experiment/sac_stage1_prepos_clearance_clean_sphere.yaml) | `scripts/train_sac.py` | 30 | native SAC baseline, same env semantics |
-| Stage 3 SAC | [sac_stage3_b_route_calib.yaml](conf/experiment/sac_stage3_b_route_calib.yaml) | `scripts/train_sac.py` | 100 | insertion calibration |
-| Stage 3 LagSAC cost 100 | [lag_stage3_b_route_calib.yaml](conf/experiment/lag_stage3_b_route_calib.yaml) | `scripts/train_sac_lagrangian.py` | 100 | relaxed constraint calibration |
-| Stage 3 LagSAC cost 50 | [lag_stage3_b_route_calib_strict.yaml](conf/experiment/lag_stage3_b_route_calib_strict.yaml) | `scripts/train_sac_lagrangian.py` | 100 | stricter constraint calibration |
-
-Important config flags:
-
-```yaml
-cost_signal: clearance
-sphere_collision_terminates: false
-physx_collision_terminates: true
-enable_physx_arm_collision: true
-enable_table_collision: true
-table_collision_terminates: true
-keep_collision_reward_penalty: true
-```
-
-Stage 3 additionally requires:
-
-```yaml
-exclude_ee_from_physx_self_collision: true
-load_agent: results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00/best_hold.msh
-```
-
-## Checkpoints
-
-Canonical warm-start chain:
-
-| Stage | Checkpoint |
-|---|---|
-| Stage 1g prepos | `results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/best_hold.msh` |
-| Stage 2g preaxis | `results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00/best_hold.msh` |
-| Stage 3g insert SAC v8 | `results/checkpoints/saved/Stage3g_insert_h200_from_h100_h150_stage2_2026-05-12_21-01-11/best_hold.msh` |
-
-Use `best_hold.msh` for warm-start and visualization. `final_agent.msh` can drift after the best policy has already appeared.
-
-## Current Results
-
-Stage 1 default pose, 5 seeds:
-
-| Algorithm | best J | hold success | cumulative safety violations | table violations |
-|---|---:|---:|---:|---:|
-| LagSAC | `-99.35 +/- 14.57` | `0.781 +/- 0.397` | `1751 +/- 443` | `42.5 +/- 44.9` |
-| SAC | `-116.21 +/- 32.72` | `0.609 +/- 0.409` | `4517 +/- 1294` | `94.2 +/- 73.2` |
-
-Interpretation: default pose is the cleaner paper result. LagSAC improves return and reduces total safety violations by about 61 percent.
-
-Stage 1 harder pose, 5 seeds:
-
-| Algorithm | best J | hold success | cumulative safety violations | table violations |
-|---|---:|---:|---:|---:|
-| LagSAC | `-23.36 +/- 9.48` | `0.950 +/- 0.082` | `1707 +/- 1280` | `166 +/- 103` |
-| SAC | `-22.61 +/- 2.95` | `0.988 +/- 0.028` | `2428 +/- 1708` | `146 +/- 79` |
-
-Interpretation: harder pose is not yet a clean paper comparison. Both algorithms mostly solve the task; LagSAC lowers total violations but table violations are not clearly better. Treat it as pose-design/debug data until the harder initial pose is finalized.
-
-Stage 3:
-
-- 50 epochs is too short for conclusion.
-- Historical SAC v8 starts inserting around epoch 74 and reaches clean insertion around epoch 80.
-- Use 100 epochs for SAC and LagSAC Stage 3 calibration.
-- Current B-route Stage 3 cost may stay near zero because the Stage 2 warm-start already keeps arms/table safe. In that case Stage 3 mainly validates task learnability, not the safety advantage of LagSAC.
-
-## Paper-Style Metrics
-
-The plot script intentionally matches the structure of CMDP benchmark papers:
-
-| Paper-style name | This repo metric | Notes |
+| Stage | Path | First success |
 |---|---|---|
-| Discounted Return | `J` | gamma-discounted eval return |
-| Maximum Violation | proxy from max cost / collision event rate | exact per-episode max violation was not logged in older runs |
-| Episodic Sum of Cost | `eval_ep_cost` | sum of clearance/table cost over eval episodes |
-| Task Success | `geom_hold_rate` | task-specific hold success rate |
+| Stage 1g prepos | [`best_hold.msh`](results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/best_hold.msh) | — |
+| Stage 2g preaxis | [`best_hold.msh`](results/checkpoints/saved/Stage2g_preaxis_h150_from_h100_stage1_2026-05-12_19-50-00/best_hold.msh) | from S1g |
+| Stage 3g insert | [`best_hold.msh`](results/checkpoints/saved/Stage3g_insert_h200_from_h100_h150_stage2_2026-05-12_21-01-11/best_hold.msh) | from S2g, ep 74 (SAC v8) |
 
-The exact metric mapping is written into [scripts/plot_paper_benchmark.py](scripts/plot_paper_benchmark.py). If new runs log a true per-episode maximum violation, replace the current proxy there.
+Always evaluate with `best_hold.msh`, not `final_agent.msh` (the best policy
+can appear earlier than the final epoch — see `Guardrails` in
+`docs/PAPER_RESULTS.md`).
 
-## Visualization
-
-Visualize Stage 1 harder initial pose:
-
-```bash
-python scripts/visualize_policy.py \
-  --agent_path results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/best_hold.msh \
-  --geom_stage prepos \
-  --default_pose_variant harder \
-  --initial_joint_noise 0.0 \
-  --freeze_mode step --freeze_after_step 1 \
-  --freeze_seconds 30 \
-  --num_envs 4 --n_episodes 1 \
-  --geom_d_target_neg=-0.08 \
-  --geom_d_target_pos 0.03 \
-  --geom_d_sat 0.3 --geom_radial_sat 1.5 \
-  --geom_d_th 0.03 --geom_r_tip_th 0.03 \
-  --rew_geom_d 8.0 --rew_geom_radial_tip 8.0
-```
-
-Visualize the full Stage 1 policy rollout:
+Visualize a checkpoint:
 
 ```bash
 python scripts/visualize_policy.py \
-  --agent_path results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/best_hold.msh \
-  --geom_stage prepos \
-  --default_pose_variant harder \
-  --initial_joint_noise 0.0 \
-  --freeze_mode episode_end \
-  --freeze_seconds 20 \
-  --num_envs 4 --n_episodes 4 \
-  --geom_d_target_neg=-0.08 \
-  --geom_d_target_pos 0.03 \
-  --geom_d_sat 0.3 --geom_radial_sat 1.5 \
-  --geom_d_th 0.03 --geom_r_tip_th 0.03 \
-  --rew_geom_d 8.0 --rew_geom_radial_tip 8.0
+  --agent_path results/checkpoints/saved/Stage3g_insert_*_2026-05-12_21-01-11/best_hold.msh \
+  --geom_stage insert \
+  --num_envs 4 --n_episodes 4
 ```
 
-Visualize collision/table diagnostics:
+Record a checkpoint to MP4 (standalone, headless-compatible):
 
 ```bash
-python scripts/visualize_policy.py \
-  --agent_path results/checkpoints/saved/Stage1g_h100_full_ep_cold_2026-05-12_18-35-31/best_hold.msh \
-  --geom_stage prepos \
-  --default_pose_variant harder \
-  --initial_joint_noise 0.0 \
-  --enable_physx_arm_collision \
-  --enable_table_collision \
-  --table_collision_terminates \
-  --table_z 0.0 \
-  --table_clearance_hard 0.0 \
-  --table_clearance_cost_margin 0.03 \
-  --debug_show_sphere_proxy \
-  --num_envs 4 --n_episodes 1
+python scripts/record_geom_video.py \
+  --agent_path <path>/best_hold.msh \
+  --geom_stage insert \
+  --capture_backend replicator   # headless / cluster
 ```
 
-The table contact is computed against the table plane; the yellow surface in IsaacSim is the visual reference. Sphere proxies are easier to inspect than the raw table collision plane.
+---
 
-## Analysis Scripts
+## Cluster Execution (Hydra + Apptainer + Slurm)
 
-Parse overnight logs and regenerate the report:
+Long benchmark runs can be dispatched through Hydra:
 
 ```bash
-python scripts/analyze_overnight_paper.py
+python scripts/train_hydra.py --multirun \
+  experiment@train=lag_stage1_prepos_clearance_b_route \
+  train.seed=0,1,2,3,4,5,6,7,8,9
 ```
 
-Plot paper-style algorithm comparisons:
+`train_hydra.py` resolves `experiment@train=<name>` to
+`conf/experiment/<name>.yaml`, mounts the project into an Apptainer container,
+and submits one job per override combination through the Slurm launcher in
+`conf/config.yaml` / `conf/apptainer/`. Cluster paths are configured for
+`/home/ruiwan/projects/Safe_RL_Peg_in_hole` and the Isaac Sim container's
+`/isaac-sim/python.sh`.
 
-```bash
-python scripts/plot_paper_benchmark.py
-```
+---
 
-Monitor a running overnight or Stage 3 job:
+## Guardrails (do not change during an active run)
 
-```bash
-tail -f /tmp/overnight_summary.txt
-ls -lh /tmp/overnight_logs
-pgrep -af "train_sac|run_lagrangian"
-```
-
-If a run hangs inside IsaacSim/PhysX, use runners with:
-
-```bash
-timeout -k 60s <limit> <command>
-```
-
-Plain `timeout` only sends SIGTERM. IsaacSim can ignore SIGTERM while stuck in a C++/CUDA call.
-
-## Guardrails
-
-Do not change these while a run is active:
-
-- `envs/dual_arm_peg_hole_env.py`
-- `envs/dual_arm_peg_hole_cost_env.py`
-- `scripts/train_sac.py`
-- `scripts/train_sac_lagrangian.py`
-- `scripts/run_lagrangian_chain_local_from_yaml.py`
-- the YAML file currently used by the active run
+`envs/dual_arm_peg_hole_env.py` · `envs/dual_arm_peg_hole_cost_env.py` ·
+`scripts/train_sac.py` · `scripts/train_sac_lagrangian.py` ·
+`scripts/rollout_cost_tracker.py` · the YAML used by the active run.
 
 General invariants:
-
-- `n_steps_per_epoch = horizon * num_envs`.
-- Stage 1 uses horizon 100 and `n_steps_per_epoch: 1600`.
-- Stage 3 uses horizon 200 and `n_steps_per_epoch: 3200`.
+- `n_steps_per_epoch = horizon × num_envs` (a Mushroom `VectorCore`
+  truncation quirk — see [`scripts/train_sac_lagrangian.py`](scripts/train_sac_lagrangian.py) header).
 - Stage 3 insertion requires `exclude_ee_from_physx_self_collision: true`.
-- Judge Stage 3 only after at least 80 epochs, preferably 100.
-- For paper comparison, use YAML configs instead of hand-written long CLI commands.
+- Judge Stage 3 only after ≥ 80 epochs (SAC v8 typically breaks through at ep ~74).
 
-## Repository Map
+---
 
-```text
-conf/experiment/             canonical experiment YAMLs
-envs/                        IsaacSim environments and B-route semantics
-scripts/train_sac.py         native SAC
-scripts/train_sac_lagrangian.py
-                              LagSAC / constrained SAC
-scripts/run_lagrangian_chain_local_from_yaml.py
-                              YAML-to-training runner
-scripts/run_stage3_100ep.sh  Stage 3 100 epoch calibration runner
-scripts/analyze_overnight_paper.py
-                              log parser for benchmark report
-scripts/plot_paper_benchmark.py
-                              paper-style comparison plots
-scripts/visualize_policy.py  policy and pose visualization
-results/checkpoints/saved/   canonical checkpoints
-results/plots/overnight_paper/
-                              generated figures
-docs/README_legacy_20260512.md
-                              old long README
+## Citation
+
+This repository is not itself a paper. Please cite the D-ATACOM reference if
+you use this codebase or the metric design:
+
+```bibtex
+@inproceedings{gunster2024datacom,
+  title  = {Handling Long-Term Safety and Uncertainty in Safe Reinforcement Learning},
+  author = {Günster, Jonas and Liu, Puze and Peters, Jan and Tateo, Davide},
+  booktitle = {Conference on Robot Learning (CoRL)},
+  year   = {2024},
+  url    = {https://arxiv.org/abs/2409.12045}
+}
 ```
+
+---
+
+## Acknowledgments
+
+- The Lagrangian SAC implementation builds on
+  [MushroomRL](https://github.com/MushroomRL/mushroom-rl)'s `dev` branch.
+- Environment built on NVIDIA Isaac Sim with the dual-arm KUKA iiwa USD asset
+  at [`assets/usd/`](assets/usd).
+- Older READMEs preserved for context:
+  [`docs/README_legacy_20260512.md`](docs/README_legacy_20260512.md) ·
+  [`docs/README_pre_rewrite_20260518.md`](docs/README_pre_rewrite_20260518.md).
