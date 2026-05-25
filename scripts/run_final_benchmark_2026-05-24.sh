@@ -102,7 +102,7 @@ import re, sys
 log = open(sys.argv[1], errors='ignore').read()
 m_J = re.search(r'训练完成.*?best J = (-?\d+\.\d+)', log)
 m_geom = re.search(r'训练完成.*?best[ _]geom(_hold)?_rate[ =]+(\d+\.\d+)', log)
-m_score = re.search(r'best_score = (-?\d+\.\d+)', log)
+m_score = re.search(r'best_score[: =]+(-?\d+(?:\.\d+)?)', log)
 holds = [float(x) for x in re.findall(r'geom_hold_rate=(\d+\.\d+)', log)]
 physx = [int(x) for x in re.findall(r'epoch_collision_physx=(\d+)', log)]
 spheres = [int(x) for x in re.findall(r'epoch_collision_sphere=(\d+)', log)]
