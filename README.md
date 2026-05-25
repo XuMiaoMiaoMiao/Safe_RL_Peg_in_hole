@@ -14,15 +14,29 @@ Return** / **Maximum Violation per Episode** / **Episodic Sum of Cost**, with a
 > LagSAC safety benchmark, plus the 3-stage geometric curriculum that proves the
 > peg-in-hole task is learnable end to end.
 
-<p align="center">
-  <img src="docs/figures/stage_chain_preview.gif" width="900" alt="Synchronized Stage 1g prepos, Stage 2g preaxis, and Stage 3g insert policy rollouts">
-</p>
-
-<p align="center">
-  <sub><b>Stage 1g — prepos</b> · position alignment (h=100) &nbsp;&nbsp;|&nbsp;&nbsp;
-  <b>Stage 2g — preaxis</b> · add axis alignment (h=150) &nbsp;&nbsp;|&nbsp;&nbsp;
-  <b>Stage 3g — insert</b> · clean insertion, pen ≈ 0 (h=200)</sub>
-</p>
+<table>
+<tr>
+<td align="center" width="33%">
+<sub><b>Stage 1g — prepos</b><br>position alignment (h=100)</sub>
+</td>
+<td align="center" width="33%">
+<sub><b>Stage 2g — preaxis</b><br>add axis alignment (h=150)</sub>
+</td>
+<td align="center" width="33%">
+<sub><b>Stage 3g — insert</b><br>clean insertion, pen ≈ 0 (h=200)</sub>
+</td>
+</tr>
+<tr>
+<td align="center" colspan="3">
+<img src="docs/figures/stage_chain_preview.gif" width="900" alt="Synchronized Stage 1g prepos, Stage 2g preaxis, and Stage 3g insert policy rollouts">
+</td>
+</tr>
+<tr>
+<td align="center"><a href="results/videos/full_chain_best_hold_2026-05-12/stage1g_prepos_best_hold_episode_000.mp4">full MP4</a></td>
+<td align="center"><a href="results/videos/full_chain_best_hold_2026-05-12/stage2g_preaxis_best_hold_episode_000.mp4">full MP4</a></td>
+<td align="center"><a href="results/videos/full_chain_best_hold_2026-05-12/stage3g_insert_best_hold_episode_000.mp4">full MP4</a></td>
+</tr>
+</table>
 
 The synchronized GIF preview is generated from the full-resolution MP4s in
 [`results/videos/full_chain_best_hold_2026-05-12/`](results/videos/full_chain_best_hold_2026-05-12/).
