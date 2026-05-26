@@ -30,7 +30,7 @@ use_axis_resid_obs: true
 exclude_ee_from_physx_self_collision: false
 
 # Collection / update cadence.
-n_epochs: 30                      # ★ 30-ep calibration run; 跟 LagSAC 同步, 后扩 120
+n_epochs: 60                      # easy-pose 15-seed benchmark; synced from hard-pose 2026-05-24
 n_steps_per_epoch: 1600          # = horizon × num_envs = 100 × 16
 n_steps_per_fit: 16
 utd: null
@@ -46,7 +46,8 @@ target_entropy: -7
 actor_grad_clip: null
 
 # Base env.
-initial_joint_noise: 0.1
+default_pose_variant: easy
+initial_joint_noise: 0.05
 preinsert_success_pos_threshold: 0.10
 preinsert_offset: null
 
@@ -57,7 +58,7 @@ geom_d_target_pos: 0.03
 geom_d_target_ramp_start: 0
 geom_d_target_ramp_end: 20
 
-geom_d_sat: 0.30
+geom_d_sat: 0.8
 geom_radial_sat: 1.5
 
 geom_d_th: 0.030
@@ -130,7 +131,7 @@ actor_only_warmstart: false
 keep_replay: false
 
 wandb_project: bimanual_peghole
-wandb_entity: miaoxu010522-lund
-wandb_run_name: sac_S1g_b_route_v4_calib30ep_seed0
-wandb_group: lag_s1_b_route_v4_calibration
+wandb_entity: safe_rl_2026_lund
+wandb_run_name: new_sac_S1g_easy_pose_60ep_seed${.seed}
+wandb_group: s1_easy_pose_bench
 no_wandb: false

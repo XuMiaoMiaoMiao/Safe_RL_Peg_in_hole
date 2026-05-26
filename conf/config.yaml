@@ -5,8 +5,8 @@ defaults:
   - _self_
 
 project:
-  host_project_root: /home/ruiwan/projects/Safe_RL_Peg_in_hole
-  container_project_root: /workspace/Safe_RL_Peg_in_hole
+  host_project_root: /home/ruiwan/projects/Safe_RL_Peg_in_hole_new
+  container_project_root: /workspace/Safe_RL_Peg_in_hole_new
   isaac_python: /isaac-sim/python.sh
 
 hydra:

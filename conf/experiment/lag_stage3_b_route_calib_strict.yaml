@@ -107,9 +107,10 @@ table_z: 0.0
 table_clearance_hard: 0.0
 table_clearance_cost_margin: 0.03
 
-# Lagrangian controller — proportional scale from Stage 1 current scheme v4.
-# Stage 1 cost_limit=50 / horizon=100 = 0.5 violation rate per step.
-# Stage 3 horizon=200: scale to cost_limit=100 keeps same per-step tolerance.
+# Lagrangian controller — strict variant vs calib.yaml.
+# calib.yaml 按 horizon 比例缩放: 50 × (200/100) = 100 (0.5/step).
+# 本文件直接沿用 Stage 1 绝对值 50 → per-step tolerance 降至 0.25, 约束严格两倍.
+# 对比目的: 观察更紧的 cost_limit 是否导致 λ 更快上升/抑制任务性能.
 cost_limit_per_ep: 50.0
 lambda_update_mode: rollout_episode_rate
 min_lambda_update_episodes: 16

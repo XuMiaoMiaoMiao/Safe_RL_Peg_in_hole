@@ -10,7 +10,7 @@ stderr_to_stdout: true
 signal_delay_s: 120     # 在超时前 120 秒向 job 发信号
 max_num_timeout: 3      # job 因 timeout 被自动重提的最大次数。
 array_parallelism: 8    # Hydra multirun/sweep 生成 job array 时，最多同时跑 8 个 array task。
-partition: gpua40
+partition: gpua100
 gpus_per_node: 1
 account: null           # 不指定 Slurm account
 qos: null
